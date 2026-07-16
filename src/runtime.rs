@@ -1,0 +1,2170 @@
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, SocketAddr},
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{bail, Context};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use tokio::{
+    process::Command,
+    signal,
+    sync::{watch, RwLock},
+    time::{interval, sleep},
+};
+use tracing::{error, info, warn};
+
+use crate::{
+    config::Config,
+    control::StatePublisher,
+    docker::DockerObserver,
+    domain::{
+        CanonicalSnapshot, CheckStatus, Impact, PortForwardPhase, TopologyStatus,
+        VpnServerLatencyStatus,
+    },
+    enforcement::{DnatTarget, EnforcementCoordinator},
+    history::{HistoryStore, PortForwardObservation, UsageObservation},
+    natpmp::{self, Client as NatPmpClient},
+    state::{AppState, RouteIntentStatus, SharedState},
+    web,
+};
+
+pub type SharedHistory = Arc<RwLock<Option<HistoryStore>>>;
+
+pub async fn run(
+    config: Config,
+    telemetry: Option<crate::telemetry::TelemetryGuard>,
+) -> anyhow::Result<()> {
+    config.validate()?;
+    // Install the fail-closed policy before bringing up the tunnel. Until wg0
+    // exists, enrolled traffic is rejected instead of escaping via the uplink.
+    let enforcement = EnforcementCoordinator::new(config.clone());
+    enforcement.reconcile_base().await?;
+    let configured_peer = if config.wireguard.manage {
+        Some(read_configured_peer(&config).await?)
+    } else {
+        None
+    };
+    if config.wireguard.manage {
+        wireguard_up(&config).await?;
+    }
+    let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+    let publisher = StatePublisher::new(CanonicalSnapshot {
+        topology: TopologyStatus {
+            network: config.network.name.clone(),
+            subnet: config.network.subnet.to_string(),
+            gateway_address: config.network.gateway_ip.to_string(),
+            host_bridge: config.network.host_bridge.clone(),
+            policy_table: config.network.route_table,
+            ..TopologyStatus::default()
+        },
+        vpn_server: configured_peer
+            .as_ref()
+            .map(crate::vpn_server::configured_status)
+            .unwrap_or_default(),
+        ..CanonicalSnapshot::default()
+    });
+    let history: SharedHistory = Arc::new(RwLock::new(None));
+    if config.persistence.enabled {
+        match open_history(config.persistence.clone()).await {
+            Ok(store) => {
+                *history.write().await = Some(store);
+                publisher
+                    .observe(
+                        "history.persistence",
+                        CheckStatus::Healthy,
+                        Impact::Advisory,
+                        "history.database_ready",
+                        "App-owned history database is ready",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                warn!(%error, "history database is unavailable; the data plane will continue");
+                publisher
+                    .observe(
+                        "history.persistence",
+                        CheckStatus::Degraded,
+                        Impact::Advisory,
+                        "history.database_unavailable",
+                        "App-owned history is unavailable; current-state operation continues",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+    } else {
+        publisher
+            .observe(
+                "history.persistence",
+                CheckStatus::Unknown,
+                Impact::Advisory,
+                "history.disabled",
+                "App-owned history is disabled by configuration",
+                None,
+                None,
+            )
+            .await;
+    }
+    let history_supervisor_task = config.persistence.enabled.then(|| {
+        tokio::spawn(supervise_history(
+            config.persistence.clone(),
+            history.clone(),
+            publisher.clone(),
+        ))
+    });
+    let history_recorder_task = config
+        .persistence
+        .enabled
+        .then(|| tokio::spawn(record_history(history.clone(), publisher.clone())));
+    let notifications = crate::notifications::NotificationManager::start(history.clone()).await;
+    let notification_monitor_task = tokio::spawn(crate::notifications::monitor_transitions(
+        notifications.clone(),
+        publisher.clone(),
+    ));
+    let telemetry_monitor_task = telemetry.as_ref().map(|telemetry| {
+        tokio::spawn(monitor_telemetry(
+            telemetry.status.clone(),
+            crate::telemetry::TelemetryMetrics::new(),
+            publisher.clone(),
+        ))
+    });
+    let telemetry_metrics = crate::telemetry::TelemetryMetrics::new();
+    let vpn_server_task = configured_peer.map(|peer| {
+        tokio::spawn(monitor_vpn_server(
+            config.clone(),
+            peer,
+            publisher.clone(),
+            history.clone(),
+            crate::telemetry::TelemetryMetrics::new(),
+            notifications.clone(),
+        ))
+    });
+    publisher
+        .observe(
+            "telemetry.otel",
+            if telemetry.is_some() {
+                CheckStatus::Unknown
+            } else {
+                CheckStatus::Healthy
+            },
+            Impact::Optional,
+            if telemetry.is_some() {
+                "otel.awaiting_export"
+            } else {
+                "otel.disabled"
+            },
+            if telemetry.is_some() {
+                "OTEL is enabled and awaiting the first export result"
+            } else {
+                "OTEL export is disabled"
+            },
+            None,
+            None,
+        )
+        .await;
+    publisher
+        .observe(
+            "gateway.firewall",
+            if config.reconcile.apply_gateway_firewall {
+                CheckStatus::Healthy
+            } else {
+                CheckStatus::Unknown
+            },
+            Impact::Critical,
+            if config.reconcile.apply_gateway_firewall {
+                "firewall.policy_installed"
+            } else {
+                "firewall.verification_disabled"
+            },
+            if config.reconcile.apply_gateway_firewall {
+                "The owned fail-closed firewall policy is installed"
+            } else {
+                "Firewall application and verification are disabled"
+            },
+            None,
+            None,
+        )
+        .await;
+    publisher
+        .observe(
+            "gateway.routes",
+            if config.wireguard.manage {
+                CheckStatus::Healthy
+            } else {
+                CheckStatus::Unknown
+            },
+            Impact::Critical,
+            if config.wireguard.manage {
+                "routes.policy_installed"
+            } else {
+                "routes.verification_external"
+            },
+            if config.wireguard.manage {
+                "Gateway source-policy routes were installed"
+            } else {
+                "WireGuard and route management are external and unverified"
+            },
+            None,
+            None,
+        )
+        .await;
+    state
+        .write()
+        .await
+        .tunnel
+        .interface
+        .clone_from(&config.wireguard.interface);
+
+    let observer = DockerObserver::connect(
+        &config.docker_socket,
+        config.network.name.clone(),
+        config.network.subnet,
+    )?;
+
+    let listen: SocketAddr = config.listen.parse()?;
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let server = axum::serve(
+        listener,
+        web::router(
+            state.clone(),
+            publisher.clone(),
+            history.clone(),
+            notifications.clone(),
+        ),
+    );
+    info!(%listen, "dashboard listening");
+    notifications.stack_started().await;
+
+    // Docker enrollment and tunnel changes must interrupt the NAT-PMP renewal
+    // sleep so stale DNAT is removed at the reconciliation cadence rather than
+    // at the provider lease-refresh cadence.
+    let (port_change_tx, port_change_rx) = watch::channel(0_u64);
+
+    let mut docker_task = tokio::spawn(reconcile_docker(
+        config.clone(),
+        state.clone(),
+        publisher.clone(),
+        observer,
+        enforcement.clone(),
+        port_change_tx.clone(),
+    ));
+    let mut tunnel_task = tokio::spawn(monitor_tunnel(
+        config.clone(),
+        state.clone(),
+        publisher.clone(),
+        enforcement.clone(),
+        port_change_tx,
+    ));
+    let mut port_task = tokio::spawn(maintain_port_forward(
+        config.clone(),
+        state.clone(),
+        publisher.clone(),
+        enforcement.clone(),
+        port_change_rx,
+    ));
+    let mut probe_task = tokio::spawn(crate::probe::monitor(config.clone(), publisher.clone()));
+    let mut client_traffic_task = tokio::spawn(monitor_client_traffic(
+        state.clone(),
+        publisher.clone(),
+        enforcement.clone(),
+        history.clone(),
+        telemetry_metrics,
+    ));
+    let mut dns_task = if config.dns.enabled {
+        let listen = config.dns.listen.parse()?;
+        let upstream = config.dns.upstream.parse()?;
+        publisher
+            .observe(
+                "dns.listener",
+                CheckStatus::Healthy,
+                Impact::Critical,
+                "dns.listener_started",
+                "UDP and TCP DNS listeners started",
+                None,
+                None,
+            )
+            .await;
+        Some(tokio::spawn(crate::dns::supervise(crate::dns::Settings {
+            listen,
+            upstream,
+            timeout: Duration::from_millis(config.dns.timeout_ms),
+            max_concurrent_queries: config.dns.max_concurrent_queries,
+            publisher: Some(publisher.clone()),
+        })))
+    } else {
+        None
+    };
+
+    let run_result: anyhow::Result<()> = tokio::select! {
+        result = server => result.context("HTTP server failed"),
+        _ = signal::ctrl_c() => {
+            info!("shutdown requested");
+            Ok(())
+        },
+        result = &mut docker_task => flatten_task_result(result, "Docker observer task panicked"),
+        result = &mut tunnel_task => flatten_task_result(result, "tunnel monitor task panicked"),
+        result = &mut port_task => flatten_task_result(result, "port-forward task panicked"),
+        result = &mut probe_task => flatten_task_result(result, "client-path probe monitor panicked"),
+        result = &mut client_traffic_task => flatten_task_result(result, "client traffic monitor panicked"),
+        result = async { dns_task.as_mut().expect("guarded by dns.enabled").await }, if dns_task.is_some() => {
+            flatten_task_result(result, "DNS task panicked")
+        }
+    };
+
+    // Stop every task capable of changing the data plane, and wait until it is
+    // actually gone, before observability flushes or WireGuard teardown begin.
+    stop_task(docker_task).await;
+    stop_task(port_task).await;
+    stop_task(probe_task).await;
+    stop_task(client_traffic_task).await;
+    if let Some(task) = dns_task {
+        stop_task(task).await;
+    }
+    stop_task(tunnel_task).await;
+    if let Some(task) = history_supervisor_task {
+        stop_task(task).await;
+    }
+    if let Some(task) = history_recorder_task {
+        stop_task(task).await;
+    }
+    if let Some(task) = telemetry_monitor_task {
+        stop_task(task).await;
+    }
+    if let Some(task) = vpn_server_task {
+        stop_task(task).await;
+    }
+    stop_task(notification_monitor_task).await;
+    if let Some(store) = history.read().await.clone() {
+        if let Err(error) = store.shutdown().await {
+            warn!(%error, "history writer did not flush cleanly during shutdown");
+        }
+    }
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown();
+    }
+
+    if config.wireguard.manage {
+        wireguard_down(&config).await;
+    }
+    run_result
+}
+
+fn flatten_task_result(
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    panic_context: &'static str,
+) -> anyhow::Result<()> {
+    result.context(panic_context)?
+}
+
+async fn stop_task<T>(task: tokio::task::JoinHandle<T>) {
+    // The branch selected by `tokio::select!` has already consumed its output;
+    // polling that completed JoinHandle again would violate the Future contract.
+    if task.is_finished() {
+        return;
+    }
+    task.abort();
+    match task.await {
+        Ok(_) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => warn!(%error, "task panicked while shutdown was in progress"),
+    }
+}
+
+async fn read_configured_peer(
+    config: &Config,
+) -> anyhow::Result<crate::vpn_server::ConfiguredPeer> {
+    let runtime_path = prepare_wireguard_profile(config).await?;
+    let profile = tokio::fs::read_to_string(runtime_path)
+        .await
+        .context("reading WireGuard profile for safe endpoint metadata")?;
+    crate::vpn_server::parse_wireguard_profile(&profile)
+}
+
+async fn monitor_vpn_server(
+    config: Config,
+    peer: crate::vpn_server::ConfiguredPeer,
+    publisher: StatePublisher,
+    history: SharedHistory,
+    telemetry_metrics: crate::telemetry::TelemetryMetrics,
+    notifications: crate::notifications::NotificationManager,
+) -> anyhow::Result<()> {
+    let mut ticker = interval(Duration::from_secs(config.vpn_server.interval_seconds));
+    let mut window = crate::vpn_server::LatencyWindow::default();
+    let mut previous_endpoint = None;
+    let mut rtt_above_threshold = false;
+    loop {
+        ticker.tick().await;
+        let now_ms = unix_ms();
+        let now_seconds = now_ms / 1_000;
+        let handshake = wireguard_handshake(&config.wireguard.interface)
+            .await
+            .ok()
+            .flatten();
+        let active =
+            handshake.is_some_and(|value| value != 0 && now_seconds.saturating_sub(value) < 180);
+        match crate::vpn_server::runtime_endpoint(&config.wireguard.interface).await {
+            Ok(endpoint) => {
+                if previous_endpoint.is_some_and(|previous| previous != endpoint) {
+                    publisher
+                        .emit(
+                            "vpn_server.endpoint",
+                            "vpn_server.endpoint_changed",
+                            "The runtime WireGuard peer endpoint changed",
+                        )
+                        .await;
+                }
+                previous_endpoint = Some(endpoint);
+                let result = if config.vpn_server.latency_probe_enabled {
+                    crate::vpn_server::probe_endpoint(
+                        endpoint,
+                        &config.wireguard.interface,
+                        Duration::from_millis(config.vpn_server.timeout_ms),
+                    )
+                    .await
+                    .unwrap_or(crate::vpn_server::ProbeResult::Unavailable)
+                } else {
+                    crate::vpn_server::ProbeResult::Unsupported
+                };
+                window.record(result.rtt());
+                if let Some(rtt) = result.rtt() {
+                    telemetry_metrics.record_vpn_server_rtt(
+                        if endpoint.is_ipv4() { "ipv4" } else { "ipv6" },
+                        rtt,
+                    );
+                    notifications
+                        .rtt_sample(rtt, &mut rtt_above_threshold)
+                        .await;
+                }
+                let latency = window.state(result.status(), now_ms);
+                publisher
+                    .mutate(|snapshot| {
+                        snapshot.vpn_server.configured_endpoint_host =
+                            Some(peer.endpoint_host.clone());
+                        snapshot.vpn_server.configured_endpoint_port = Some(peer.endpoint_port);
+                        snapshot.vpn_server.runtime_endpoint_address =
+                            Some(endpoint.ip().to_string());
+                        snapshot.vpn_server.runtime_endpoint_port = Some(endpoint.port());
+                        snapshot.vpn_server.active = active;
+                        snapshot.vpn_server.latest_handshake_unix = handshake;
+                        snapshot.vpn_server.handshake_age_seconds =
+                            handshake.map(|value| now_seconds.saturating_sub(value));
+                        snapshot.vpn_server.observed_at_unix_ms = Some(now_ms);
+                        snapshot.vpn_server.latency = latency.clone();
+                    })
+                    .await;
+                if let Some(store) = history.read().await.clone() {
+                    store.record_vpn_server(crate::history::VpnServerObservation {
+                        timestamp_unix_ms: now_ms,
+                        configured_endpoint_host: peer.endpoint_host.clone(),
+                        runtime_endpoint_address: endpoint.ip().to_string(),
+                        runtime_endpoint_port: endpoint.port(),
+                        active,
+                        latency_status: result.status(),
+                        rtt_ms: result.rtt(),
+                    });
+                }
+                publisher
+                    .observe(
+                        "vpn_server.latency",
+                        match result.status() {
+                            VpnServerLatencyStatus::Measured => CheckStatus::Healthy,
+                            VpnServerLatencyStatus::Timeout
+                            | VpnServerLatencyStatus::Unsupported
+                            | VpnServerLatencyStatus::ResolutionFailed
+                            | VpnServerLatencyStatus::Unavailable => CheckStatus::Unknown,
+                        },
+                        Impact::Optional,
+                        match result.status() {
+                            VpnServerLatencyStatus::Measured => "vpn_server.latency_measured",
+                            VpnServerLatencyStatus::Timeout => "vpn_server.icmp_timeout",
+                            VpnServerLatencyStatus::Unsupported => "vpn_server.icmp_unsupported",
+                            VpnServerLatencyStatus::ResolutionFailed => {
+                                "vpn_server.route_unavailable"
+                            }
+                            VpnServerLatencyStatus::Unavailable => "vpn_server.probe_unavailable",
+                        },
+                        if result.status() == VpnServerLatencyStatus::Measured {
+                            "Underlay latency to the active WireGuard endpoint was measured"
+                        } else {
+                            "WireGuard endpoint latency is unavailable; tunnel health is independent"
+                        },
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                warn!(%error, "VPN-server endpoint observation is unavailable");
+                window.record(None);
+                publisher
+                    .mutate(|snapshot| {
+                        snapshot.vpn_server.active = active;
+                        snapshot.vpn_server.latest_handshake_unix = handshake;
+                        snapshot.vpn_server.handshake_age_seconds =
+                            handshake.map(|value| now_seconds.saturating_sub(value));
+                        snapshot.vpn_server.observed_at_unix_ms = Some(now_ms);
+                        snapshot.vpn_server.latency =
+                            window.state(VpnServerLatencyStatus::Unavailable, now_ms);
+                    })
+                    .await;
+                publisher
+                    .observe(
+                        "vpn_server.latency",
+                        CheckStatus::Unknown,
+                        Impact::Optional,
+                        "vpn_server.endpoint_unavailable",
+                        "The runtime WireGuard endpoint is unavailable for advisory latency sampling",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+async fn monitor_telemetry(
+    status: crate::telemetry::ExportStatus,
+    metrics: crate::telemetry::TelemetryMetrics,
+    publisher: StatePublisher,
+) {
+    let mut ticker = interval(Duration::from_secs(15));
+    let mut observed_failures = 0;
+    loop {
+        ticker.tick().await;
+        let failures = status.failed_exports();
+        let successes = status.successful_exports();
+        let last_failure = status.last_failure_unix_ms();
+        let last_success = status.last_success_unix_ms();
+        metrics.record_export_status(&status);
+        let failed_after_success =
+            last_failure.is_some_and(|failed| last_success.is_none_or(|success| failed > success));
+        publisher
+            .observe(
+                "telemetry.otel",
+                if failed_after_success || failures > observed_failures {
+                    CheckStatus::Degraded
+                } else if successes > 0 {
+                    CheckStatus::Healthy
+                } else {
+                    CheckStatus::Unknown
+                },
+                Impact::Optional,
+                if failed_after_success || failures > observed_failures {
+                    "otel.export_failed"
+                } else if successes > 0 {
+                    "otel.export_succeeded"
+                } else {
+                    "otel.awaiting_export"
+                },
+                if failed_after_success || failures > observed_failures {
+                    "One or more OTEL exports failed; local operation continues"
+                } else if successes > 0 {
+                    "OTEL export has succeeded"
+                } else {
+                    "OTEL is enabled and awaiting the first export result"
+                },
+                None,
+                None,
+            )
+            .await;
+        observed_failures = failures;
+    }
+}
+
+async fn reconcile_docker(
+    config: Config,
+    state: SharedState,
+    publisher: StatePublisher,
+    observer: DockerObserver,
+    enforcement: EnforcementCoordinator,
+    port_change_tx: watch::Sender<u64>,
+) -> anyhow::Result<()> {
+    let mut ticker = interval(config.reconcile_interval());
+    loop {
+        ticker.tick().await;
+        match observer.inspect_network(config.network.gateway_ip).await {
+            Ok(network) => {
+                let matches = network.exists && network.subnet_matches && network.gateway_attached;
+                publisher.observe(
+                    "topology.docker_network",
+                    if matches { CheckStatus::Healthy } else { CheckStatus::Failed },
+                    Impact::Critical,
+                    if matches { "topology.network_matches" } else { "topology.network_mismatch" },
+                    if matches { "Docker network subnet and gateway attachment match configuration" } else { "Docker network subnet or gateway attachment does not match configuration" },
+                    None,
+                    None,
+                ).await;
+                if network.ipv6_enabled {
+                    publisher
+                        .observe(
+                            "topology.network_ipv6",
+                            CheckStatus::Degraded,
+                            Impact::Advisory,
+                            "topology.network_ipv6_enabled",
+                            "The enrolled Docker network has IPv6 enabled, which is unsupported",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+            }
+            Err(error) => {
+                warn!(%error, "Docker network inspection failed");
+                publisher
+                    .observe(
+                        "topology.docker_network",
+                        CheckStatus::Failed,
+                        Impact::Critical,
+                        "topology.network_missing",
+                        "The configured Docker network could not be inspected",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+        match observer.discover().await {
+            Ok(clients) => {
+                let target_count = clients
+                    .values()
+                    .filter(|client| client.port_forward_target)
+                    .count();
+                if target_count > 1 {
+                    state.write().await.last_error = Some(
+                        "more than one container requests Proton's single forwarded port"
+                            .to_owned(),
+                    );
+                }
+                let existing_traffic = state
+                    .read()
+                    .await
+                    .clients
+                    .iter()
+                    .map(|(id, client)| (id.clone(), (client.ipv4_address, client.traffic.clone())))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let mut clients = clients;
+                for (id, client) in &mut clients {
+                    if let Some((_, traffic)) = existing_traffic
+                        .get(id)
+                        .filter(|(address, _)| *address == client.ipv4_address)
+                    {
+                        client.traffic = traffic.clone();
+                    }
+                }
+                let old_port_inputs = {
+                    let current = state.read().await;
+                    port_forward_target_inputs(&current.clients)
+                };
+                let new_port_inputs = port_forward_target_inputs(&clients);
+                let port_inputs_changed = old_port_inputs != new_port_inputs;
+                enforcement
+                    .reconcile_clients(&clients, port_inputs_changed)
+                    .await?;
+                if port_inputs_changed {
+                    invalidate_published_forward(
+                        &state,
+                        &publisher,
+                        PortForwardPhase::WaitingForTarget,
+                    )
+                    .await;
+                }
+                state.write().await.clients = clients.clone();
+                if port_inputs_changed {
+                    notify_port_change(&port_change_tx);
+                }
+                let has_ipv6 = clients.values().any(|client| client.ipv6_address.is_some());
+                let invalid_labels = clients
+                    .values()
+                    .any(|client| !client.port_forward_label_valid);
+                let stopped = clients.values().any(|client| !client.running);
+                let route_mismatch = clients
+                    .values()
+                    .any(|client| client.route_intent.status == RouteIntentStatus::Mismatch);
+                let route_unknown = clients
+                    .values()
+                    .any(|client| client.route_intent.status == RouteIntentStatus::Unknown);
+                let client_count = clients.len();
+                publisher
+                    .mutate(|snapshot| snapshot.clients = clients)
+                    .await;
+                publisher
+                    .observe(
+                        "docker.discovery",
+                        CheckStatus::Healthy,
+                        Impact::Advisory,
+                        "docker.discovery_fresh",
+                        "Docker enrollment inventory is fresh",
+                        None,
+                        None,
+                    )
+                    .await;
+                publisher
+                    .observe(
+                        "topology.route_intent",
+                        if route_mismatch {
+                            CheckStatus::Degraded
+                        } else if route_unknown {
+                            CheckStatus::Unknown
+                        } else {
+                            CheckStatus::Healthy
+                        },
+                        Impact::Advisory,
+                        if route_mismatch {
+                            "route_intent.alternate_selected"
+                        } else if route_unknown {
+                            "route_intent.unknown"
+                        } else if client_count == 0 {
+                            "route_intent.no_clients"
+                        } else {
+                            "route_intent.egress_selected"
+                        },
+                        if route_mismatch {
+                            "Docker declares an alternate IPv4 default for one or more enrolled clients; effective routes are not runtime-attested"
+                        } else if route_unknown {
+                            "Docker gateway metadata is insufficient for one or more enrolled clients; effective routes are not runtime-attested"
+                        } else if client_count == 0 {
+                            "No enrolled clients require a declared-route observation"
+                        } else {
+                            "Docker declares the egress network as the IPv4 default for all enrolled clients; effective routes are not runtime-attested"
+                        },
+                        None,
+                        None,
+                    )
+                    .await;
+                publisher.observe(
+                    "topology.client_ipv6",
+                    if has_ipv6 { CheckStatus::Degraded } else { CheckStatus::Healthy },
+                    Impact::Advisory,
+                    if has_ipv6 { "topology.client_ipv6_unsupported" } else { "topology.client_ipv4_only" },
+                    if has_ipv6 { "An enrolled client has an IPv6 address; client IPv6 leak protection is unsupported" } else { "No enrolled client IPv6 address was discovered" },
+                    None,
+                    None,
+                ).await;
+                publisher
+                    .observe(
+                        "port_forward.target_selection",
+                        if target_count > 1 || invalid_labels {
+                            CheckStatus::Degraded
+                        } else {
+                            CheckStatus::Healthy
+                        },
+                        Impact::Optional,
+                        if target_count > 1 {
+                            "port_forward.target_ambiguous"
+                        } else if invalid_labels {
+                            "port_forward.target_port_invalid"
+                        } else {
+                            "port_forward.target_valid"
+                        },
+                        if target_count > 1 {
+                            "More than one enrolled container requests the single forwarded port"
+                        } else if invalid_labels {
+                            "A forwarding target has a missing or invalid target-port label"
+                        } else {
+                            "Forwarding target labels are unambiguous"
+                        },
+                        None,
+                        None,
+                    )
+                    .await;
+                publisher
+                    .observe(
+                        "topology.client_lifecycle",
+                        if stopped {
+                            CheckStatus::Degraded
+                        } else {
+                            CheckStatus::Healthy
+                        },
+                        Impact::Advisory,
+                        if stopped {
+                            "topology.client_not_running"
+                        } else {
+                            "topology.clients_running"
+                        },
+                        if stopped {
+                            "One or more enrolled containers are not running"
+                        } else {
+                            "All discovered enrolled containers are running"
+                        },
+                        None,
+                        None,
+                    )
+                    .await;
+                publisher.observe("topology.configured", CheckStatus::Healthy, Impact::Critical, "topology.config_consistent", "Configured subnet, gateway, bridge, and policy table are internally consistent", None, None).await;
+            }
+            Err(error) => {
+                warn!(%error, "Docker discovery failed");
+                state.write().await.last_error = Some(format!("Docker discovery failed: {error}"));
+                publisher
+                    .observe(
+                        "docker.discovery",
+                        CheckStatus::Degraded,
+                        Impact::Advisory,
+                        "docker.discovery_failed",
+                        "Docker enrollment inventory could not be refreshed",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+        match observer.discover_isolation_candidates().await {
+            Ok(candidates) => {
+                let policy = crate::isolation::build_policy(
+                    &config.network.name,
+                    &config.network.host_bridge,
+                    config.network.subnet,
+                    candidates,
+                    unix_ms(),
+                );
+                let complete = policy.eligible_for_enforcement;
+                let has_participants = !policy.participants.is_empty();
+                publisher
+                    .mutate(|snapshot| {
+                        snapshot.topology.client_isolation = if complete {
+                            "policy_complete_agent_mode_external".to_owned()
+                        } else if has_participants {
+                            "policy_incomplete_audit_only".to_owned()
+                        } else {
+                            "no_running_participants".to_owned()
+                        };
+                        snapshot.isolation_policy = policy;
+                    })
+                    .await;
+                publisher
+                    .observe(
+                        "topology.client_isolation",
+                        if complete {
+                            CheckStatus::Healthy
+                        } else if has_participants {
+                            CheckStatus::Degraded
+                        } else {
+                            CheckStatus::Unknown
+                        },
+                        Impact::Advisory,
+                        if complete {
+                            "isolation.policy_complete"
+                        } else if has_participants {
+                            "isolation.policy_incomplete"
+                        } else {
+                            "isolation.no_participants"
+                        },
+                        if complete {
+                            "Every running bridge participant has a complete isolation identity and allow-list"
+                        } else if has_participants {
+                            "Bridge isolation policy is incomplete; enforce mode must degrade to audit"
+                        } else {
+                            "No running IPv4 bridge participants were discovered"
+                        },
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                warn!(%error, "Docker isolation inventory failed");
+                publisher
+                    .observe(
+                        "topology.client_isolation",
+                        CheckStatus::Degraded,
+                        Impact::Advisory,
+                        "isolation.inventory_unavailable",
+                        "Bridge isolation inventory could not be refreshed",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+const CLIENT_TRAFFIC_HISTORY_CAPACITY: usize = 120;
+
+async fn monitor_client_traffic(
+    state: SharedState,
+    publisher: StatePublisher,
+    enforcement: EnforcementCoordinator,
+    history: SharedHistory,
+    telemetry_metrics: crate::telemetry::TelemetryMetrics,
+) -> anyhow::Result<()> {
+    let mut ticker = interval(Duration::from_secs(5));
+    loop {
+        ticker.tick().await;
+        match enforcement.sample_client_counters().await {
+            Ok(counters) => {
+                let now = unix_ms();
+                let mut legacy = state.write().await;
+                for (container_id, totals) in counters {
+                    let Some(client) = legacy.clients.get_mut(&container_id) else {
+                        continue;
+                    };
+                    client.traffic.download_packets = totals.download_packets;
+                    client.traffic.downloaded_bytes = totals.downloaded_bytes;
+                    client.traffic.upload_packets = totals.upload_packets;
+                    client.traffic.uploaded_bytes = totals.uploaded_bytes;
+                    client.traffic.sampled_at_unix_ms = Some(now);
+                    record_client_traffic_sample(&mut client.traffic, now);
+                    telemetry_metrics.record_client(
+                        &client.usage_id,
+                        totals.downloaded_bytes,
+                        totals.uploaded_bytes,
+                        totals.download_packets,
+                        totals.upload_packets,
+                    );
+                    if let Some(store) = history.read().await.clone() {
+                        store.record_usage(UsageObservation {
+                            sampled_at_unix_ms: now,
+                            usage_id: client.usage_id.clone(),
+                            usage_id_source: client.usage_id_source,
+                            container_id: container_id.clone(),
+                            ipv4_address: client.ipv4_address.to_string(),
+                            name: client.name.clone(),
+                            download_bytes: totals.downloaded_bytes,
+                            upload_bytes: totals.uploaded_bytes,
+                            download_packets: totals.download_packets,
+                            upload_packets: totals.upload_packets,
+                        });
+                    }
+                }
+                let clients = legacy.clients.clone();
+                drop(legacy);
+                publisher
+                    .mutate(|snapshot| snapshot.clients = clients)
+                    .await;
+                publisher
+                    .observe(
+                        "traffic.clients",
+                        CheckStatus::Healthy,
+                        Impact::Advisory,
+                        "traffic.client_counters_sampled",
+                        "Per-client nftables counters were sampled",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                warn!(%error, "unable to sample per-client nftables counters");
+                publisher
+                    .observe(
+                        "traffic.clients",
+                        CheckStatus::Degraded,
+                        Impact::Advisory,
+                        "traffic.client_counters_unavailable",
+                        "Per-client nftables counters are unavailable",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+async fn open_history(config: crate::config::PersistenceConfig) -> anyhow::Result<HistoryStore> {
+    tokio::task::spawn_blocking(move || HistoryStore::open(&config))
+        .await
+        .context("history initialization worker panicked")?
+}
+
+async fn supervise_history(
+    config: crate::config::PersistenceConfig,
+    history: SharedHistory,
+    publisher: StatePublisher,
+) {
+    let mut ticker = interval(Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        let current = history.read().await.clone();
+        if let Some(store) = current {
+            match store.flush().await {
+                Ok(()) => {
+                    let dropped = store.dropped_writes();
+                    publisher
+                        .observe(
+                            "history.persistence",
+                            if dropped == 0 {
+                                CheckStatus::Healthy
+                            } else {
+                                CheckStatus::Degraded
+                            },
+                            Impact::Advisory,
+                            if dropped == 0 {
+                                "history.database_ready"
+                            } else {
+                                "history.writer_dropped_samples"
+                            },
+                            if dropped == 0 {
+                                "App-owned history database is ready"
+                            } else {
+                                "The bounded history writer dropped one or more observations"
+                            },
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    warn!(%error, "history writer failed; reconnecting in the background");
+                    *history.write().await = None;
+                    publisher
+                        .observe(
+                            "history.persistence",
+                            CheckStatus::Degraded,
+                            Impact::Advisory,
+                            "history.writer_unavailable",
+                            "App-owned history writer failed; current-state operation continues",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+            }
+        } else {
+            match open_history(config.clone()).await {
+                Ok(store) => {
+                    *history.write().await = Some(store);
+                    publisher
+                        .observe(
+                            "history.persistence",
+                            CheckStatus::Healthy,
+                            Impact::Advisory,
+                            "history.database_recovered",
+                            "App-owned history database recovered",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    warn!(%error, "history database retry failed");
+                }
+            }
+        }
+    }
+}
+
+async fn record_history(history: SharedHistory, publisher: StatePublisher) {
+    let mut events = publisher.subscribe_events();
+    let mut snapshots = publisher.subscribe();
+    let mut last_port_sequence = snapshots.borrow().port_forward.change_sequence;
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                if let Ok(transition) = event {
+                    if let Some(store) = history.read().await.clone() {
+                        store.record_transition(transition);
+                    }
+                }
+            }
+            result = snapshots.changed() => {
+                if result.is_err() {
+                    return;
+                }
+                let snapshot = snapshots.borrow().clone();
+                if snapshot.port_forward.change_sequence != 0
+                    && snapshot.port_forward.change_sequence != last_port_sequence
+                {
+                    last_port_sequence = snapshot.port_forward.change_sequence;
+                    if let Some(store) = history.read().await.clone() {
+                        store.record_port_forward(PortForwardObservation {
+                            timestamp_unix_ms: snapshot
+                                .port_forward
+                                .changed_at_unix_ms
+                                .unwrap_or(snapshot.generated_at_unix_ms),
+                            phase: snapshot.port_forward.phase,
+                            external_port: snapshot.port_forward.external_port,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn record_client_traffic_sample(traffic: &mut crate::state::ClientTrafficState, now: u64) {
+    let changed = traffic.history.back().is_none_or(|sample| {
+        sample.downloaded_bytes != traffic.downloaded_bytes
+            || sample.uploaded_bytes != traffic.uploaded_bytes
+    });
+    if changed {
+        if traffic.history.len() == CLIENT_TRAFFIC_HISTORY_CAPACITY {
+            traffic.history.pop_front();
+        }
+        traffic
+            .history
+            .push_back(crate::state::ClientTrafficSample {
+                sampled_at_unix_ms: now,
+                downloaded_bytes: traffic.downloaded_bytes,
+                uploaded_bytes: traffic.uploaded_bytes,
+            });
+    }
+}
+
+async fn monitor_tunnel(
+    config: Config,
+    state: SharedState,
+    publisher: StatePublisher,
+    enforcement: EnforcementCoordinator,
+    port_change_tx: watch::Sender<u64>,
+) -> anyhow::Result<()> {
+    let mut ticker = interval(Duration::from_secs(1));
+    let mut previous_counters = None;
+    let mut samples_since_handshake = 10_u8;
+    let mut tunnel_failures = 0_u32;
+    let mut recovery_attempt = 0_u32;
+    let mut tunnel_successes = 0_u32;
+    loop {
+        ticker.tick().await;
+        match read_interface_counters(&config.wireguard.interface).await {
+            Ok(counters) => {
+                let now = Instant::now();
+                let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+                let rates = previous_counters
+                    .map(|(previous, sampled_at)| {
+                        calculate_rates(previous, counters, now - sampled_at)
+                    })
+                    .unwrap_or_default();
+                previous_counters = Some((counters, now));
+                let mut state = state.write().await;
+                state.traffic.download_bytes_per_second = rates.0;
+                state.traffic.upload_bytes_per_second = rates.1;
+                state.traffic.downloaded_bytes = counters.0;
+                state.traffic.uploaded_bytes = counters.1;
+                state.traffic.sampled_at_unix_ms = Some(unix_ms);
+                let traffic = state.traffic.clone();
+                drop(state);
+                publisher
+                    .mutate(|snapshot| snapshot.traffic = traffic)
+                    .await;
+                publisher
+                    .observe(
+                        "wireguard.traffic",
+                        CheckStatus::Healthy,
+                        Impact::Advisory,
+                        "wireguard.counters_sampled",
+                        "WireGuard traffic counters were sampled",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                warn!(%error, "unable to sample WireGuard traffic counters");
+                publisher
+                    .observe(
+                        "wireguard.traffic",
+                        CheckStatus::Degraded,
+                        Impact::Advisory,
+                        "wireguard.counters_unavailable",
+                        "WireGuard traffic counters are unavailable",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+
+        // Handshake inspection invokes `wg`; sampling it every ten seconds keeps
+        // the traffic display responsive without spawning a process every second.
+        if samples_since_handshake < 10 {
+            samples_since_handshake += 1;
+            continue;
+        }
+        samples_since_handshake = 0;
+        match wireguard_handshake(&config.wireguard.interface).await {
+            Ok(handshake) => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                let up =
+                    handshake.is_some_and(|value| value != 0 && now.saturating_sub(value) < 180);
+                if up {
+                    enforcement.enable_dnat().await;
+                } else {
+                    enforcement.disable_dnat().await?;
+                    invalidate_published_forward(&state, &publisher, PortForwardPhase::Unavailable)
+                        .await;
+                }
+                let mut state = state.write().await;
+                let tunnel_changed = state.tunnel.up != up;
+                state.tunnel.up = up;
+                state.tunnel.latest_handshake_unix = handshake.filter(|value| *value != 0);
+                drop(state);
+                if tunnel_changed {
+                    notify_port_change(&port_change_tx);
+                }
+                publisher
+                    .observe(
+                        "wireguard.interface",
+                        CheckStatus::Healthy,
+                        Impact::Critical,
+                        "wireguard.interface_present",
+                        "The WireGuard interface is present",
+                        None,
+                        None,
+                    )
+                    .await;
+                publisher
+                    .observe(
+                        "wireguard.handshake",
+                        if up {
+                            CheckStatus::Healthy
+                        } else {
+                            CheckStatus::Failed
+                        },
+                        Impact::Critical,
+                        if up {
+                            "wireguard.handshake_recent"
+                        } else {
+                            "wireguard.handshake_stale"
+                        },
+                        if up {
+                            "A recent WireGuard handshake was observed"
+                        } else {
+                            "The WireGuard handshake is missing or stale"
+                        },
+                        None,
+                        None,
+                    )
+                    .await;
+                if up {
+                    tunnel_failures = 0;
+                    tunnel_successes = tunnel_successes.saturating_add(1);
+                    if tunnel_successes >= config.recovery.success_threshold {
+                        recovery_attempt = 0;
+                        publisher
+                            .mutate(|snapshot| snapshot.recovery = Default::default())
+                            .await;
+                    }
+                } else {
+                    tunnel_successes = 0;
+                    tunnel_failures = tunnel_failures.saturating_add(1);
+                }
+            }
+            Err(error) => {
+                enforcement.disable_dnat().await?;
+                invalidate_published_forward(&state, &publisher, PortForwardPhase::Unavailable)
+                    .await;
+                let mut state = state.write().await;
+                let tunnel_changed = state.tunnel.up;
+                state.tunnel.up = false;
+                drop(state);
+                if tunnel_changed {
+                    notify_port_change(&port_change_tx);
+                }
+                warn!(%error, "unable to inspect WireGuard tunnel");
+                tunnel_failures = tunnel_failures.saturating_add(1);
+                tunnel_successes = 0;
+                publisher
+                    .observe(
+                        "wireguard.interface",
+                        CheckStatus::Failed,
+                        Impact::Critical,
+                        "wireguard.interface_missing",
+                        "The WireGuard interface could not be inspected",
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+        }
+        if config.recovery.enabled
+            && config.wireguard.manage
+            && tunnel_failures >= config.recovery.failure_threshold
+        {
+            {
+                let mut state = state.write().await;
+                state.tunnel.up = false;
+            }
+            notify_port_change(&port_change_tx);
+            recovery_attempt = recovery_attempt.saturating_add(1);
+            let delay = crate::recovery::retry_delay_seconds(
+                recovery_attempt,
+                config.recovery.maximum_backoff_seconds,
+            );
+            let next = unix_ms().saturating_add(delay.saturating_mul(1000));
+            publisher
+                .mutate(|snapshot| {
+                    snapshot.recovery.active = true;
+                    snapshot.recovery.attempt = recovery_attempt;
+                    snapshot.recovery.reason_code = Some("wireguard.recovery_required".to_owned());
+                    snapshot.recovery.next_attempt_at_unix_ms = Some(next);
+                })
+                .await;
+            if let Err(error) = enforcement.disable_dnat().await {
+                publisher
+                    .observe(
+                        "gateway.firewall",
+                        CheckStatus::Failed,
+                        Impact::Critical,
+                        "firewall.reconciliation_failed",
+                        "The owned firewall could not be reconciled before tunnel recovery",
+                        None,
+                        Some(recovery_attempt),
+                    )
+                    .await;
+                warn!(%error, "unable to reconcile firewall for tunnel recovery");
+                continue;
+            }
+            invalidate_published_forward(&state, &publisher, PortForwardPhase::Unavailable).await;
+            notify_port_change(&port_change_tx);
+            sleep(Duration::from_secs(delay)).await;
+            wireguard_down(&config).await;
+            match wireguard_up(&config).await {
+                Ok(()) => {
+                    tunnel_failures = 0;
+                    publisher
+                        .observe(
+                            "gateway.routes",
+                            CheckStatus::Healthy,
+                            Impact::Critical,
+                            "routes.reinstalled",
+                            "Gateway policy routes were reinstalled during recovery",
+                            None,
+                            Some(recovery_attempt),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    warn!(%error, "WireGuard recovery attempt failed");
+                    publisher
+                        .observe(
+                            "wireguard.interface",
+                            CheckStatus::Failed,
+                            Impact::Critical,
+                            "wireguard.recovery_failed",
+                            "The WireGuard recovery attempt failed",
+                            None,
+                            Some(recovery_attempt),
+                        )
+                        .await;
+                    tunnel_failures = config.recovery.failure_threshold;
+                }
+            }
+        }
+    }
+}
+
+async fn read_interface_counters(interface: &str) -> anyhow::Result<(u64, u64)> {
+    let base = format!("/sys/class/net/{interface}/statistics");
+    let rx = tokio::fs::read_to_string(format!("{base}/rx_bytes"))
+        .await?
+        .trim()
+        .parse()
+        .context("parsing WireGuard rx_bytes")?;
+    let tx = tokio::fs::read_to_string(format!("{base}/tx_bytes"))
+        .await?
+        .trim()
+        .parse()
+        .context("parsing WireGuard tx_bytes")?;
+    Ok((rx, tx))
+}
+
+fn calculate_rates(previous: (u64, u64), current: (u64, u64), elapsed: Duration) -> (u64, u64) {
+    let elapsed = elapsed.as_secs_f64();
+    if elapsed <= 0.0 {
+        return (0, 0);
+    }
+    (
+        (current.0.saturating_sub(previous.0) as f64 / elapsed).round() as u64,
+        (current.1.saturating_sub(previous.1) as f64 / elapsed).round() as u64,
+    )
+}
+
+fn dnat_install_required(
+    active_forward: Option<(u16, Ipv4Addr, u16)>,
+    desired: (u16, Ipv4Addr, u16),
+    applied: bool,
+) -> bool {
+    active_forward != Some(desired) || !applied
+}
+
+async fn maintain_port_forward(
+    config: Config,
+    state: SharedState,
+    publisher: StatePublisher,
+    enforcement: EnforcementCoordinator,
+    mut port_change_rx: watch::Receiver<u64>,
+) -> anyhow::Result<()> {
+    if !config.proton.port_forwarding {
+        futures_util::future::pending::<()>().await;
+        return Ok(());
+    }
+    let client = NatPmpClient::new(config.proton.natpmp_gateway);
+    let mut assigned_port = 0_u16;
+    let mut active_forward = None;
+
+    loop {
+        if !state.read().await.tunnel.up {
+            deactivate_forward(
+                &state,
+                &publisher,
+                &enforcement,
+                &mut active_forward,
+                PortForwardPhase::Unavailable,
+                "port_forward.tunnel_unavailable",
+            )
+            .await?;
+            wait_for_port_change(&mut port_change_rx, Duration::from_secs(2)).await;
+            continue;
+        }
+
+        let target = select_port_target(&state).await;
+        let Some((target_name, dnat_target)) = target else {
+            let targets = state
+                .read()
+                .await
+                .clients
+                .values()
+                .filter(|client| client.port_forward_target)
+                .count();
+            let phase = if targets > 1 {
+                PortForwardPhase::TargetAmbiguous
+            } else {
+                PortForwardPhase::WaitingForTarget
+            };
+            deactivate_forward(
+                &state,
+                &publisher,
+                &enforcement,
+                &mut active_forward,
+                phase,
+                if targets > 1 {
+                    "port_forward.target_ambiguous"
+                } else {
+                    "port_forward.target_missing"
+                },
+            )
+            .await?;
+            wait_for_port_change(
+                &mut port_change_rx,
+                Duration::from_secs(config.proton.refresh_seconds),
+            )
+            .await;
+            continue;
+        };
+        let target_ip = dnat_target.address;
+        let target_port = dnat_target.port;
+
+        match client.external_address().await {
+            Ok(public_ip) => match natpmp::request_symmetric_mapping(
+                &client,
+                assigned_port,
+                if assigned_port == 0 { 1 } else { assigned_port },
+                config.proton.lifetime_seconds,
+            )
+            .await
+            {
+                Ok(mapping) => {
+                    let desired_forward = (mapping.external_port, target_ip, target_port);
+                    let port_changed = assigned_port != 0 && assigned_port != mapping.external_port;
+                    let mapping_changed = active_forward != Some(desired_forward);
+                    let mapping_applied = enforcement.dnat_is_applied(desired_forward).await;
+                    let install_required =
+                        dnat_install_required(active_forward, desired_forward, mapping_applied);
+                    let now = unix_ms();
+                    if install_required {
+                        if !enforcement
+                            .set_dnat_for_target(desired_forward, &dnat_target)
+                            .await?
+                        {
+                            wait_for_port_change(&mut port_change_rx, Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        active_forward = Some(desired_forward);
+                    }
+                    assigned_port = mapping.external_port;
+                    let mut state = state.write().await;
+                    state.port_forward.active = true;
+                    state.port_forward.public_ip = Some(public_ip);
+                    state.port_forward.port = Some(mapping.external_port);
+                    state.port_forward.target = Some(target_name.clone());
+                    state.port_forward.target_port = Some(target_port);
+                    state.port_forward.expires_in_seconds = Some(mapping.lifetime_seconds);
+                    state.port_forward.lease_acquired_at_unix_ms = Some(now);
+                    drop(state);
+                    publisher
+                        .mutate(|snapshot| {
+                            if mapping_changed {
+                                snapshot.sequence += 1;
+                                snapshot.port_forward.change_sequence = snapshot.sequence;
+                                snapshot.port_forward.changed_at_unix_ms = Some(now);
+                            }
+                            snapshot.port_forward.phase = PortForwardPhase::Installed;
+                            snapshot.port_forward.requested_target = Some(target_name.clone());
+                            snapshot.port_forward.internal_port = Some(target_port);
+                            snapshot.port_forward.external_port = Some(mapping.external_port);
+                            snapshot.port_forward.tcp_udp_agree = Some(true);
+                            snapshot.port_forward.lease_acquired_at_unix_ms = Some(now);
+                            snapshot.port_forward.lease_expires_at_unix_ms =
+                                Some(now + u64::from(mapping.lifetime_seconds) * 1000);
+                            snapshot.port_forward.dnat_installed = true;
+                            snapshot.port_forward.externally_verified = None;
+                        })
+                        .await;
+                    publisher
+                        .observe(
+                            "port_forward.verification",
+                            CheckStatus::Unknown,
+                            Impact::Optional,
+                            "port_forward.verification_unknown",
+                            "The renewed lease has no matching external reachability evidence yet",
+                            None,
+                            None,
+                        )
+                        .await;
+                    if port_changed {
+                        publisher
+                            .emit(
+                                "port_forward",
+                                "port_forward.port_changed",
+                                "The provider assigned a different forwarded port",
+                            )
+                            .await;
+                    }
+                    observe_installed_forward(&publisher).await;
+                    info!("Proton forwarded port active");
+                }
+                Err(error) => {
+                    record_port_error(&state, error.to_string()).await;
+                    deactivate_forward(
+                        &state,
+                        &publisher,
+                        &enforcement,
+                        &mut active_forward,
+                        PortForwardPhase::LeaseLost,
+                        "port_forward.lease_lost",
+                    )
+                    .await?;
+                }
+            },
+            Err(error) => {
+                record_port_error(&state, error.to_string()).await;
+                deactivate_forward(
+                    &state,
+                    &publisher,
+                    &enforcement,
+                    &mut active_forward,
+                    PortForwardPhase::LeaseLost,
+                    "port_forward.lease_lost",
+                )
+                .await?;
+            }
+        }
+        wait_for_port_change(
+            &mut port_change_rx,
+            Duration::from_secs(config.proton.refresh_seconds),
+        )
+        .await;
+    }
+}
+
+fn notify_port_change(sender: &watch::Sender<u64>) {
+    sender.send_modify(|version| *version = version.wrapping_add(1));
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortForwardTargetInput {
+    container_id: String,
+    address: Ipv4Addr,
+    target_port: Option<u16>,
+    compliant: bool,
+    running: bool,
+}
+
+fn port_forward_target_inputs(
+    clients: &BTreeMap<String, crate::state::ClientState>,
+) -> Vec<PortForwardTargetInput> {
+    clients
+        .values()
+        .filter(|client| client.port_forward_target)
+        .map(|client| PortForwardTargetInput {
+            container_id: client.container_id.clone(),
+            address: client.ipv4_address,
+            target_port: client.target_port,
+            compliant: client.compliant,
+            running: client.running,
+        })
+        .collect()
+}
+
+async fn wait_for_port_change(receiver: &mut watch::Receiver<u64>, duration: Duration) {
+    tokio::select! {
+        _ = sleep(duration) => {}
+        changed = receiver.changed() => {
+            if changed.is_err() {
+                futures_util::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+async fn observe_installed_forward(publisher: &StatePublisher) {
+    for (component, reason) in [
+        ("port_forward.dnat", "port_forward.dnat_installed"),
+        ("port_forward.lifecycle", "port_forward.lease_installed"),
+    ] {
+        publisher
+            .observe(
+                component,
+                CheckStatus::Healthy,
+                Impact::Optional,
+                reason,
+                "The current symmetric lease is installed in the owned firewall",
+                None,
+                None,
+            )
+            .await;
+    }
+}
+
+async fn invalidate_published_forward(
+    state: &SharedState,
+    publisher: &StatePublisher,
+    phase: PortForwardPhase,
+) {
+    let mut legacy = state.write().await;
+    legacy.port_forward.active = false;
+    legacy.port_forward.lease_acquired_at_unix_ms = None;
+    drop(legacy);
+    let now = unix_ms();
+    publisher
+        .mutate(|snapshot| {
+            if snapshot.port_forward.dnat_installed || snapshot.port_forward.phase != phase {
+                snapshot.sequence += 1;
+                snapshot.port_forward.change_sequence = snapshot.sequence;
+                snapshot.port_forward.changed_at_unix_ms = Some(now);
+            }
+            snapshot.port_forward.phase = phase;
+            snapshot.port_forward.dnat_installed = false;
+            snapshot.port_forward.external_port = None;
+            snapshot.port_forward.lease_acquired_at_unix_ms = None;
+            snapshot.port_forward.lease_expires_at_unix_ms = None;
+            snapshot.port_forward.externally_verified = None;
+        })
+        .await;
+}
+
+async fn deactivate_forward(
+    state: &SharedState,
+    publisher: &StatePublisher,
+    enforcement: &EnforcementCoordinator,
+    active_forward: &mut Option<(u16, Ipv4Addr, u16)>,
+    phase: PortForwardPhase,
+    reason: &str,
+) -> anyhow::Result<()> {
+    if active_forward.is_some() {
+        if let Err(error) = enforcement.clear_dnat().await {
+            publisher
+                .observe(
+                    "gateway.firewall",
+                    CheckStatus::Failed,
+                    Impact::Critical,
+                    "firewall.dnat_removal_failed",
+                    "Optional DNAT could not be removed; forwarding state remains unresolved",
+                    None,
+                    None,
+                )
+                .await;
+            return Err(error);
+        }
+    }
+    *active_forward = None;
+    let mut legacy = state.write().await;
+    legacy.port_forward.active = false;
+    legacy.port_forward.lease_acquired_at_unix_ms = None;
+    drop(legacy);
+    let now = unix_ms();
+    publisher
+        .mutate(|snapshot| {
+            let changed =
+                snapshot.port_forward.phase != phase || snapshot.port_forward.dnat_installed;
+            if changed {
+                snapshot.sequence += 1;
+                snapshot.port_forward.change_sequence = snapshot.sequence;
+                snapshot.port_forward.changed_at_unix_ms = Some(now);
+            }
+            snapshot.port_forward.phase = phase;
+            snapshot.port_forward.dnat_installed = false;
+            snapshot.port_forward.external_port = None;
+            snapshot.port_forward.lease_acquired_at_unix_ms = None;
+            snapshot.port_forward.lease_expires_at_unix_ms = None;
+            snapshot.port_forward.externally_verified = None;
+        })
+        .await;
+    publisher
+        .observe(
+            "port_forward.lifecycle",
+            if matches!(
+                phase,
+                PortForwardPhase::TargetAmbiguous
+                    | PortForwardPhase::LeaseLost
+                    | PortForwardPhase::InstallFailed
+                    | PortForwardPhase::VerificationFailed
+                    | PortForwardPhase::Unavailable
+            ) {
+                CheckStatus::Degraded
+            } else {
+                CheckStatus::Healthy
+            },
+            Impact::Optional,
+            reason,
+            "The forwarded-port lifecycle changed",
+            None,
+            None,
+        )
+        .await;
+    publisher
+        .observe(
+            "port_forward.dnat",
+            CheckStatus::Healthy,
+            Impact::Optional,
+            reason,
+            "No optional DNAT rule is installed",
+            None,
+            None,
+        )
+        .await;
+    Ok(())
+}
+
+async fn select_port_target(state: &SharedState) -> Option<(String, DnatTarget)> {
+    let state = state.read().await;
+    let mut targets = state
+        .clients
+        .values()
+        .filter(|client| client.port_forward_target && client.compliant);
+    let target = targets.next()?;
+    if targets.next().is_some() {
+        return None;
+    }
+    Some((
+        target.name.clone(),
+        DnatTarget {
+            container_id: target.container_id.clone(),
+            address: target.ipv4_address,
+            port: target.target_port?,
+        },
+    ))
+}
+
+async fn record_port_error(state: &SharedState, error: String) {
+    warn!(%error, "Proton port forwarding failed");
+    let mut state = state.write().await;
+    state.port_forward.active = false;
+    state.last_error = Some(format!("Proton port forwarding failed: {error}"));
+}
+
+async fn wireguard_up(config: &Config) -> anyhow::Result<()> {
+    let runtime_path = prepare_wireguard_profile(config).await?;
+    let runtime_path = runtime_path
+        .to_str()
+        .context("WireGuard runtime path is not valid UTF-8")?;
+    command("wg-quick", &["up", runtime_path]).await?;
+    configure_gateway_routes(config).await
+}
+
+async fn prepare_wireguard_profile(config: &Config) -> anyhow::Result<std::path::PathBuf> {
+    let profile = if let Some(encoded_path) = &config.wireguard.config_base64_path {
+        let encoded = tokio::fs::read_to_string(encoded_path)
+            .await
+            .context("reading base64 WireGuard Docker secret")?;
+        STANDARD
+            .decode(encoded.trim())
+            .context("decoding base64 WireGuard Docker secret")?
+    } else {
+        let metadata = tokio::fs::metadata(&config.wireguard.config_path)
+            .await
+            .context("WireGuard configuration must be mounted as a secret")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                bail!("WireGuard configuration must not be readable by group or others");
+            }
+        }
+        tokio::fs::read(&config.wireguard.config_path)
+            .await
+            .context("reading mounted WireGuard configuration")?
+    };
+    if !profile.starts_with(b"[Interface]") || !profile.windows(6).any(|value| value == b"[Peer]") {
+        bail!("decoded WireGuard secret is not a supported configuration");
+    }
+    let runtime_path =
+        std::path::Path::new("/run/egressy").join(format!("{}.conf", config.wireguard.interface));
+    let runtime_directory = runtime_path
+        .parent()
+        .context("WireGuard runtime path has no parent")?;
+    tokio::fs::create_dir_all(runtime_directory).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(runtime_directory, std::fs::Permissions::from_mode(0o700))
+            .await?;
+    }
+    tokio::fs::write(&runtime_path, force_table_off(profile)?).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&runtime_path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    Ok(runtime_path)
+}
+
+fn force_table_off(config: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let config = String::from_utf8(config).context("WireGuard configuration is not UTF-8")?;
+    let mut output = String::with_capacity(config.len() + 12);
+    let mut inserted = false;
+    for line in config.lines() {
+        output.push_str(line);
+        output.push('\n');
+        if line.trim() == "[Interface]" {
+            output.push_str("Table = off\n");
+            inserted = true;
+        } else if line.trim_start().starts_with("Table") {
+            bail!("WireGuard configuration must not define Table; Egressy manages policy routing");
+        }
+    }
+    if !inserted {
+        bail!("WireGuard configuration has no [Interface] section");
+    }
+    Ok(output.into_bytes())
+}
+
+async fn configure_gateway_routes(config: &Config) -> anyhow::Result<()> {
+    let table = config.network.route_table.to_string();
+    let subnet = config.network.subnet.to_string();
+    let tunnel = &config.wireguard.interface;
+    let gateway = config.proton.natpmp_gateway.to_string();
+    let local_gateway = config.network.gateway_ip.to_string();
+
+    // Forwarded packets retain the enrolled container's source address, so a
+    // source rule selects the tunnel without moving Egressy's management/API
+    // traffic away from its ordinary Docker uplink.
+    let _ = command("ip", &["rule", "del", "from", &subnet, "lookup", &table]).await;
+    let _ = command(
+        "ip",
+        &["rule", "del", "from", &local_gateway, "lookup", "main"],
+    )
+    .await;
+    // DNS and dashboard replies originate from the gateway's vpn-egress
+    // address. Keep them on the connected bridge instead of selecting wg0.
+    command(
+        "ip",
+        &[
+            "rule",
+            "add",
+            "priority",
+            "90",
+            "from",
+            &local_gateway,
+            "lookup",
+            "main",
+        ],
+    )
+    .await?;
+    command(
+        "ip",
+        &[
+            "rule", "add", "priority", "100", "from", &subnet, "lookup", &table,
+        ],
+    )
+    .await?;
+    command(
+        "ip",
+        &[
+            "route", "replace", "table", &table, "default", "dev", tunnel,
+        ],
+    )
+    .await?;
+    command(
+        "ip",
+        &["route", "replace", &gateway, "dev", tunnel, "scope", "link"],
+    )
+    .await
+}
+
+async fn wireguard_down(config: &Config) {
+    let runtime_path =
+        std::path::Path::new("/run/egressy").join(format!("{}.conf", config.wireguard.interface));
+    let runtime_path = runtime_path.to_string_lossy();
+    if let Err(error) = command("wg-quick", &["down", &runtime_path]).await {
+        error!(%error, "failed to stop WireGuard cleanly");
+    }
+}
+
+async fn wireguard_handshake(interface: &str) -> anyhow::Result<Option<u64>> {
+    let output = Command::new("wg")
+        .args(["show", interface, "latest-handshakes"])
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!(
+            "wg show failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(|value| value.parse().ok())
+        .max())
+}
+
+async fn command(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+pub fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    fn forwarding_client(
+        id: &str,
+        address: &str,
+        target_port: Option<u16>,
+        compliant: bool,
+        running: bool,
+    ) -> crate::state::ClientState {
+        crate::state::ClientState {
+            container_id: id.into(),
+            usage_id: format!("test:{id}"),
+            usage_id_source: crate::state::UsageIdentitySource::ExplicitLabel,
+            name: id.into(),
+            ipv4_address: address.parse().unwrap(),
+            port_forward_target: true,
+            target_port,
+            compliant,
+            compliance_message: "test".into(),
+            running,
+            ipv6_address: None,
+            networks: vec!["vpn-egress".into()],
+            port_forward_label_valid: target_port.is_some(),
+            route_intent: crate::state::RouteIntentState::default(),
+            traffic: crate::state::ClientTrafficState::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_missing_firewall_owner_before_network_mutation() {
+        let mut config: Config = serde_yaml::from_str("{}").unwrap();
+        config.reconcile.apply_gateway_firewall = false;
+        let error = run(config, None).await.unwrap_err().to_string();
+        assert!(error.contains("must own the fail-closed gateway firewall"));
+    }
+
+    #[test]
+    fn calculates_byte_rates_over_sample_period() {
+        assert_eq!(
+            calculate_rates((1_000, 2_000), (3_000, 3_000), Duration::from_millis(500)),
+            (4_000, 2_000)
+        );
+    }
+
+    #[test]
+    fn counter_reset_does_not_underflow() {
+        assert_eq!(
+            calculate_rates((10_000, 10_000), (100, 200), Duration::from_secs(1)),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn same_mapping_after_recovery_requires_reinstall_before_publication() {
+        let mapping = (45_678, "172.30.0.10".parse().unwrap(), 6881);
+        assert!(dnat_install_required(Some(mapping), mapping, false));
+        assert!(!dnat_install_required(Some(mapping), mapping, true));
+    }
+
+    #[test]
+    fn client_traffic_history_is_bounded_and_skips_unchanged_totals() {
+        let mut traffic = crate::state::ClientTrafficState::default();
+        for index in 0..(CLIENT_TRAFFIC_HISTORY_CAPACITY + 10) {
+            traffic.downloaded_bytes = index as u64;
+            traffic.uploaded_bytes = (index * 2) as u64;
+            record_client_traffic_sample(&mut traffic, index as u64);
+        }
+        assert_eq!(traffic.history.len(), CLIENT_TRAFFIC_HISTORY_CAPACITY);
+        let last_len = traffic.history.len();
+        record_client_traffic_sample(&mut traffic, 999);
+        assert_eq!(traffic.history.len(), last_len);
+        assert_eq!(traffic.history.front().unwrap().downloaded_bytes, 10);
+    }
+
+    #[test]
+    fn direct_profile_without_table_gets_table_off() {
+        let config =
+            force_table_off(b"[Interface]\nPrivateKey=x\n\n[Peer]\nPublicKey=y\n".to_vec())
+                .unwrap();
+        let config = String::from_utf8(config).unwrap();
+        assert!(config.starts_with("[Interface]\nTable = off\n"));
+    }
+
+    #[test]
+    fn direct_profile_rejects_automatic_and_numeric_tables() {
+        for table in ["auto", "123"] {
+            assert!(force_table_off(
+                format!("[Interface]\nTable = {table}\n[Peer]\n").into_bytes()
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_forward_recovers_lifecycle_check() {
+        let publisher = StatePublisher::new(CanonicalSnapshot::default());
+        publisher
+            .observe(
+                "port_forward.lifecycle",
+                CheckStatus::Degraded,
+                Impact::Optional,
+                "port_forward.tunnel_unavailable",
+                "Tunnel unavailable",
+                None,
+                None,
+            )
+            .await;
+        observe_installed_forward(&publisher).await;
+        let snapshot = publisher.subscribe().borrow().clone();
+        assert_eq!(
+            snapshot.checks["port_forward.lifecycle"].status,
+            CheckStatus::Healthy
+        );
+        assert_eq!(
+            snapshot.checks["port_forward.lifecycle"].reason_code,
+            "port_forward.lease_installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforcement_invalidation_clears_published_dnat_state() {
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        state.write().await.port_forward.active = true;
+        let mut snapshot = CanonicalSnapshot::default();
+        snapshot.port_forward.phase = PortForwardPhase::Installed;
+        snapshot.port_forward.dnat_installed = true;
+        snapshot.port_forward.external_port = Some(45_678);
+        let publisher = StatePublisher::new(snapshot);
+
+        invalidate_published_forward(&state, &publisher, PortForwardPhase::Unavailable).await;
+
+        assert!(!state.read().await.port_forward.active);
+        let snapshot = publisher.subscribe().borrow().clone();
+        assert_eq!(snapshot.port_forward.phase, PortForwardPhase::Unavailable);
+        assert!(!snapshot.port_forward.dnat_installed);
+        assert_eq!(snapshot.port_forward.external_port, None);
+    }
+
+    #[tokio::test]
+    async fn stopped_tasks_cannot_reconcile_natpmp_or_restart_wireguard() {
+        let actions = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let mut tasks = Vec::new();
+        for action in &actions {
+            let action = action.clone();
+            tasks.push(tokio::spawn(async move {
+                sleep(Duration::from_millis(50)).await;
+                action.store(true, Ordering::SeqCst);
+            }));
+        }
+        for task in tasks {
+            stop_task(task).await;
+        }
+        sleep(Duration::from_millis(75)).await;
+        for action in actions {
+            assert!(!action.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn target_change_interrupts_the_lease_refresh_wait() {
+        let (sender, mut receiver) = watch::channel(0_u64);
+        notify_port_change(&sender);
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_for_port_change(&mut receiver, Duration::from_secs(45)),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn every_forwarding_target_lifecycle_change_is_observable() {
+        let original = [(
+            "old".to_owned(),
+            forwarding_client("old", "172.30.0.10", Some(6881), true, true),
+        )]
+        .into();
+        let baseline = port_forward_target_inputs(&original);
+
+        let cases: Vec<BTreeMap<String, crate::state::ClientState>> = vec![
+            BTreeMap::new(),
+            [(
+                "old".to_owned(),
+                forwarding_client("old", "172.30.0.10", Some(6881), false, true),
+            )]
+            .into(),
+            [(
+                "old".to_owned(),
+                forwarding_client("old", "172.30.0.10", Some(6881), true, false),
+            )]
+            .into(),
+            [(
+                "old".to_owned(),
+                forwarding_client("old", "172.30.0.11", Some(6881), true, true),
+            )]
+            .into(),
+            [
+                (
+                    "old".to_owned(),
+                    forwarding_client("old", "172.30.0.10", Some(6881), true, true),
+                ),
+                (
+                    "second".to_owned(),
+                    forwarding_client("second", "172.30.0.11", Some(6881), true, true),
+                ),
+            ]
+            .into(),
+            [(
+                "replacement".to_owned(),
+                forwarding_client("replacement", "172.30.0.10", Some(6881), true, true),
+            )]
+            .into(),
+        ];
+
+        for inputs in cases {
+            assert_ne!(baseline, port_forward_target_inputs(&inputs));
+        }
+    }
+}

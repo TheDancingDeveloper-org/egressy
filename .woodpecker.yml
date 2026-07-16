@@ -1,0 +1,61 @@
+when:
+  - event: push
+    branch: main
+  - event: pull_request
+  - event: manual
+
+steps:
+  - name: ui
+    image: mcr.microsoft.com/playwright:v1.61.1-noble
+    commands:
+      - cd ui
+      - npm ci
+      - npm test
+      - npm run build
+      - npm run test:e2e
+      - git diff --exit-code -- src/generated.ts dist/index.html
+
+  - name: test
+    image: rust:1.97
+    commands:
+      - rustup component add rustfmt clippy
+      - python3 -m unittest external-probe/test_external_probe_service.py
+      - cargo fmt --check
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --all-targets
+
+  - name: publish-gateway
+    image: woodpeckerci/plugin-docker-buildx
+    settings:
+      repo: repo.indexarr.net/indexarr/egressy
+      registry: repo.indexarr.net
+      username:
+        from_secret: git_auth_token
+      password:
+        from_secret: git_auth_token
+      platforms: linux/amd64,linux/arm64/v8
+      tags:
+        - latest
+        - ${CI_COMMIT_SHA}
+    when:
+      - event: push
+        branch: main
+
+  - name: publish-external-probe
+    image: woodpeckerci/plugin-docker-buildx
+    settings:
+      repo: repo.indexarr.net/indexarr/egressy-external-probe
+      registry: repo.indexarr.net
+      username:
+        from_secret: git_auth_token
+      password:
+        from_secret: git_auth_token
+      dockerfile: external-probe/Dockerfile
+      context: external-probe
+      platforms: linux/amd64,linux/arm64/v8
+      tags:
+        - latest
+        - ${CI_COMMIT_SHA}
+    when:
+      - event: push
+        branch: main

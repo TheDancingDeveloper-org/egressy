@@ -1,0 +1,22 @@
+/target/
+/config/config.yaml
+/mullvad/
+*.conf
+.env
+/ui/node_modules/
+/ui/test-results/
+/ui/playwright-report/
+/ui/demo-dist/
+__pycache__/
+*.py[cod]
+
+# Private operator notes and publication-excluded working artifacts.
+/.local/
+/docs/REVIEW-FINDINGS-*.md
+**/*[Dd][Ee][Ss][Ii][Gg][Nn]*.md
+**/*[Pp][Ll][Aa][Nn]*.md
+**/*[Rr][Ee][Qq][Uu][Ii][Rr][Ee][Mm][Ee][Nn][Tt]*.md
+**/*[Dd][Ee][Pp][Ll][Oo][Yy][Mm][Ee][Nn][Tt]*.md
+/docs/dev*.md
+/testprobe.md
+/glueton.md

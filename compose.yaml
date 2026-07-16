@@ -1,0 +1,119 @@
+services:
+  docker-api-proxy:
+    image: haproxy:3.2-alpine@sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a
+    container_name: egressy-docker-api-proxy
+    restart: unless-stopped
+    group_add:
+      - "${DOCKER_SOCKET_GID:?set DOCKER_SOCKET_GID to the numeric group of /var/run/docker.sock}"
+    read_only: true
+    tmpfs:
+      - /var/lib/haproxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/docker-api-proxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      docker-control:
+        ipv4_address: 169.254.254.2
+
+  egressy:
+    build: .
+    container_name: egressy
+    restart: unless-stopped
+    depends_on:
+      - docker-api-proxy
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    tmpfs:
+      - /run/egressy:mode=0700
+    environment:
+      EGRESSY_OTEL_ENABLED: "${EGRESSY_OTEL_ENABLED:-false}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}"
+      OTEL_EXPORTER_OTLP_TIMEOUT: "${OTEL_EXPORTER_OTLP_TIMEOUT:-10000}"
+      OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-egressy}"
+      EGRESSY_OTEL_HEADERS_PATH: "${EGRESSY_OTEL_HEADERS_PATH:-}"
+      EGRESSY_OTEL_INSECURE: "${EGRESSY_OTEL_INSECURE:-false}"
+    labels:
+      egressy.isolation-id: gateway
+      egressy.isolation-allow: egressy-probe:8081/tcp
+    volumes:
+      - ./config/config.yaml:/etc/egressy/config.yaml:ro
+      - egressy-data:/var/lib/egressy
+      # Replace the source with a protected Proton profile generated with NAT-PMP on.
+      - ${PROTON_WIREGUARD_CONFIG:?set PROTON_WIREGUARD_CONFIG}:/run/secrets/wg0.conf:ro
+    ports:
+      # Management UI is deliberately host-local by default.
+      - 127.0.0.1:8080:8080
+    networks:
+      uplink: {}
+      docker-control: {}
+      vpn-egress:
+        ipv4_address: 172.30.0.2
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://172.30.0.2:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  egressy-probe:
+    build: .
+    container_name: egressy-probe
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/egressy-probe"]
+    environment:
+      EGRESSY_PROBE_DNS: 172.30.0.2:53
+      EGRESSY_PROBE_IDENTITY_URL: https://ifconfig.co/json
+      EGRESSY_PROBE_IDENTITY_INTERVAL_SECONDS: 300
+      EGRESSY_PROBE_EXPECTED_IDENTITY: Datacamp
+    labels:
+      egressy.isolation-id: egressy-probe
+      egressy.isolation-allow: gateway:53/udp,gateway:53/tcp,gateway:8080/tcp
+    dns:
+      - 172.30.0.2
+    networks:
+      vpn-egress:
+        ipv4_address: 172.30.0.5
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8081/livez"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  egressy-isolation-agent:
+    build: .
+    container_name: egressy-isolation-agent
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/egressy-isolation-agent"]
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      EGRESSY_ISOLATION_POLICY_URL: http://127.0.0.1:8080/api/v2/isolation-policy
+      EGRESSY_ISOLATION_MODE: "${EGRESSY_ISOLATION_MODE:-disabled}"
+      EGRESSY_ISOLATION_INTERVAL_SECONDS: "5"
+      EGRESSY_ISOLATION_STALE_SECONDS: "30"
+    depends_on:
+      - egressy
+
+networks:
+  uplink: {}
+  docker-control:
+    internal: true
+    ipam:
+      config:
+        - subnet: 169.254.254.0/29
+  vpn-egress:
+    external: true
+
+volumes:
+  egressy-data: {}

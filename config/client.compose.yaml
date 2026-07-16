@@ -1,0 +1,24 @@
+services:
+  example-client:
+    image: alpine:3.22
+    command: ["sleep", "infinity"]
+    labels:
+      egressy.enabled: "true"
+      egressy.usage-id: "example/example-client"
+      egressy.isolation-id: "example-client"
+      # Proton allocates one public port per tunnel. Exactly one client can opt in.
+      egressy.port-forward: "true"
+      egressy.target-port: "6881"
+    networks:
+      app:
+        gw_priority: 0
+      vpn-egress:
+        # Makes vpn-egress this container's default route. Requires Compose 2.33.1+.
+        gw_priority: 100
+    dns:
+      - 172.30.0.2
+
+networks:
+  app: {}
+  vpn-egress:
+    external: true

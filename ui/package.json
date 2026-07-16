@@ -1,0 +1,31 @@
+{
+  "name": "egressy-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "generate:types": "openapi-typescript ../openapi/v2.json -o src/generated.ts",
+    "build": "npm run generate:types && vite build",
+    "build:demo": "npm run generate:types && VITE_DEMO=true vite build --outDir demo-dist",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@playwright/test": "latest",
+    "@testing-library/jest-dom": "latest",
+    "@testing-library/react": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "jsdom": "latest",
+    "openapi-typescript": "latest",
+    "typescript": "latest",
+    "vite-plugin-singlefile": "latest",
+    "vitest": "latest"
+  }
+}

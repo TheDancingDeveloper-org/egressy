@@ -1,0 +1,454 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Egressy API", "version": "2.0.0" },
+  "paths": {
+    "/api/v2/status": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Canonical operational snapshot",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CanonicalSnapshot" } } }
+          }
+        }
+      }
+    },
+    "/api/v2/isolation-policy": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Safe desired host bridge-isolation policy snapshot",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IsolationPolicy" } } }
+          }
+        }
+      }
+    },
+    "/api/v2/events": {
+      "get": {
+        "responses": {
+          "200": { "description": "Server-sent transition events" }
+        }
+      }
+    },
+    "/api/v2/settings/notifications": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Masked GUI-managed Omnihook settings",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NotificationSettingsView" } } }
+          }
+        }
+      },
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NotificationSettingsInput" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved masked Omnihook settings",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NotificationSettingsView" } } }
+          },
+          "400": { "description": "Invalid notification settings" }
+        }
+      }
+    },
+    "/api/v2/settings/notifications/test": {
+      "post": {
+        "responses": {
+          "204": { "description": "Test notification delivered" },
+          "502": { "description": "Test notification delivery failed" }
+        }
+      }
+    },
+    "/api/v2/history/usage": {
+      "get": {
+        "parameters": [
+          { "name": "from_unix_ms", "in": "query", "schema": { "type": "integer" } },
+          { "name": "to_unix_ms", "in": "query", "schema": { "type": "integer" } },
+          { "name": "bucket_seconds", "in": "query", "schema": { "type": "integer", "minimum": 60 } },
+          { "name": "usage_id", "in": "query", "schema": { "type": "string", "maxLength": 128 } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 10000 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "App-owned per-workload usage history",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UsageHistoryResponse" } } }
+          },
+          "400": { "description": "Invalid bounded history query" },
+          "503": { "description": "Local history database unavailable" }
+        }
+      }
+    },
+    "/api/v2/history/events": {
+      "get": {
+        "parameters": [
+          { "name": "from_unix_ms", "in": "query", "schema": { "type": "integer" } },
+          { "name": "to_unix_ms", "in": "query", "schema": { "type": "integer" } },
+          { "name": "before_id", "in": "query", "schema": { "type": "integer" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated safe operational event history",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventHistoryResponse" } } }
+          },
+          "400": { "description": "Invalid bounded history query" },
+          "503": { "description": "Local history database unavailable" }
+        }
+      }
+    },
+    "/api/v2/history/vpn-server": {
+      "get": {
+        "parameters": [
+          { "name": "from_unix_ms", "in": "query", "schema": { "type": "integer" } },
+          { "name": "to_unix_ms", "in": "query", "schema": { "type": "integer" } },
+          { "name": "bucket_seconds", "in": "query", "schema": { "type": "integer", "minimum": 60 } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 10000 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "App-owned WireGuard endpoint latency history",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VpnServerHistoryResponse" } } }
+          },
+          "400": { "description": "Invalid bounded history query" },
+          "503": { "description": "Local history database unavailable" }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "responses": {
+          "200": { "description": "Prometheus text exposition for current per-client traffic counters" }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "NotificationSettingsView": {
+        "type": "object",
+        "required": ["enabled", "provider", "destination", "webhook_configured", "telegram_chat_id_configured", "hmac_secret_configured", "timeout_seconds", "rtt_threshold_ms", "alert_stack_started", "alert_vpn_disconnected", "alert_vpn_reconnected", "alert_rtt_above_threshold", "alert_diagnostic_failed", "updated_at_unix_ms"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "provider": { "enum": ["discord", "slack", "telegram", "generic"] },
+          "destination": { "type": ["string", "null"] },
+          "webhook_configured": { "type": "boolean" },
+          "telegram_chat_id_configured": { "type": "boolean" },
+          "hmac_secret_configured": { "type": "boolean" },
+          "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+          "rtt_threshold_ms": { "type": "number", "minimum": 1, "maximum": 60000 },
+          "alert_stack_started": { "type": "boolean" },
+          "alert_vpn_disconnected": { "type": "boolean" },
+          "alert_vpn_reconnected": { "type": "boolean" },
+          "alert_rtt_above_threshold": { "type": "boolean" },
+          "alert_diagnostic_failed": { "type": "boolean" },
+          "updated_at_unix_ms": { "type": "integer" }
+        }
+      },
+      "NotificationSettingsInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["enabled", "provider", "webhook_url", "telegram_chat_id", "hmac_secret", "timeout_seconds", "rtt_threshold_ms", "alert_stack_started", "alert_vpn_disconnected", "alert_vpn_reconnected", "alert_rtt_above_threshold", "alert_diagnostic_failed"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "provider": { "enum": ["discord", "slack", "telegram", "generic"] },
+          "webhook_url": { "type": "string" },
+          "telegram_chat_id": { "type": "string" },
+          "hmac_secret": { "type": "string" },
+          "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+          "rtt_threshold_ms": { "type": "number", "minimum": 1, "maximum": 60000 },
+          "alert_stack_started": { "type": "boolean" },
+          "alert_vpn_disconnected": { "type": "boolean" },
+          "alert_vpn_reconnected": { "type": "boolean" },
+          "alert_rtt_above_threshold": { "type": "boolean" },
+          "alert_diagnostic_failed": { "type": "boolean" }
+        }
+      },
+      "CanonicalSnapshot": {
+        "type": "object",
+        "required": ["schema_version", "sequence", "generated_at_unix_ms", "protection", "availability", "checks", "transitions", "port_forward", "recovery", "external_probe", "vpn_server", "isolation_policy", "topology", "clients", "traffic"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 2 },
+          "sequence": { "type": "integer" },
+          "generated_at_unix_ms": { "type": "integer" },
+          "protection": { "enum": ["enforced", "unknown", "violated"] },
+          "availability": { "enum": ["starting", "healthy", "degraded", "unavailable", "recovering"] },
+          "checks": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/SubsystemCheck" } },
+          "transitions": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/Transition" } },
+          "port_forward": { "$ref": "#/components/schemas/PortForwardStatus" },
+          "recovery": { "type": "object" },
+          "external_probe": { "$ref": "#/components/schemas/ExternalProbeResult" },
+          "vpn_server": { "$ref": "#/components/schemas/VpnServerStatus" },
+          "isolation_policy": { "$ref": "#/components/schemas/IsolationPolicy" },
+          "topology": { "type": "object" }
+          ,"clients": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/ClientState" } }
+          ,"traffic": { "type": "object" }
+        }
+      },
+      "ExternalProbeResult": {
+        "type": "object",
+        "required": ["status", "observed_at_unix_ms", "source_public_non_tailscale", "source_matches_claimed_ip", "tcp_port_reachable", "forwarded_port", "lease_acquired_at_unix_ms", "request_started_at_unix_ms", "reason_code", "safe_message"],
+        "properties": {
+          "status": { "enum": ["unknown", "healthy", "degraded", "unavailable"] },
+          "observed_at_unix_ms": { "type": ["integer", "null"] },
+          "source_public_non_tailscale": { "type": ["boolean", "null"] },
+          "source_matches_claimed_ip": { "type": ["boolean", "null"] },
+          "tcp_port_reachable": { "type": ["boolean", "null"] },
+          "forwarded_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "lease_acquired_at_unix_ms": { "type": ["integer", "null"] },
+          "request_started_at_unix_ms": { "type": ["integer", "null"] },
+          "reason_code": { "type": ["string", "null"] },
+          "safe_message": { "type": ["string", "null"] }
+        }
+      },
+      "VpnServerStatus": {
+        "type": "object",
+        "required": ["configured_endpoint_host", "configured_endpoint_port", "configured_address_family", "allowed_ips_posture", "runtime_endpoint_address", "runtime_endpoint_port", "provider_inferred", "region_inferred", "inference_source", "inference_confidence", "active", "latest_handshake_unix", "handshake_age_seconds", "observed_at_unix_ms", "latency"],
+        "properties": {
+          "configured_endpoint_host": { "type": ["string", "null"] },
+          "configured_endpoint_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "configured_address_family": { "type": ["string", "null"] },
+          "allowed_ips_posture": { "type": "string" },
+          "runtime_endpoint_address": { "type": ["string", "null"] },
+          "runtime_endpoint_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "provider_inferred": { "type": ["string", "null"] },
+          "region_inferred": { "type": ["string", "null"] },
+          "inference_source": { "type": ["string", "null"] },
+          "inference_confidence": { "type": ["string", "null"] },
+          "active": { "type": "boolean" },
+          "latest_handshake_unix": { "type": ["integer", "null"] },
+          "handshake_age_seconds": { "type": ["integer", "null"] },
+          "observed_at_unix_ms": { "type": ["integer", "null"] },
+          "latency": { "$ref": "#/components/schemas/VpnServerLatency" }
+        }
+      },
+      "VpnServerLatency": {
+        "type": "object",
+        "required": ["status", "sampled_at_unix_ms", "latest_rtt_ms", "recent_min_rtt_ms", "recent_average_rtt_ms", "recent_max_rtt_ms", "loss_ratio", "sample_count"],
+        "properties": {
+          "status": { "enum": ["measured", "timeout", "unsupported", "resolution_failed", "unavailable"] },
+          "sampled_at_unix_ms": { "type": ["integer", "null"] },
+          "latest_rtt_ms": { "type": ["number", "null"] },
+          "recent_min_rtt_ms": { "type": ["number", "null"] },
+          "recent_average_rtt_ms": { "type": ["number", "null"] },
+          "recent_max_rtt_ms": { "type": ["number", "null"] },
+          "loss_ratio": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+          "sample_count": { "type": "integer" }
+        }
+      },
+      "PortForwardStatus": {
+        "type": "object",
+        "required": ["phase", "requested_target", "internal_port", "external_port", "tcp_udp_agree", "lease_acquired_at_unix_ms", "lease_expires_at_unix_ms", "dnat_installed", "externally_verified", "change_sequence", "changed_at_unix_ms"],
+        "properties": {
+          "phase": { "enum": ["disabled", "waiting_for_target", "requested", "leased", "installed", "verified", "target_ambiguous", "lease_lost", "install_failed", "verification_failed", "unavailable"] },
+          "requested_target": { "type": ["string", "null"] },
+          "internal_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "external_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "tcp_udp_agree": { "type": ["boolean", "null"] },
+          "lease_acquired_at_unix_ms": { "type": ["integer", "null"] },
+          "lease_expires_at_unix_ms": { "type": ["integer", "null"] },
+          "dnat_installed": { "type": "boolean" },
+          "externally_verified": { "type": ["boolean", "null"] },
+          "change_sequence": { "type": "integer" },
+          "changed_at_unix_ms": { "type": ["integer", "null"] }
+        }
+      },
+      "ClientState": {
+        "type": "object",
+        "required": ["container_id", "usage_id", "usage_id_source", "name", "ipv4_address", "port_forward_target", "target_port", "compliant", "compliance_message", "running", "ipv6_address", "networks", "port_forward_label_valid", "route_intent", "traffic"],
+        "properties": {
+          "container_id": { "type": "string" },
+          "usage_id": { "type": "string", "maxLength": 128 },
+          "usage_id_source": { "enum": ["explicit_label", "compose_service", "container_lifetime"] },
+          "name": { "type": "string" },
+          "ipv4_address": { "type": "string", "format": "ipv4" },
+          "port_forward_target": { "type": "boolean" },
+          "target_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "compliant": { "type": "boolean" },
+          "compliance_message": { "type": "string" },
+          "running": { "type": "boolean" },
+          "ipv6_address": { "type": ["string", "null"] },
+          "networks": { "type": "array", "items": { "type": "string" } },
+          "port_forward_label_valid": { "type": "boolean" },
+          "route_intent": { "$ref": "#/components/schemas/RouteIntentState" },
+          "traffic": { "$ref": "#/components/schemas/ClientTrafficState" }
+        }
+      },
+      "RouteIntentState": {
+        "type": "object",
+        "required": ["status", "ipv4_default_network", "ipv6_default_network", "egress_gateway_priority", "gateway_priorities", "reason_code", "safe_message"],
+        "properties": {
+          "status": { "enum": ["verified", "mismatch", "unknown"] },
+          "ipv4_default_network": { "type": ["string", "null"] },
+          "ipv6_default_network": { "type": ["string", "null"] },
+          "egress_gateway_priority": { "type": ["integer", "null"] },
+          "gateway_priorities": { "type": "object", "additionalProperties": { "type": ["integer", "null"] } },
+          "reason_code": { "type": "string" },
+          "safe_message": { "type": "string" }
+        }
+      },
+      "ClientTrafficState": {
+        "type": "object",
+        "required": ["download_packets", "downloaded_bytes", "upload_packets", "uploaded_bytes", "sampled_at_unix_ms", "history"],
+        "properties": {
+          "download_packets": { "type": "integer" },
+          "downloaded_bytes": { "type": "integer" },
+          "upload_packets": { "type": "integer" },
+          "uploaded_bytes": { "type": "integer" },
+          "sampled_at_unix_ms": { "type": ["integer", "null"] },
+          "history": { "type": "array", "maxItems": 120, "items": { "$ref": "#/components/schemas/ClientTrafficSample" } }
+        }
+      },
+      "ClientTrafficSample": {
+        "type": "object",
+        "required": ["sampled_at_unix_ms", "downloaded_bytes", "uploaded_bytes"],
+        "properties": {
+          "sampled_at_unix_ms": { "type": "integer" },
+          "downloaded_bytes": { "type": "integer" },
+          "uploaded_bytes": { "type": "integer" }
+        }
+      },
+      "UsageHistoryResponse": {
+        "type": "object",
+        "required": ["from_unix_ms", "to_unix_ms", "bucket_seconds", "points", "truncated"],
+        "properties": {
+          "from_unix_ms": { "type": "integer" },
+          "to_unix_ms": { "type": "integer" },
+          "bucket_seconds": { "type": "integer" },
+          "points": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/UsageHistoryPoint" } },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "UsageHistoryPoint": {
+        "type": "object",
+        "required": ["bucket_start_unix_ms", "usage_id", "usage_id_source", "name", "download_bytes", "upload_bytes", "download_packets", "upload_packets", "sample_count"],
+        "properties": {
+          "bucket_start_unix_ms": { "type": "integer" },
+          "usage_id": { "type": "string" },
+          "usage_id_source": { "enum": ["explicit_label", "compose_service", "container_lifetime"] },
+          "name": { "type": "string" },
+          "download_bytes": { "type": "integer" },
+          "upload_bytes": { "type": "integer" },
+          "download_packets": { "type": "integer" },
+          "upload_packets": { "type": "integer" },
+          "sample_count": { "type": "integer" }
+        }
+      },
+      "EventHistoryResponse": {
+        "type": "object",
+        "required": ["events", "next_before_id"],
+        "properties": {
+          "events": { "type": "array", "maxItems": 500, "items": { "$ref": "#/components/schemas/HistoricalEvent" } },
+          "next_before_id": { "type": ["integer", "null"] }
+        }
+      },
+      "HistoricalEvent": {
+        "type": "object",
+        "required": ["id", "timestamp_unix_ms", "kind", "component", "from_status", "to_status", "reason_code", "safe_message", "external_port", "port_forward_phase"],
+        "properties": {
+          "id": { "type": "integer" },
+          "timestamp_unix_ms": { "type": "integer" },
+          "kind": { "enum": ["transition", "port_forward"] },
+          "component": { "type": "string" },
+          "from_status": { "type": ["string", "null"] },
+          "to_status": { "type": ["string", "null"] },
+          "reason_code": { "type": "string" },
+          "safe_message": { "type": "string" },
+          "external_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+          "port_forward_phase": { "type": ["string", "null"] }
+        }
+      },
+      "VpnServerHistoryResponse": {
+        "type": "object",
+        "required": ["from_unix_ms", "to_unix_ms", "bucket_seconds", "points", "truncated"],
+        "properties": {
+          "from_unix_ms": { "type": "integer" },
+          "to_unix_ms": { "type": "integer" },
+          "bucket_seconds": { "type": "integer" },
+          "points": { "type": "array", "maxItems": 10000, "items": { "$ref": "#/components/schemas/VpnServerHistoryPoint" } },
+          "truncated": { "type": "boolean" }
+        }
+      },
+      "VpnServerHistoryPoint": {
+        "type": "object",
+        "required": ["bucket_start_unix_ms", "configured_endpoint_host", "runtime_endpoint_address", "runtime_endpoint_port", "active_sample_count", "sample_count", "measured_sample_count", "minimum_rtt_ms", "average_rtt_ms", "maximum_rtt_ms"],
+        "properties": {
+          "bucket_start_unix_ms": { "type": "integer" },
+          "configured_endpoint_host": { "type": "string" },
+          "runtime_endpoint_address": { "type": "string" },
+          "runtime_endpoint_port": { "type": "integer" },
+          "active_sample_count": { "type": "integer" },
+          "sample_count": { "type": "integer" },
+          "measured_sample_count": { "type": "integer" },
+          "minimum_rtt_ms": { "type": ["number", "null"] },
+          "average_rtt_ms": { "type": ["number", "null"] },
+          "maximum_rtt_ms": { "type": ["number", "null"] }
+        }
+      },
+      "IsolationPolicy": {
+        "type": "object",
+        "required": ["schema_version", "generated_at_unix_ms", "network", "bridge", "subnet", "eligible_for_enforcement", "reason_code", "safe_message", "issues", "participants"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "generated_at_unix_ms": { "type": "integer" },
+          "network": { "type": "string" },
+          "bridge": { "type": "string" },
+          "subnet": { "type": "string" },
+          "eligible_for_enforcement": { "type": "boolean" },
+          "reason_code": { "type": "string" },
+          "safe_message": { "type": "string" },
+          "issues": { "type": "array", "items": { "type": "string", "maxLength": 512 } },
+          "participants": { "type": "array", "items": { "$ref": "#/components/schemas/IsolationParticipant" } }
+        }
+      },
+      "IsolationParticipant": {
+        "type": "object",
+        "required": ["container_id", "name", "isolation_id", "ipv4_address", "allowances"],
+        "properties": {
+          "container_id": { "type": "string" },
+          "name": { "type": "string" },
+          "isolation_id": { "type": ["string", "null"] },
+          "ipv4_address": { "type": "string", "format": "ipv4" },
+          "allowances": { "type": "array", "items": { "$ref": "#/components/schemas/IsolationAllowance" } }
+        }
+      },
+      "IsolationAllowance": {
+        "type": "object",
+        "required": ["destination_id", "destination_address", "port", "protocol"],
+        "properties": {
+          "destination_id": { "type": "string" },
+          "destination_address": { "type": "string", "format": "ipv4" },
+          "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "protocol": { "enum": ["tcp", "udp"] }
+        }
+      },
+      "SubsystemCheck": {
+        "type": "object",
+        "required": ["id", "status", "impact", "observed_at_unix_ms", "changed_at_unix_ms", "reason_code", "safe_message", "consecutive_failures"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "enum": ["pending", "healthy", "degraded", "failed", "unknown"] },
+          "impact": { "enum": ["critical", "advisory", "optional"] },
+          "observed_at_unix_ms": { "type": "integer" },
+          "changed_at_unix_ms": { "type": "integer" },
+          "reason_code": { "type": "string" },
+          "safe_message": { "type": "string" },
+          "consecutive_failures": { "type": "integer" }
+        }
+      },
+      "Transition": {
+        "type": "object",
+        "required": ["sequence", "timestamp_unix_ms", "component", "from_status", "to_status", "reason_code", "safe_message"],
+        "properties": {
+          "sequence": { "type": "integer" },
+          "timestamp_unix_ms": { "type": "integer" },
+          "component": { "type": "string" },
+          "from_status": { "type": "string" },
+          "to_status": { "type": "string" },
+          "reason_code": { "type": "string" },
+          "safe_message": { "type": "string" }
+        }
+      }
+    }
+  }
+}

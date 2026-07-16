@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "generated_at_unix_ms": 0,
+  "network": "vpn-egress",
+  "bridge": "br-vpn-egress",
+  "subnet": "172.30.0.0/24",
+  "eligible_for_enforcement": true,
+  "reason_code": "isolation.policy_complete",
+  "safe_message": "fixture policy is complete",
+  "issues": [],
+  "participants": [
+    {
+      "container_id": "source-container",
+      "name": "source",
+      "isolation_id": "source",
+      "ipv4_address": "172.30.0.10",
+      "allowances": [
+        {
+          "destination_id": "destination",
+          "destination_address": "172.30.0.11",
+          "port": 8083,
+          "protocol": "tcp"
+        }
+      ]
+    },
+    {
+      "container_id": "destination-container",
+      "name": "destination",
+      "isolation_id": "destination",
+      "ipv4_address": "172.30.0.11",
+      "allowances": []
+    }
+  ]
+}

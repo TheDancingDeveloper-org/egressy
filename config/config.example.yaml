@@ -1,0 +1,85 @@
+listen: 0.0.0.0:8080
+docker_socket: http://169.254.254.2:2375
+
+network:
+  name: vpn-egress
+  subnet: 172.30.0.0/24
+  gateway_ip: 172.30.0.2
+  host_bridge: br-vpn-egress
+  route_table: 200
+
+wireguard:
+  interface: wg0
+  # Mount a Proton-generated profile with NAT-PMP enabled here. Keep mode 0600.
+  # Egressy validates it and writes a Table=off copy to /run/egressy tmpfs;
+  # wg-quick never receives this operator-owned source path directly.
+  config_path: /run/secrets/wg0.conf
+  # Production can instead mount a base64 Docker secret at this path. It is
+  # decoded into the protected /run/egressy runtime copy before wg-quick starts.
+  config_base64_path: null
+  manage: true
+
+proton:
+  port_forwarding: true
+  natpmp_gateway: 10.2.0.1
+  refresh_seconds: 45
+  lifetime_seconds: 60
+
+dns:
+  enabled: true
+  listen: 172.30.0.2:53
+  upstream: 10.2.0.1:53
+  timeout_ms: 2000
+  max_concurrent_queries: 128
+
+probe:
+  enabled: true
+  url: http://172.30.0.5:8081/status
+  interval_seconds: 30
+  # Optional shared-token file. If configured, mount the same protected value
+  # into the probe and expose it there as EGRESSY_PROBE_TOKEN.
+  token_path: null
+  # Current Proton endpoints are announced by Datacamp Limited.
+  expected_identity: Datacamp
+
+external_probe:
+  enabled: false
+  instance_id: example-gateway
+  url: https://probe.example.com/api/v1/check
+  interval_seconds: 300
+  timeout_seconds: 10
+  token_path: null
+
+persistence:
+  enabled: true
+  path: /var/lib/egressy/egressy.sqlite3
+  retention_days: 365
+  bucket_seconds: 60
+  writer_capacity: 1024
+
+# Optional outbound OTLP mirror. Docker environment parameters override this
+# section. Keep disabled unless a reviewed collector is configured.
+otel:
+  enabled: false
+  endpoint: ""
+  protocol: http/protobuf
+  timeout_seconds: 10
+  service_name: egressy
+  headers_path: null
+  insecure: false
+
+vpn_server:
+  latency_probe_enabled: true
+  interval_seconds: 30
+  timeout_ms: 1500
+
+recovery:
+  enabled: true
+  failure_threshold: 3
+  success_threshold: 2
+  maximum_backoff_seconds: 300
+
+reconcile:
+  interval_seconds: 5
+  # Required fail-closed owner. false is rejected by configuration validation.
+  apply_gateway_firewall: true
