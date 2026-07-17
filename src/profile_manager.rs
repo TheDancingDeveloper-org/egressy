@@ -174,6 +174,13 @@ impl ProfileManager {
         Ok(revision)
     }
 
+    pub async fn stage_mounted_profile(&self) -> anyhow::Result<ManagedRevision> {
+        let profile = crate::runtime::load_mounted_profile(&self.config)
+            .await?
+            .context("the mounted profile is absent")?;
+        self.stage(profile.render_source().into_bytes()).await
+    }
+
     pub async fn stage_edit(
         &self,
         input: crate::wireguard::StructuredProfileInput,

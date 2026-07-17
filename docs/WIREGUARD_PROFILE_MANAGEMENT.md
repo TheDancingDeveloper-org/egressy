@@ -67,6 +67,13 @@ dashboard offers a profile setup flow:
 Egressy stores the managed profile securely, applies it transactionally, and
 reports the result without returning private or preshared keys to the browser.
 
+Browser authentication is explicit: configure a protected `admin_token_path`,
+sign in from the dashboard, and Egressy issues a short-lived HttpOnly session
+cookie. Mounted profiles remain immutable. The dashboard can import the
+currently mounted profile into the encrypted GUI-managed store, activate that
+source, and then edit supported non-secret fields while preserving stored keys
+unless replacements are deliberately entered.
+
 ### Advanced workflow
 
 The dashboard provides a structured advanced editor for supported WireGuard

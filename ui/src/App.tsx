@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactElement, type MouseEvent as ReactMouseEvent } from 'react'
-import { EventHistory, fetchEventHistory, fetchSnapshot, fetchUsageHistory, fetchVpnServerHistory, Snapshot, UsageHistory, VpnServerHistory } from './api'
+import { EventHistory, fetchEventHistory, fetchSnapshot, fetchUsageHistory, fetchVpnServerHistory, importMountedProfile, login, logout, Snapshot, UsageHistory, VpnServerHistory } from './api'
 import { ClientThroughputChart, ThroughputChart, TrafficSample, formatRate } from './ThroughputChart'
 import { NotificationsPanel } from './NotificationsPanel'
 import { ProfilesPanel } from './ProfilesPanel'
@@ -86,6 +86,8 @@ export function App() {
   const [vpnServerHistory, setVpnServerHistory] = useState<VpnServerHistory>()
   const [historyError, setHistoryError] = useState<string>()
   const [now, setNow] = useState(Date.now)
+  const [loginToken, setLoginToken] = useState('')
+  const [authMessage, setAuthMessage] = useState<string>()
 
   useEffect(() => {
     let mounted = true
@@ -200,6 +202,17 @@ export function App() {
       </div>
 
       <div className="content">
+        {snapshot.profile_management?.mutation_authorized && <div className="card admin-session">
+          <h3>Profile administration</h3>
+          {snapshot.profile_management?.source_mutable
+            ? <><span className="pill ok">managed editing enabled</span><button type="button" onClick={() => void logout().then(() => window.location.reload())}>Log out</button></>
+            : <><p className="sub">Sign in to stage and apply encrypted GUI-managed WireGuard revisions. Mounted profiles remain read-only.</p>
+              <form onSubmit={event => { event.preventDefault(); void login(loginToken).then(() => { setLoginToken(''); setAuthMessage('Signed in for profile administration.'); window.location.reload() }).catch(error => setAuthMessage(error instanceof Error ? error.message : 'Login failed')) }}>
+                <label>Administrator token<input type="password" autoComplete="current-password" value={loginToken} onChange={event => setLoginToken(event.target.value)} /></label>
+                <button type="submit" disabled={!loginToken}>Sign in</button>
+              </form></>}
+          {authMessage && <p className="sub">{authMessage}</p>}
+        </div>}
         {import.meta.env.VITE_DEMO === 'true' && <div role="status" className="notice" style={{ marginBottom: 14, marginTop: 0 }}>
           <InfoGlyph />Interactive demo — all data is generated in this browser and no gateway is connected.
         </div>}

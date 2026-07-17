@@ -84,6 +84,13 @@ export const fetchSnapshot = async (): Promise<Snapshot> => {
   return response.json()
 }
 
+export const login = async (token: string): Promise<void> => {
+  const response = await fetch('/api/v2/auth/login', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) })
+  if (!response.ok) throw new Error(response.status === 403 ? 'Profile administration is not configured on this gateway' : 'Login failed')
+}
+
+export const logout = async (): Promise<void> => { await fetch('/api/v2/auth/logout', { method: 'POST', credentials: 'same-origin' }) }
+
 export const fetchUsageHistory = async (hours = 24): Promise<UsageHistory> => {
   const to = Date.now()
   const from = to - hours * 60 * 60 * 1000
@@ -133,9 +140,11 @@ export const sendTestNotification = async (): Promise<void> => {
 }
 
 const profileRequest = async <T>(path: string, method: string, token: string, profile?: string): Promise<T> => {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (token) headers.authorization = `Bearer ${token}`
   const response = await fetch(path, {
     method,
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    headers,
     body: profile === undefined ? undefined : JSON.stringify({ profile }),
     credentials: 'same-origin',
   })
@@ -151,12 +160,20 @@ export const stageManagedProfile = (profile: string, token: string) =>
 export const applyManagedProfile = (revision: string, token: string) =>
   profileRequest<{ safe_message: string }>(`/api/v2/wireguard/profiles/${encodeURIComponent(revision)}/apply`, 'POST', token)
 export const activateProfileSource = async (source: 'mounted' | 'gui_managed', token: string) => {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (token) headers.authorization = `Bearer ${token}`
   const response = await fetch('/api/v2/wireguard/source', {
     method: 'POST', credentials: 'same-origin',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    headers,
     body: JSON.stringify({ source }),
   })
   const body = await response.json().catch(() => ({})) as { safe_message?: string; message?: string }
+  if (!response.ok) throw new Error(body.message ?? `profile API returned ${response.status}`)
+  return body
+}
+export const importMountedProfile = async (): Promise<ManagedRevision> => {
+  const response = await fetch('/api/v2/wireguard/profiles/import-mounted', { method: 'POST', credentials: 'same-origin' })
+  const body = await response.json().catch(() => ({})) as ManagedRevision & { message?: string }
   if (!response.ok) throw new Error(body.message ?? `profile API returned ${response.status}`)
   return body
 }
@@ -166,9 +183,11 @@ export interface StructuredProfileInput {
   peers: { public_key: string; preshared_key?: string; endpoint: string | null; allowed_ips: string[]; persistent_keepalive: number | null }[]
 }
 export const stageStructuredProfile = async (input: StructuredProfileInput, token: string): Promise<ManagedRevision> => {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (token) headers.authorization = `Bearer ${token}`
   const response = await fetch('/api/v2/wireguard/profiles/edit', {
     method: 'POST', credentials: 'same-origin',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    headers,
     body: JSON.stringify(input),
   })
   const body = await response.json().catch(() => ({})) as ManagedRevision & { message?: string }

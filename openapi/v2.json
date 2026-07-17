@@ -12,6 +12,16 @@
         }
       }
     },
+    "/api/v2/auth/login": {
+      "post": {
+        "summary": "Create a browser profile-administration session",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } } } },
+        "responses": { "204": { "description": "HttpOnly session cookie issued" }, "401": { "description": "Invalid administrator token" }, "403": { "description": "Administrator authentication is not configured" } }
+      }
+    },
+    "/api/v2/auth/logout": {
+      "post": { "summary": "Clear the browser profile-administration session", "responses": { "204": { "description": "Session cleared" } } }
+    },
     "/api/v2/isolation-policy": {
       "get": {
         "responses": {
@@ -190,6 +200,10 @@
         "type": "object",
         "required": ["lifecycle", "source", "source_mutable", "active_revision", "active", "revisions", "last_apply", "management_available", "mutation_authorized", "ipv4_only"],
         "properties": { "lifecycle": { "enum": ["unconfigured", "validating", "applying", "active", "degraded", "apply_failed", "recovering"] }, "source": { "enum": ["mounted", "gui_managed"] }, "source_mutable": { "type": "boolean" }, "active_revision": { "type": ["string", "null"] }, "active": { "oneOf": [{ "$ref": "#/components/schemas/RedactedProfile" }, { "type": "null" }] }, "revisions": { "type": "array", "maxItems": 100, "items": { "type": "object" } }, "last_apply": { "type": ["object", "null"] }, "management_available": { "type": "boolean" }, "mutation_authorized": { "type": "boolean" }, "ipv4_only": { "type": "boolean" } }
+      },
+      "LoginRequest": {
+        "type": "object", "additionalProperties": false, "required": ["token"],
+        "properties": { "token": { "type": "string", "minLength": 32, "maxLength": 512, "writeOnly": true } }
       },
       "NotificationSettingsView": {
         "type": "object",

@@ -1,4 +1,10 @@
-use std::{convert::Infallible, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, State},
@@ -7,7 +13,9 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::Engine;
 use futures_util::Stream;
+use rand::RngCore;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::trace::TraceLayer;
 
@@ -38,6 +46,7 @@ pub struct WebState {
 pub struct AdminAuth {
     token: Option<Arc<String>>,
     trusted_origins: Arc<Vec<String>>,
+    sessions: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl AdminAuth {
@@ -51,19 +60,19 @@ impl AdminAuth {
         Ok(Self {
             token,
             trusted_origins: Arc::new(config.trusted_origins.clone()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    fn authorize(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+    fn check_token(&self, supplied: &str) -> Result<(), StatusCode> {
         let expected = self.token.as_ref().ok_or(StatusCode::FORBIDDEN)?;
-        let supplied = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .ok_or(StatusCode::UNAUTHORIZED)?;
         if !constant_time_equal(supplied.as_bytes(), expected.as_bytes()) {
             return Err(StatusCode::UNAUTHORIZED);
         }
+        Ok(())
+    }
+
+    fn check_origin(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
         if let Some(origin) = headers
             .get(header::ORIGIN)
             .and_then(|value| value.to_str().ok())
@@ -86,6 +95,56 @@ impl AdminAuth {
             }
         }
         Ok(())
+    }
+
+    fn login(&self, supplied: &str, headers: &HeaderMap) -> Result<String, StatusCode> {
+        self.check_origin(headers)?;
+        self.check_token(supplied)?;
+        let mut bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let session = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        self.sessions
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .insert(
+                session.clone(),
+                Instant::now() + Duration::from_secs(8 * 60 * 60),
+            );
+        Ok(session)
+    }
+
+    fn logout(&self, session: Option<&str>) {
+        if let Some(session) = session {
+            if let Ok(mut sessions) = self.sessions.lock() {
+                sessions.remove(session);
+            }
+        }
+    }
+
+    fn authorize(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+        if let Some(cookie) = headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+        {
+            if let Some(session) = cookie
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("egressy_session="))
+            {
+                if let Ok(mut sessions) = self.sessions.lock() {
+                    sessions.retain(|_, expires| *expires > Instant::now());
+                    if sessions.contains_key(session) {
+                        return self.check_origin(headers);
+                    }
+                }
+            }
+        }
+        let supplied = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        self.check_token(supplied)
+            .and_then(|_| self.check_origin(headers))
     }
 }
 
@@ -134,9 +193,15 @@ pub fn router(
         .route("/api/v2/status", get(v2_status))
         .route("/api/v2/isolation-policy", get(isolation_policy))
         .route("/api/v2/events", get(events))
+        .route("/api/v2/auth/login", post(login))
+        .route("/api/v2/auth/logout", post(logout))
         .route(
             "/api/v2/wireguard/profiles",
             get(profile_status).post(stage_profile),
+        )
+        .route(
+            "/api/v2/wireguard/profiles/import-mounted",
+            post(import_mounted_profile),
         )
         .route(
             "/api/v2/wireguard/profiles/validate",
@@ -185,6 +250,56 @@ struct ProfileBody {
     profile: String,
 }
 
+#[derive(serde::Deserialize)]
+struct LoginBody {
+    token: String,
+}
+
+async fn login(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(mut input): Json<LoginBody>,
+) -> Response {
+    use zeroize::Zeroize;
+    let result = state.auth.login(&input.token, &headers);
+    input.token.zeroize();
+    match result {
+        Ok(session) => (
+            [(
+                header::SET_COOKIE,
+                format!(
+                    "egressy_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800"
+                ),
+            )],
+            StatusCode::NO_CONTENT,
+        )
+            .into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    if let Some(cookie) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Some(session) = cookie
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("egressy_session="))
+        {
+            state.auth.logout(Some(session));
+        }
+    }
+    (
+        [(
+            header::SET_COOKIE,
+            "egressy_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        )],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response()
+}
+
 async fn profile_status(
     State(state): State<WebState>,
 ) -> Json<crate::profile_manager::ProfileManagementStatus> {
@@ -222,6 +337,16 @@ async fn stage_profile(
     let source = std::mem::take(&mut input.profile).into_bytes();
     input.profile.zeroize();
     match state.profiles.stage(source).await {
+        Ok(revision) => (StatusCode::CREATED, Json(revision)).into_response(),
+        Err(error) => safe_profile_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn import_mounted_profile(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    if let Err(status) = state.auth.authorize(&headers) {
+        return status.into_response();
+    }
+    match state.profiles.stage_mounted_profile().await {
         Ok(revision) => (StatusCode::CREATED, Json(revision)).into_response(),
         Err(error) => safe_profile_error(StatusCode::BAD_REQUEST, &error),
     }
@@ -589,6 +714,7 @@ mod tests {
         let auth = AdminAuth {
             token: Some(Arc::new("a".repeat(32))),
             trusted_origins: Arc::new(vec!["https://egressy.example".into()]),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         };
         assert_eq!(
             auth.authorize(&HeaderMap::new()),
@@ -613,6 +739,24 @@ mod tests {
             .is_ok());
     }
 
+    #[test]
+    fn browser_session_authorizes_same_origin_profile_mutations() {
+        let auth = AdminAuth {
+            token: Some(Arc::new("a".repeat(32))),
+            trusted_origins: Arc::new(Vec::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let session = auth.login(&"a".repeat(32), &HeaderMap::new()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("egressy_session={session}").parse().unwrap(),
+        );
+        assert!(auth.authorize(&headers).is_ok());
+        auth.logout(Some(&session));
+        assert_eq!(auth.authorize(&headers), Err(StatusCode::UNAUTHORIZED));
+    }
+
     #[tokio::test]
     async fn profile_validation_response_never_returns_secrets() {
         let token = "a".repeat(32);
@@ -633,6 +777,7 @@ mod tests {
             auth: AdminAuth {
                 token: Some(Arc::new(token.clone())),
                 trusted_origins: Arc::new(Vec::new()),
+                sessions: Arc::new(Mutex::new(HashMap::new())),
             },
         };
         let response = validate_profile(

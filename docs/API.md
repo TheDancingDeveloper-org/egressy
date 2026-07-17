@@ -135,6 +135,12 @@ history is bounded and in memory.
 `ui/src/generated.ts`. CI fails when either generated TypeScript or the embedded
 single-file dashboard differs from a clean build.
 
+`POST /api/v2/auth/login` exchanges the administrator bearer token from the
+protected `admin_token_path` file for an expiring `HttpOnly`, `SameSite=Strict`
+browser session cookie. `POST /api/v2/auth/logout` clears it. Profile mutation
+endpoints accept either this same-origin session cookie or an explicit bearer
+token; the token and session value are never returned in JSON or logs.
+
 `GET /metrics` exposes `egressy_client_traffic_bytes_total` and
 `egressy_client_traffic_packets_total`, labelled only by current container ID
 and direction. Only currently enrolled clients produce series, bounding live

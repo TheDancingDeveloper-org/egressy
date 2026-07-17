@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   activateProfileSource, applyManagedProfile, ProfileManagement, RedactedProfile, stageManagedProfile,
-  stageStructuredProfile, StructuredProfileInput, validateManagedProfile,
+  stageStructuredProfile, StructuredProfileInput, validateManagedProfile, importMountedProfile,
 } from './api'
 
 const emptyPreview = undefined as RedactedProfile | undefined
@@ -90,6 +90,13 @@ export function ProfilesPanel({ management = unconfigured }: { management?: Prof
     finally { setToken(''); setBusy(false) }
   }
 
+  const importMounted = async () => {
+    setBusy(true); setError(undefined)
+    try { await importMountedProfile(); await activateProfileSource('gui_managed', token); window.location.reload() }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'Mounted profile import failed') }
+    finally { setToken(''); setBusy(false) }
+  }
+
   const active = management.active
   return <>
     <div className="view-head"><h1 id="h-profiles">WireGuard profile</h1><span className="count">{management.lifecycle}</span></div>
@@ -113,9 +120,10 @@ export function ProfilesPanel({ management = unconfigured }: { management?: Prof
       <h3>Active source</h3>
       <label>Source administrator token<input type="password" autoComplete="off" value={token} onChange={event => setToken(event.target.value)} /></label>
       <div className="actions">
-        <button type="button" disabled={busy || !token || management.source === 'mounted'} onClick={() => void switchSource('mounted')}>Activate mounted</button>
-        <button type="button" disabled={busy || !token || management.source === 'gui_managed'} onClick={() => void switchSource('gui_managed')}>Activate managed</button>
+        <button type="button" disabled={busy || management.source === 'mounted'} onClick={() => void switchSource('mounted')}>Activate mounted</button>
+        <button type="button" disabled={busy || management.source === 'gui_managed'} onClick={() => void switchSource('gui_managed')}>Activate managed</button>
       </div>
+      {management.source === 'mounted' && <button type="button" disabled={busy} onClick={() => void importMounted()}>Import mounted profile into encrypted editor</button>}
     </div>}
 
     {management.mutation_authorized && <div className="card profile-editor" style={{ marginTop: 12 }}>
@@ -123,9 +131,9 @@ export function ProfilesPanel({ management = unconfigured }: { management?: Prof
       <label>Administrator token<input type="password" autoComplete="off" value={token} onChange={event => setToken(event.target.value)} /></label>
       <label>WireGuard .conf file<input ref={file} type="file" accept=".conf,text/plain" onChange={event => void readFile(event.target.files?.[0])} /></label>
       <label>Or paste profile<textarea rows={12} spellCheck={false} value={profile} onChange={event => setProfile(event.target.value)} /></label>
-      <div className="actions"><button type="button" disabled={busy || !profile || !token} onClick={() => void validate()}>Review</button>
-        <button type="button" disabled={busy || !preview || !token} onClick={() => void stageAndApply()}>Apply</button></div>
-      <p className="sub">The pasted profile and administrator token remain only in this component state and are cleared after submission.</p>
+      <div className="actions"><button type="button" disabled={busy || !profile} onClick={() => void validate()}>Review</button>
+        <button type="button" disabled={busy || !preview} onClick={() => void stageAndApply()}>Apply</button></div>
+      <p className="sub">The pasted profile remains only in this component state and is cleared after submission. Authentication uses the browser session when signed in.</p>
     </div>}
 
     {management.source_mutable && active && <div className="card profile-editor" style={{ marginTop: 12 }}>
@@ -146,7 +154,7 @@ export function ProfilesPanel({ management = unconfigured }: { management?: Prof
           <label>Persistent keepalive<input type="number" value={peer.persistent_keepalive ?? ''} onChange={event => setEdit({ ...edit, peers: edit.peers.map((value, peerIndex) => peerIndex === index ? { ...value, persistent_keepalive: event.target.value ? Number(event.target.value) : null } : value) })} /></label>
           <label>Replace preshared key (optional)<input type="password" autoComplete="off" value={peerSecrets[index] ?? ''} onChange={event => setPeerSecrets(values => ({ ...values, [index]: event.target.value }))} /></label>
         </div>)}
-        <button type="button" disabled={busy || !token} onClick={() => void applyStructured()}>Stage and apply structured edit</button>
+        <button type="button" disabled={busy} onClick={() => void applyStructured()}>Stage and apply structured edit</button>
       </>}
     </div>}
 
