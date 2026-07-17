@@ -127,6 +127,50 @@ curl -fsS http://127.0.0.1:8080/readyz
 curl -fsS http://127.0.0.1:8080/api/v2/status
 ```
 
+### Optional profile administration
+
+Mounted WireGuard profiles are read-only. To enable the dashboard's encrypted
+GUI-managed profile editor, create a separate administrator token file and
+protect it from group/other reads:
+
+```sh
+umask 077
+openssl rand -base64 48 > /protected/path/egressy-admin-token
+chmod 600 /protected/path/egressy-admin-token
+openssl rand -base64 32 > /protected/path/egressy-storage-key
+chmod 600 /protected/path/egressy-storage-key
+```
+
+Set these fields in `config/config.yaml` (and mount the token file into the
+gateway container):
+
+```yaml
+wireguard:
+  source: gui_managed
+  storage_key_path: /run/secrets/egressy-storage-key
+  admin_token_path: /run/secrets/egressy-admin-token
+  trusted_origins: []
+```
+
+`storage_key_path` must contain a protected, base64-encoded 32-byte key. Add
+both files as read-only mounts under the same paths in the `egressy` service,
+for example:
+
+```yaml
+volumes:
+  - /protected/path/egressy-admin-token:/run/secrets/egressy-admin-token:ro
+  - /protected/path/egressy-storage-key:/run/secrets/egressy-storage-key:ro
+```
+
+Keep the profile database and key on the persistent data volume or another
+protected secret mount; never commit them. After restarting, open the local
+dashboard and sign in with the administrator token. Egressy exchanges it for an
+eight-hour `HttpOnly`, `SameSite=Strict` browser session. Profile mutation
+requests may also use `Authorization: Bearer <token>` for API clients. A
+non-empty `trusted_origins` list is required when a reviewed reverse proxy
+serves the dashboard from a different origin; same-origin browser requests
+remain allowed.
+
 ### 5. Enroll a client
 
 Start from [config/client.compose.yaml](config/client.compose.yaml). The
@@ -191,8 +235,12 @@ repository; the workflow reports the resulting URL.
 
 ## Security notes
 
-- The dashboard has no built-in authentication. Keep it on localhost or a
-  trusted management network behind your own access control.
+- Read-only dashboard and notification settings endpoints are unauthenticated;
+  keep the dashboard on localhost or a trusted management network behind your
+  own access control.
+- GUI-managed WireGuard profile mutations require the protected administrator
+  token when `wireguard.admin_token_path` is configured. Browser login uses a
+  short-lived HttpOnly session; mounted profiles remain immutable.
 - The `egressy` daemon does not mount the Docker socket. A restricted proxy
   exposes only the exact read operations needed for discovery.
 - The profile is copied to protected tmpfs and normalized to `Table = off`
