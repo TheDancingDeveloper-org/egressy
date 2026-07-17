@@ -1,6 +1,6 @@
 [package]
 name = "egressy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.97"
 license = "AGPL-3.0-only"
@@ -11,6 +11,7 @@ default-run = "egressy"
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
+chacha20poly1305 = "0.10"
 bollard = "0.21"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
@@ -34,6 +35,7 @@ tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
+zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3.23"

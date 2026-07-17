@@ -1,6 +1,8 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import { App } from './App'
+import { ProfilesPanel } from './ProfilesPanel'
+import type { ProfileManagement } from './api'
 
 class EventSourceStub { addEventListener() {} close() {} onerror = () => {} }
 afterEach(() => vi.restoreAllMocks())
@@ -75,4 +77,33 @@ test('edits GUI-managed Omnihook settings without rendering stored secrets', asy
   expect(await screen.findByText('Omnihook settings saved.')).toBeInTheDocument()
   const put = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')
   expect(JSON.parse(String(put?.[1]?.body)).rtt_threshold_ms).toBe(75)
+})
+
+test('profile UI escapes controlled strings and keeps secret replacements write-only', async () => {
+  const management: ProfileManagement = {
+    lifecycle: 'active', source: 'gui_managed', source_mutable: true,
+    active_revision: '0123456789abcdef01234567', revisions: [], last_apply: null,
+    management_available: true, mutation_authorized: true, ipv4_only: true,
+    active: {
+      interface: { private_key_configured: true, addresses: ['10.0.0.2/32'], dns: ['10.0.0.1'], listen_port: null, mtu: 1380 },
+      peers: [{ public_key: '<img src=x onerror=alert(1)>', preshared_key_configured: true, endpoint: { host: '<script>alert(1)</script>', port: 51820, address_family: 'hostname' }, allowed_ips: ['0.0.0.0/0'], persistent_keepalive: 25 }],
+      peer_count: 1, ipv4_full_tunnel: true, full_tunnel_peer: 0, warnings: [], apply_kind: 'no_change',
+    },
+  }
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 'abcdefabcdefabcdefabcdef' }) })
+  vi.stubGlobal('fetch', fetchMock)
+  const { container } = render(<ProfilesPanel management={management} />)
+  expect(container.querySelector('script')).toBeNull()
+  expect(container.querySelector('img')).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Edit structured fields' }))
+  expect(screen.getByLabelText('Replace private key (optional)')).toHaveValue('')
+  expect(screen.getByLabelText('Replace preshared key (optional)')).toHaveValue('')
+  fireEvent.change(screen.getByLabelText('Administrator token'), { target: { value: 'a'.repeat(32) } })
+  fireEvent.change(screen.getByLabelText('Replace private key (optional)'), { target: { value: 'replacement-secret' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Stage and apply structured edit' }))
+  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled())
+  const request = fetchMock.mock.calls[0][1] as RequestInit
+  expect(String(request.body)).toContain('replacement-secret')
+  expect(String(request.body)).not.toContain('configured')
+  expect(window.localStorage.length).toBe(0)
 })

@@ -57,7 +57,7 @@ the example values. Run the network helper once with root privileges.
 
 ## Supply WireGuard safely
 
-Generate a Proton profile with NAT-PMP enabled. Store it outside the checkout,
+Generate a conventional IPv4 full-tunnel WireGuard profile. Store it outside the checkout,
 owned by the operator, with mode `0600`. The Compose example mounts it
 read-only. Egressy validates it, writes a normalized `Table = off` copy to
 `/run/egressy` tmpfs, and gives only that copy to `wg-quick`.
@@ -84,12 +84,12 @@ sudo nft list table inet egressy_host
 ## Start and verify
 
 Set `DOCKER_SOCKET_GID` to the numeric group owning the Docker socket and
-`PROTON_WIREGUARD_CONFIG` to the protected profile path if Compose cannot infer
+`EGRESSY_WIREGUARD_CONFIG` to the protected profile path if Compose cannot infer
 them in your environment:
 
 ```sh
 export DOCKER_SOCKET_GID="$(stat -c '%g' /var/run/docker.sock)"
-export PROTON_WIREGUARD_CONFIG=/protected/path/wg0.conf
+export EGRESSY_WIREGUARD_CONFIG=/protected/path/wg0.conf
 docker compose up -d --build
 docker compose ps
 docker compose logs --no-log-prefix egressy

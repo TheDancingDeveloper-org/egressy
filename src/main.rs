@@ -10,12 +10,15 @@ pub use egressy::isolation;
 mod natpmp;
 mod notifications;
 mod probe;
+mod profile_manager;
+mod profiles;
 mod recovery;
 mod runtime;
 mod state;
 mod telemetry;
 mod vpn_server;
 mod web;
+mod wireguard;
 
 use std::path::PathBuf;
 

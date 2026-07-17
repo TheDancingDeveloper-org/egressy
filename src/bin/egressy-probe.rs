@@ -104,11 +104,22 @@ struct PortForwardClaim {
     lease_acquired_at_unix_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct IdentityResponse {
-    asn_org: Option<String>,
-    as_name: Option<String>,
-    org: Option<String>,
+#[derive(Clone, Debug)]
+enum IdentityMatcher {
+    PlainTextContains(String),
+    JsonStringContains { fields: Vec<String>, value: String },
+    JsonBoolean { field: String, value: bool },
+}
+
+impl IdentityMatcher {
+    fn expected_value(&self) -> String {
+        match self {
+            Self::PlainTextContains(value) | Self::JsonStringContains { value, .. } => {
+                value.clone()
+            }
+            Self::JsonBoolean { value, .. } => value.to_string(),
+        }
+    }
 }
 
 const DNS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -120,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
     let listen: SocketAddr = env("EGRESSY_PROBE_LISTEN", "0.0.0.0:8081").parse()?;
     let dns: SocketAddr = env("EGRESSY_PROBE_DNS", "172.30.0.2:53").parse()?;
+    let identity_enabled = env_bool("EGRESSY_PROBE_IDENTITY_ENABLED", false)?;
     let identity_url = env("EGRESSY_PROBE_IDENTITY_URL", "https://ifconfig.co/json");
     let identity_interval_seconds = env(
         "EGRESSY_PROBE_IDENTITY_INTERVAL_SECONDS",
@@ -129,13 +141,20 @@ async fn main() -> anyhow::Result<()> {
     if identity_interval_seconds == 0 {
         bail!("EGRESSY_PROBE_IDENTITY_INTERVAL_SECONDS must be greater than zero");
     }
-    let expected_identity = env("EGRESSY_PROBE_EXPECTED_IDENTITY", "Datacamp");
+    let identity_matcher = load_identity_matcher()?;
+    let expected_identity = if identity_enabled {
+        identity_matcher.expected_value()
+    } else {
+        String::new()
+    };
     let token = std::env::var("EGRESSY_PROBE_TOKEN").ok();
     let result = Arc::new(RwLock::new(ProbeStatus::default()));
     tokio::spawn(run_checks(
         result.clone(),
         dns,
         identity_url,
+        identity_enabled,
+        identity_matcher,
         expected_identity,
         Duration::from_secs(identity_interval_seconds),
     ));
@@ -170,11 +189,14 @@ async fn run_checks(
     result: SharedResult,
     dns: SocketAddr,
     identity_url: String,
+    identity_enabled: bool,
+    identity_matcher: IdentityMatcher,
     expected_identity: String,
     identity_interval: Duration,
 ) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -185,13 +207,24 @@ async fn run_checks(
     };
 
     let dns_checks = run_dns_checks(result.clone(), dns, expected_identity.clone());
-    let identity_checks = run_identity_checks(
-        result,
-        client,
-        identity_url,
-        expected_identity,
-        identity_interval,
-    );
+    let identity_checks = async move {
+        if identity_enabled {
+            run_identity_checks(
+                result,
+                client,
+                identity_url,
+                expected_identity,
+                identity_matcher,
+                identity_interval,
+            )
+            .await;
+        } else {
+            let mut snapshot = result.write().await;
+            snapshot.https_egress_ok = true;
+            snapshot.vpn_identity_ok = true;
+            futures_util::future::pending::<()>().await;
+        }
+    };
     tokio::join!(dns_checks, identity_checks);
 }
 
@@ -208,12 +241,20 @@ async fn run_identity_checks(
     client: reqwest::Client,
     identity_url: String,
     expected_identity: String,
+    matcher: IdentityMatcher,
     identity_interval: Duration,
 ) {
     let mut ticker = interval(identity_interval);
     loop {
         ticker.tick().await;
-        observe_identity(&result, &client, &identity_url, &expected_identity).await;
+        observe_identity(
+            &result,
+            &client,
+            &identity_url,
+            &expected_identity,
+            &matcher,
+        )
+        .await;
     }
 }
 
@@ -236,10 +277,10 @@ async fn observe_identity(
     client: &reqwest::Client,
     identity_url: &str,
     expected_identity: &str,
+    matcher: &IdentityMatcher,
 ) {
     let started = Instant::now();
-    let (https_egress_ok, vpn_identity_ok) =
-        check_identity(client, identity_url, expected_identity).await;
+    let (https_egress_ok, vpn_identity_ok) = check_identity(client, identity_url, matcher).await;
     let mut snapshot = result.write().await;
     snapshot.observed_at_unix_ms = unix_ms();
     snapshot.https_egress_ok = https_egress_ok;
@@ -252,7 +293,7 @@ async fn observe_identity(
 async fn check_identity(
     client: &reqwest::Client,
     identity_url: &str,
-    expected_identity: &str,
+    matcher: &IdentityMatcher,
 ) -> (bool, bool) {
     let mut response = match client.get(identity_url).send().await {
         Ok(response) => match response.error_for_status() {
@@ -293,7 +334,7 @@ async fn check_identity(
         }
     }
 
-    match identity_body_matches(&body, expected_identity) {
+    match identity_body_matches(&body, matcher) {
         Ok(matches) => (true, matches),
         Err(error) => {
             warn!(%error, "probe identity response could not be interpreted");
@@ -302,23 +343,72 @@ async fn check_identity(
     }
 }
 
-fn identity_body_matches(body: &[u8], expected_identity: &str) -> anyhow::Result<bool> {
+fn identity_body_matches(body: &[u8], matcher: &IdentityMatcher) -> anyhow::Result<bool> {
     let text = std::str::from_utf8(body)?.trim();
-    if text.starts_with('{') {
-        let response: IdentityResponse = serde_json::from_str(text)?;
-        let identity = response
-            .asn_org
-            .or(response.as_name)
-            .or(response.org)
-            .context("identity JSON did not contain asn_org, as_name, or org")?;
-        return Ok(identity
+    match matcher {
+        IdentityMatcher::PlainTextContains(value) => Ok(text
             .to_ascii_lowercase()
-            .contains(&expected_identity.to_ascii_lowercase()));
+            .contains(&value.to_ascii_lowercase())),
+        IdentityMatcher::JsonStringContains { fields, value } => {
+            let document: serde_json::Value = serde_json::from_str(text)?;
+            Ok(fields.iter().any(|field| {
+                document
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|observed| {
+                        observed
+                            .to_ascii_lowercase()
+                            .contains(&value.to_ascii_lowercase())
+                    })
+            }))
+        }
+        IdentityMatcher::JsonBoolean { field, value } => {
+            let document: serde_json::Value = serde_json::from_str(text)?;
+            Ok(document.get(field).and_then(serde_json::Value::as_bool) == Some(*value))
+        }
     }
+}
 
-    Ok(text
-        .to_ascii_lowercase()
-        .contains(&expected_identity.to_ascii_lowercase()))
+fn load_identity_matcher() -> anyhow::Result<IdentityMatcher> {
+    const FIELDS: &[&str] = &["asn_org", "as_name", "org", "mullvad_exit_ip"];
+    let kind = env(
+        "EGRESSY_PROBE_IDENTITY_MATCHER_TYPE",
+        "json_string_contains",
+    );
+    match kind.as_str() {
+        "plain_text_contains" => Ok(IdentityMatcher::PlainTextContains(env(
+            "EGRESSY_PROBE_IDENTITY_MATCHER_VALUE",
+            "Datacamp",
+        ))),
+        "json_string_contains" => {
+            let fields = env(
+                "EGRESSY_PROBE_IDENTITY_MATCHER_FIELDS",
+                "asn_org,as_name,org",
+            )
+            .split(',')
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+            if fields.is_empty() || fields.iter().any(|field| !FIELDS.contains(&field.as_str())) {
+                bail!("identity matcher field is not allowlisted");
+            }
+            Ok(IdentityMatcher::JsonStringContains {
+                fields,
+                value: env("EGRESSY_PROBE_IDENTITY_MATCHER_VALUE", "Datacamp"),
+            })
+        }
+        "json_boolean" => {
+            let field = env("EGRESSY_PROBE_IDENTITY_MATCHER_FIELD", "mullvad_exit_ip");
+            if !FIELDS.contains(&field.as_str()) {
+                bail!("identity matcher field is not allowlisted");
+            }
+            Ok(IdentityMatcher::JsonBoolean {
+                field,
+                value: env_bool("EGRESSY_PROBE_IDENTITY_MATCHER_VALUE", true)?,
+            })
+        }
+        _ => bail!("unsupported identity matcher type"),
+    }
 }
 
 fn update_path_summary(snapshot: &mut ProbeStatus) {
@@ -646,6 +736,18 @@ fn env(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_owned())
 }
 
+fn env_bool(name: &str, fallback: bool) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => bail!("{name} must be true or false"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(fallback),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn load_external_probe_config() -> anyhow::Result<Option<ExternalProbeConfig>> {
     if !env("EGRESSY_EXTERNAL_PROBE_ENABLED", "false").eq_ignore_ascii_case("true") {
         return Ok(None);
@@ -757,23 +859,51 @@ mod tests {
     #[test]
     fn matches_ifconfig_json_asn_organization() {
         let body = br#"{"ip":"198.51.100.8","asn":"AS212238","asn_org":"Datacamp Limited"}"#;
-        assert!(identity_body_matches(body, "Datacamp").unwrap());
+        let matcher = IdentityMatcher::JsonStringContains {
+            fields: vec!["asn_org".into()],
+            value: "Datacamp".into(),
+        };
+        assert!(identity_body_matches(body, &matcher).unwrap());
     }
 
     #[test]
     fn rejects_unexpected_ifconfig_json_identity() {
         let body = br#"{"ip":"198.51.100.8","asn":"AS64500","asn_org":"Example ISP"}"#;
-        assert!(!identity_body_matches(body, "Datacamp").unwrap());
+        let matcher = IdentityMatcher::JsonStringContains {
+            fields: vec!["asn_org".into()],
+            value: "Datacamp".into(),
+        };
+        assert!(!identity_body_matches(body, &matcher).unwrap());
     }
 
     #[test]
     fn preserves_plain_text_identity_endpoint_compatibility() {
-        assert!(identity_body_matches(b"AS212238 Datacamp Limited\n", "datacamp").unwrap());
+        assert!(identity_body_matches(
+            b"AS212238 Datacamp Limited\n",
+            &IdentityMatcher::PlainTextContains("datacamp".into())
+        )
+        .unwrap());
     }
 
     #[test]
     fn rejects_identity_json_without_an_organization_field() {
-        assert!(identity_body_matches(br#"{"ip":"198.51.100.8"}"#, "Datacamp").is_err());
+        let matcher = IdentityMatcher::JsonStringContains {
+            fields: vec!["asn_org".into()],
+            value: "Datacamp".into(),
+        };
+        assert!(!identity_body_matches(br#"{"ip":"198.51.100.8"}"#, &matcher).unwrap());
+    }
+
+    #[test]
+    fn matches_allowlisted_json_boolean() {
+        assert!(identity_body_matches(
+            br#"{"mullvad_exit_ip":true}"#,
+            &IdentityMatcher::JsonBoolean {
+                field: "mullvad_exit_ip".into(),
+                value: true
+            },
+        )
+        .unwrap());
     }
 
     #[test]

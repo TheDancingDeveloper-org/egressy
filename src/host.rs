@@ -95,6 +95,15 @@ pub fn render_gateway_firewall(
             )
         })
         .collect::<String>();
+    let natpmp_input =
+        if config.port_forwarding.backend == crate::config::PortForwardingBackend::NatPmp {
+            format!(
+                "    udp dport 5351 ip saddr {} accept\n",
+                config.port_forwarding.gateway
+            )
+        } else {
+            String::new()
+        };
     format!(
         r#"table inet egressy {{
 {counter_objects}
@@ -105,7 +114,7 @@ pub fn render_gateway_firewall(
     ip saddr {subnet} udp dport 53 accept
     ip saddr {subnet} tcp dport 53 accept
     tcp dport 8080 accept
-    udp dport 5351 ip saddr {natpmp_gateway} accept
+{natpmp_input}
   }}
   chain forward {{
     type filter hook forward priority 0; policy drop;
@@ -127,7 +136,7 @@ pub fn render_gateway_firewall(
 "#,
         subnet = network.subnet,
         tunnel = tunnel,
-        natpmp_gateway = config.proton.natpmp_gateway,
+        natpmp_input = natpmp_input,
         gateway = network.gateway_ip,
         dnat = dnat,
         counter_objects = counter_objects,
@@ -175,6 +184,16 @@ mod tests {
         let rules = render_gateway_firewall(&config, None, &[]);
         assert!(rules.contains("udp dport 53 ip daddr != 172.30.0.2 reject"));
         assert!(rules.contains("tcp dport 53 ip daddr != 172.30.0.2 reject"));
+    }
+
+    #[test]
+    fn natpmp_input_exists_only_when_the_backend_is_enabled() {
+        let disabled: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(!render_gateway_firewall(&disabled, None, &[]).contains("udp dport 5351"));
+        let enabled: Config =
+            serde_yaml::from_str("port_forwarding:\n  backend: nat_pmp\n  gateway: 10.2.0.1\n")
+                .unwrap();
+        assert!(render_gateway_firewall(&enabled, None, &[]).contains("udp dport 5351"));
     }
 
     #[test]

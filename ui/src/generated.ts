@@ -107,6 +107,348 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v2/wireguard/profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Profile lifecycle and redacted metadata */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ProfileManagementStatus"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["ProfileWrite"];
+                };
+            };
+            responses: {
+                /** @description Encrypted staged revision */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Administrator token required */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Mutation disabled or origin rejected */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Candidate invalid */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/wireguard/profiles/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["ProfileWrite"];
+                };
+            };
+            responses: {
+                /** @description Redacted candidate metadata */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RedactedProfile"];
+                    };
+                };
+                /** @description Administrator token required */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Line-specific safe validation errors */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/wireguard/profiles/edit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Stage a structured edit; omitted secret fields preserve the active stored value */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        private_key?: string | null;
+                        addresses: string[];
+                        dns: string[];
+                        listen_port: number | null;
+                        mtu: number | null;
+                        peers: Record<string, never>[];
+                    };
+                };
+            };
+            responses: {
+                /** @description Encrypted staged revision with redacted metadata */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Invalid structured edit */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Administrator token required */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/wireguard/source": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Transactionally activate the explicitly selected mounted or GUI-managed source */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @enum {unknown} */
+                        source: "mounted" | "gui_managed";
+                    };
+                };
+            };
+            responses: {
+                /** @description Safe apply and rollback result */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Administrator token required */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Source activation failed and was rolled back or left fail closed */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/wireguard/profiles/{revision}/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    revision: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Safe apply and rollback result */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Administrator token required */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Apply failed; previous profile restored or traffic blocked */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/wireguard/profiles/{revision}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    revision: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Inactive revision deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Active or missing revision */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Administrator token required */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v2/settings/notifications": {
         parameters: {
             query?: never;
@@ -412,6 +754,41 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ProfileWrite: {
+            /** @description Complete WireGuard profile; never returned */
+            profile: string;
+        };
+        /** @description Bounded parsed metadata; contains no private or preshared key values */
+        RedactedProfile: {
+            interface: {
+                private_key_configured?: boolean;
+                addresses?: string[];
+                dns?: string[];
+                listen_port?: number | null;
+                mtu?: number | null;
+            };
+            peers: Record<string, never>[];
+            peer_count: number;
+            ipv4_full_tunnel: boolean;
+            full_tunnel_peer: number | null;
+            warnings: Record<string, never>[];
+            /** @enum {unknown} */
+            apply_kind: "no_change" | "dns_reload" | "sync_conf" | "sync_conf_and_routes" | "tunnel_recycle";
+        };
+        ProfileManagementStatus: {
+            /** @enum {unknown} */
+            lifecycle: "unconfigured" | "validating" | "applying" | "active" | "degraded" | "apply_failed" | "recovering";
+            /** @enum {unknown} */
+            source: "mounted" | "gui_managed";
+            source_mutable: boolean;
+            active_revision: string | null;
+            active: components["schemas"]["RedactedProfile"] | null;
+            revisions: Record<string, never>[];
+            last_apply: Record<string, never> | null;
+            management_available: boolean;
+            mutation_authorized: boolean;
+            ipv4_only: boolean;
+        };
         NotificationSettingsView: {
             enabled: boolean;
             /** @enum {unknown} */
@@ -467,6 +844,7 @@ export interface components {
                 [key: string]: components["schemas"]["ClientState"];
             };
             traffic: Record<string, never>;
+            profile_management: components["schemas"]["ProfileManagementStatus"];
         };
         ExternalProbeResult: {
             /** @enum {unknown} */

@@ -37,6 +37,21 @@ export interface NotificationSettingsInput {
   alert_rtt_above_threshold: boolean; alert_diagnostic_failed: boolean
 }
 export interface IsolationPolicy { schema_version: 1; generated_at_unix_ms: number; network: string; bridge: string; subnet: string; eligible_for_enforcement: boolean; reason_code: string; safe_message: string; issues: string[]; participants: { container_id: string; name: string; isolation_id: string | null; ipv4_address: string; allowances: { destination_id: string; destination_address: string; port: number; protocol: 'tcp' | 'udp' }[] }[] }
+export interface RedactedProfile {
+  interface: { private_key_configured: boolean; addresses: string[]; dns: string[]; listen_port: number | null; mtu: number | null }
+  peers: { public_key: string; preshared_key_configured: boolean; endpoint: { host: string; port: number; address_family: string } | null; allowed_ips: string[]; persistent_keepalive: number | null }[]
+  peer_count: number; ipv4_full_tunnel: boolean; full_tunnel_peer: number | null
+  warnings: { code: string; field: string; message: string }[]
+  apply_kind: 'no_change' | 'dns_reload' | 'sync_conf' | 'sync_conf_and_routes' | 'tunnel_recycle'
+}
+export interface ManagedRevision { id: string; created_at_unix_ms: number; activated_at_unix_ms: number | null; active: boolean; staged: boolean; metadata: RedactedProfile }
+export interface ProfileManagement {
+  lifecycle: 'unconfigured' | 'validating' | 'applying' | 'active' | 'degraded' | 'apply_failed' | 'recovering'
+  source: 'mounted' | 'gui_managed'; source_mutable: boolean; active_revision: string | null
+  active: RedactedProfile | null; revisions: ManagedRevision[]; management_available: boolean
+  mutation_authorized: boolean; ipv4_only: boolean
+  last_apply: { revision: string | null; classification: string; rolled_back: boolean; safe_message: string } | null
+}
 export interface Snapshot {
   schema_version: 2; sequence: number; generated_at_unix_ms: number; protection: Protection
   availability: Availability; checks: Record<string, Check>; transitions: Transition[]
@@ -60,6 +75,7 @@ export interface Snapshot {
   clients: Record<string, { container_id: string; usage_id: string; usage_id_source: UsageIdentitySource; name: string; ipv4_address: string; port_forward_target: boolean; target_port: number | null; compliant: boolean; compliance_message: string; running: boolean; ipv6_address: string | null; networks: string[]; port_forward_label_valid: boolean; route_intent: RouteIntent; traffic: ClientTraffic }>
   traffic: { download_bytes_per_second: number; upload_bytes_per_second: number; downloaded_bytes: number; uploaded_bytes: number; sampled_at_unix_ms?: number }
   last_client_path_success_at_unix_ms?: number
+  profile_management: ProfileManagement
 }
 
 export const fetchSnapshot = async (): Promise<Snapshot> => {
@@ -114,4 +130,48 @@ export const saveNotificationSettings = async (input: NotificationSettingsInput)
 export const sendTestNotification = async (): Promise<void> => {
   const response = await fetch('/api/v2/settings/notifications/test', { method: 'POST' })
   if (!response.ok) throw new Error('Omnihook could not deliver the test notification')
+}
+
+const profileRequest = async <T>(path: string, method: string, token: string, profile?: string): Promise<T> => {
+  const response = await fetch(path, {
+    method,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: profile === undefined ? undefined : JSON.stringify({ profile }),
+    credentials: 'same-origin',
+  })
+  const body = await response.json().catch(() => ({})) as T & { message?: string }
+  if (!response.ok) throw new Error(body.message ?? `profile API returned ${response.status}`)
+  return body
+}
+
+export const validateManagedProfile = (profile: string, token: string) =>
+  profileRequest<RedactedProfile>('/api/v2/wireguard/profiles/validate', 'POST', token, profile)
+export const stageManagedProfile = (profile: string, token: string) =>
+  profileRequest<ManagedRevision>('/api/v2/wireguard/profiles', 'POST', token, profile)
+export const applyManagedProfile = (revision: string, token: string) =>
+  profileRequest<{ safe_message: string }>(`/api/v2/wireguard/profiles/${encodeURIComponent(revision)}/apply`, 'POST', token)
+export const activateProfileSource = async (source: 'mounted' | 'gui_managed', token: string) => {
+  const response = await fetch('/api/v2/wireguard/source', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify({ source }),
+  })
+  const body = await response.json().catch(() => ({})) as { safe_message?: string; message?: string }
+  if (!response.ok) throw new Error(body.message ?? `profile API returned ${response.status}`)
+  return body
+}
+
+export interface StructuredProfileInput {
+  private_key?: string; addresses: string[]; dns: string[]; listen_port: number | null; mtu: number | null
+  peers: { public_key: string; preshared_key?: string; endpoint: string | null; allowed_ips: string[]; persistent_keepalive: number | null }[]
+}
+export const stageStructuredProfile = async (input: StructuredProfileInput, token: string): Promise<ManagedRevision> => {
+  const response = await fetch('/api/v2/wireguard/profiles/edit', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify(input),
+  })
+  const body = await response.json().catch(() => ({})) as ManagedRevision & { message?: string }
+  if (!response.ok) throw new Error(body.message ?? `profile API returned ${response.status}`)
+  return body
 }

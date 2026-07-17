@@ -3,7 +3,7 @@
 Egressy is a transparent Layer-3 VPN gateway for Docker. Containers in
 independent Compose projects opt into a shared external bridge while retaining
 their own network namespaces, port spaces, and service discovery. Their IPv4
-traffic is policy-routed through a standalone Rust gateway and Proton VPN over
+traffic is policy-routed through a standalone Rust gateway and a conventional WireGuard VPN over
 WireGuard—no HTTP or SOCKS proxy configuration required.
 
 The project, crate, daemon, CLI, images, services, labels, environment
@@ -28,7 +28,7 @@ application container
   -> Egressy gateway
   -> fail-closed nftables policy
   -> WireGuard wg0
-  -> Proton VPN
+  -> WireGuard provider
 ```
 
 Applications can use TCP, UDP, and ICMP through the tunnel while management
@@ -42,7 +42,7 @@ paths and failure behavior.
 - Router-owned WireGuard policy routes that preserve management traffic.
 - Restricted, read-only Docker discovery and label-aware enrollment.
 - UDP/TCP DNS forwarding to the tunnel resolver with leak rejection.
-- Native Proton NAT-PMP with matching TCP/UDP allocation and dynamic DNAT to
+- Optional NAT-PMP with matching TCP/UDP allocation and dynamic DNAT to
   one compliant target.
 - Bounded tunnel recovery with backoff and firewall preservation.
 - Enrolled-path DNS, HTTPS, and provider-identity validation companion.
@@ -57,8 +57,8 @@ paths and failure behavior.
 - A Linux host with Docker Engine and Compose 2.33.1 or later.
 - Root access for initial host routing setup.
 - `/dev/net/tun`, `NET_ADMIN`, nftables, and policy-routing support.
-- A Proton WireGuard profile generated with NAT-PMP enabled if port forwarding
-  is required.
+- A supported IPv4 full-tunnel WireGuard profile. NAT-PMP is configured
+  separately if the provider supports it.
 - A dedicated, unused IPv4 subnet. Examples use `172.30.0.0/24`.
 
 Rootless Docker, Docker Desktop, Kubernetes, IPv6 client enrollment, multiple
@@ -116,7 +116,7 @@ the example stack:
 
 ```sh
 chmod 600 /protected/path/wg0.conf
-PROTON_WIREGUARD_CONFIG=/protected/path/wg0.conf docker compose up -d --build
+EGRESSY_WIREGUARD_CONFIG=/protected/path/wg0.conf docker compose up -d --build
 ```
 
 The dashboard binds to `http://127.0.0.1:8080` by default. Check:
@@ -159,7 +159,7 @@ default route and public exit are correct before enrolling real workloads.
 
 ## Port forwarding
 
-Proton supplies one forwarded port per tunnel. Exactly one enrolled client may
+A configured tunnel supplies at most one forwarded port. Exactly one enrolled client may
 request it:
 
 ```yaml

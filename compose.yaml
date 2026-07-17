@@ -44,8 +44,8 @@ services:
     volumes:
       - ./config/config.yaml:/etc/egressy/config.yaml:ro
       - egressy-data:/var/lib/egressy
-      # Replace the source with a protected Proton profile generated with NAT-PMP on.
-      - ${PROTON_WIREGUARD_CONFIG:?set PROTON_WIREGUARD_CONFIG}:/run/secrets/wg0.conf:ro
+      # Select mounted or gui_managed explicitly in config/config.yaml.
+      - ${EGRESSY_WIREGUARD_CONFIG:-./config/wg0.conf}:/run/secrets/wg0.conf:ro
     ports:
       # Management UI is deliberately host-local by default.
       - 127.0.0.1:8080:8080
@@ -55,7 +55,7 @@ services:
       vpn-egress:
         ipv4_address: 172.30.0.2
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://172.30.0.2:8080/healthz"]
+      test: ["CMD", "curl", "--fail", "http://172.30.0.2:8080/livez"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -67,9 +67,12 @@ services:
     entrypoint: ["/usr/local/bin/egressy-probe"]
     environment:
       EGRESSY_PROBE_DNS: 172.30.0.2:53
+      EGRESSY_PROBE_IDENTITY_ENABLED: "false"
       EGRESSY_PROBE_IDENTITY_URL: https://ifconfig.co/json
       EGRESSY_PROBE_IDENTITY_INTERVAL_SECONDS: 300
-      EGRESSY_PROBE_EXPECTED_IDENTITY: Datacamp
+      EGRESSY_PROBE_IDENTITY_MATCHER_TYPE: json_string_contains
+      EGRESSY_PROBE_IDENTITY_MATCHER_FIELDS: asn_org,as_name,org
+      EGRESSY_PROBE_IDENTITY_MATCHER_VALUE: Datacamp
     labels:
       egressy.isolation-id: egressy-probe
       egressy.isolation-allow: gateway:53/udp,gateway:53/tcp,gateway:8080/tcp

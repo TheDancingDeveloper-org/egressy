@@ -84,9 +84,10 @@ pub async fn monitor(config: Config, publisher: StatePublisher) -> anyhow::Resul
                             )
                             .await;
                         let egress_ok = result.https_egress_ok && result.vpn_identity_ok;
-                        let identity_matches = result
-                            .expected_identity
-                            .eq_ignore_ascii_case(&config.probe.expected_identity);
+                        let identity_matches = !config.validation.identity.enabled
+                            || result.expected_identity.eq_ignore_ascii_case(
+                                &config.validation.identity.matcher.expected_value(),
+                            );
                         publisher
                             .observe(
                                 "client_path.egress",

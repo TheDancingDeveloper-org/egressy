@@ -42,10 +42,10 @@ fn default_tunnel() -> String {
 }
 
 fn default_wg_config() -> String {
-    "/run/secrets/proton-wireguard.conf".to_owned()
+    "/run/secrets/wg0.conf".to_owned()
 }
 
-fn default_natpmp_gateway() -> Ipv4Addr {
+fn default_port_forward_gateway() -> Ipv4Addr {
     Ipv4Addr::new(10, 2, 0, 1)
 }
 
@@ -59,10 +59,6 @@ fn default_lifetime_seconds() -> u32 {
 
 fn default_dns_listen() -> String {
     "172.30.0.2:53".to_owned()
-}
-
-fn default_dns_upstream() -> String {
-    "10.2.0.1:53".to_owned()
 }
 
 fn default_true() -> bool {
@@ -141,13 +137,15 @@ pub struct Config {
     #[serde(default)]
     pub wireguard: WireGuardConfig,
     #[serde(default)]
-    pub proton: ProtonConfig,
+    pub port_forwarding: PortForwardingConfig,
     #[serde(default)]
     pub dns: DnsConfig,
     #[serde(default)]
     pub probe: ProbeConfig,
     #[serde(default)]
     pub external_probe: ExternalProbeConfig,
+    #[serde(default)]
+    pub validation: ValidationConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
     #[serde(default)]
@@ -186,36 +184,62 @@ impl Default for NetworkConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct WireGuardConfig {
     pub interface: String,
-    pub config_path: String,
+    pub source: ProfileSource,
+    pub config_path: Option<String>,
     pub config_base64_path: Option<String>,
     pub manage: bool,
+    pub profile_database_path: String,
+    pub storage_key_path: Option<String>,
+    pub admin_token_path: Option<String>,
+    pub trusted_origins: Vec<String>,
 }
 
 impl Default for WireGuardConfig {
     fn default() -> Self {
         Self {
             interface: default_tunnel(),
-            config_path: default_wg_config(),
+            source: ProfileSource::Mounted,
+            config_path: Some(default_wg_config()),
             config_base64_path: None,
             manage: true,
+            profile_database_path: "/var/lib/egressy/profiles.sqlite3".to_owned(),
+            storage_key_path: None,
+            admin_token_path: None,
+            trusted_origins: Vec::new(),
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileSource {
+    #[default]
+    Mounted,
+    GuiManaged,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortForwardingBackend {
+    #[default]
+    Disabled,
+    NatPmp,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ProtonConfig {
-    pub port_forwarding: bool,
-    pub natpmp_gateway: Ipv4Addr,
+pub struct PortForwardingConfig {
+    pub backend: PortForwardingBackend,
+    pub gateway: Ipv4Addr,
     pub refresh_seconds: u64,
     pub lifetime_seconds: u32,
 }
 
-impl Default for ProtonConfig {
+impl Default for PortForwardingConfig {
     fn default() -> Self {
         Self {
-            port_forwarding: true,
-            natpmp_gateway: default_natpmp_gateway(),
+            backend: PortForwardingBackend::Disabled,
+            gateway: default_port_forward_gateway(),
             refresh_seconds: default_refresh_seconds(),
             lifetime_seconds: default_lifetime_seconds(),
         }
@@ -227,7 +251,7 @@ impl Default for ProtonConfig {
 pub struct DnsConfig {
     pub enabled: bool,
     pub listen: String,
-    pub upstream: String,
+    pub upstream: DnsUpstreamConfig,
     pub timeout_ms: u64,
     pub max_concurrent_queries: usize,
 }
@@ -237,11 +261,26 @@ impl Default for DnsConfig {
         Self {
             enabled: true,
             listen: default_dns_listen(),
-            upstream: default_dns_upstream(),
+            upstream: DnsUpstreamConfig::default(),
             timeout_ms: default_dns_timeout_ms(),
             max_concurrent_queries: default_dns_concurrency(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsUpstreamSource {
+    #[default]
+    Profile,
+    Explicit,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsUpstreamConfig {
+    pub source: DnsUpstreamSource,
+    pub addresses: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -251,7 +290,6 @@ pub struct ProbeConfig {
     pub url: String,
     pub interval_seconds: u64,
     pub token_path: Option<String>,
-    pub expected_identity: String,
 }
 
 impl Default for ProbeConfig {
@@ -261,7 +299,51 @@ impl Default for ProbeConfig {
             url: default_probe_url(),
             interval_seconds: 30,
             token_path: None,
-            expected_identity: "Datacamp".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ValidationConfig {
+    pub identity: IdentityValidationConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IdentityValidationConfig {
+    pub enabled: bool,
+    pub url: String,
+    pub matcher: IdentityMatcher,
+}
+
+impl Default for IdentityValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            matcher: IdentityMatcher::PlainTextContains {
+                value: String::new(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IdentityMatcher {
+    PlainTextContains { value: String },
+    JsonStringContains { fields: Vec<String>, value: String },
+    JsonBoolean { field: String, value: bool },
+}
+
+impl IdentityMatcher {
+    pub fn expected_value(&self) -> String {
+        match self {
+            Self::PlainTextContains { value } | Self::JsonStringContains { value, .. } => {
+                value.clone()
+            }
+            Self::JsonBoolean { value, .. } => value.to_string(),
         }
     }
 }
@@ -444,8 +526,11 @@ impl Config {
         if self.network.route_table == 0 || self.network.route_table == 253 {
             bail!("network.route_table must be a dedicated non-zero policy table");
         }
-        if self.proton.refresh_seconds >= u64::from(self.proton.lifetime_seconds) {
-            bail!("proton.refresh_seconds must be shorter than proton.lifetime_seconds");
+        if self.port_forwarding.backend == PortForwardingBackend::NatPmp
+            && self.port_forwarding.refresh_seconds
+                >= u64::from(self.port_forwarding.lifetime_seconds)
+        {
+            bail!("port_forwarding.refresh_seconds must be shorter than port_forwarding.lifetime_seconds");
         }
         if self.reconcile.interval_seconds == 0 {
             bail!("reconcile.interval_seconds must be greater than zero");
@@ -495,6 +580,30 @@ impl Config {
                 bail!(
                     "external_probe.timeout_seconds must be shorter than external_probe.interval_seconds"
                 );
+            }
+        }
+        if self.validation.identity.enabled {
+            let url = reqwest::Url::parse(&self.validation.identity.url)
+                .context("invalid validation.identity.url")?;
+            if url.scheme() != "https" || url.host_str().is_none() {
+                bail!("validation.identity.url must be an HTTPS URL with a hostname");
+            }
+            const FIELDS: &[&str] = &["asn_org", "as_name", "org", "mullvad_exit_ip"];
+            match &self.validation.identity.matcher {
+                IdentityMatcher::PlainTextContains { value } => validate_match_value(value)?,
+                IdentityMatcher::JsonStringContains { fields, value } => {
+                    validate_match_value(value)?;
+                    if fields.is_empty()
+                        || fields.len() > 8
+                        || fields.iter().any(|field| !FIELDS.contains(&field.as_str()))
+                    {
+                        bail!("validation identity JSON fields must use the bounded allowlist");
+                    }
+                }
+                IdentityMatcher::JsonBoolean { field, .. } if !FIELDS.contains(&field.as_str()) => {
+                    bail!("validation identity JSON boolean field must use the bounded allowlist");
+                }
+                IdentityMatcher::JsonBoolean { .. } => {}
             }
         }
         if self.persistence.enabled {
@@ -570,16 +679,52 @@ impl Config {
             .listen
             .parse::<std::net::SocketAddr>()
             .context("invalid dns.listen")?;
-        self.dns
-            .upstream
-            .parse::<std::net::SocketAddr>()
-            .context("invalid dns.upstream")?;
+        if self.dns.enabled && self.dns.upstream.source == DnsUpstreamSource::Explicit {
+            if self.dns.upstream.addresses.is_empty() {
+                bail!("dns.upstream.addresses must not be empty for an explicit upstream");
+            }
+            for address in &self.dns.upstream.addresses {
+                address
+                    .parse::<std::net::SocketAddr>()
+                    .context("invalid dns.upstream.addresses entry")?;
+            }
+        }
+        if self.wireguard.source == ProfileSource::Mounted
+            && self.wireguard.config_path.is_some()
+            && self.wireguard.config_base64_path.is_some()
+        {
+            bail!(
+                "wireguard mounted source must select config_path or config_base64_path, not both"
+            );
+        }
+        if self.wireguard.source == ProfileSource::GuiManaged {
+            if self.wireguard.profile_database_path.trim().is_empty() {
+                bail!("wireguard.profile_database_path must not be empty");
+            }
+            if self.wireguard.config_base64_path.is_some() {
+                bail!("wireguard.config_base64_path is only valid for mounted source");
+            }
+        }
+        for origin in &self.wireguard.trusted_origins {
+            let url =
+                reqwest::Url::parse(origin).context("invalid wireguard.trusted_origins entry")?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                bail!("wireguard.trusted_origins entries must be HTTP(S) origins");
+            }
+        }
         Ok(())
     }
 
     pub fn reconcile_interval(&self) -> Duration {
         Duration::from_secs(self.reconcile.interval_seconds)
     }
+}
+
+fn validate_match_value(value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() || value.len() > 128 {
+        bail!("validation identity match values must contain 1-128 characters");
+    }
+    Ok(())
 }
 
 fn env_var(name: &str) -> Option<String> {
@@ -737,5 +882,21 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn identity_validation_is_disabled_by_default_and_matchers_are_bounded() {
+        let disabled: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(!disabled.validation.identity.enabled);
+        let mullvad: Config = serde_yaml::from_str(
+            "validation:\n  identity:\n    enabled: true\n    url: https://am.i.mullvad.net/json\n    matcher:\n      type: json_boolean\n      field: mullvad_exit_ip\n      value: true\n",
+        )
+        .unwrap();
+        mullvad.validate().unwrap();
+        let arbitrary: Config = serde_yaml::from_str(
+            "validation:\n  identity:\n    enabled: true\n    url: https://example.test/json\n    matcher:\n      type: json_string_contains\n      fields: [password]\n      value: secret\n",
+        )
+        .unwrap();
+        assert!(arbitrary.validate().is_err());
     }
 }

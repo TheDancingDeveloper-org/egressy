@@ -4,7 +4,7 @@ use anyhow::{bail, Context};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::Semaphore,
+    sync::{watch, Semaphore},
     task::JoinSet,
     time::timeout,
 };
@@ -20,7 +20,7 @@ const MAX_DNS_MESSAGE: usize = 65_535;
 #[derive(Clone)]
 pub struct Settings {
     pub listen: SocketAddr,
-    pub upstream: SocketAddr,
+    pub upstream: watch::Receiver<Option<SocketAddr>>,
     pub timeout: Duration,
     pub max_concurrent_queries: usize,
     pub publisher: Option<StatePublisher>,
@@ -98,7 +98,15 @@ async fn serve_udp(
         };
         workers.spawn(async move {
             let _permit = permit;
-            match forward_query(&query, settings.upstream, settings.timeout).await {
+            let Some(upstream) = *settings.upstream.borrow() else {
+                observe_failure(
+                    settings.publisher.as_ref(),
+                    &anyhow::anyhow!("DNS upstream is not configured"),
+                )
+                .await;
+                return;
+            };
+            match forward_query(&query, upstream, settings.timeout).await {
                 Ok((response, tcp_used)) => {
                     observe_success(settings.publisher.as_ref(), tcp_used).await;
                     if let Err(error) = listener.send_to(&response, client).await {
@@ -146,7 +154,8 @@ async fn serve_tcp(
 
 async fn handle_tcp_client(client: &mut TcpStream, settings: &Settings) -> anyhow::Result<()> {
     let query = read_tcp_message(client, settings.timeout).await?;
-    let response = tcp_exchange(&query, settings.upstream, settings.timeout).await?;
+    let upstream = (*settings.upstream.borrow()).context("DNS upstream is not configured")?;
+    let response = tcp_exchange(&query, upstream, settings.timeout).await?;
     observe_success(settings.publisher.as_ref(), true).await;
     write_tcp_message(client, &response, settings.timeout).await?;
     Ok(())

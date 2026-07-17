@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactElement, type MouseEvent as ReactMouseEv
 import { EventHistory, fetchEventHistory, fetchSnapshot, fetchUsageHistory, fetchVpnServerHistory, Snapshot, UsageHistory, VpnServerHistory } from './api'
 import { ThroughputChart, TrafficSample, formatRate } from './ThroughputChart'
 import { NotificationsPanel } from './NotificationsPanel'
+import { ProfilesPanel } from './ProfilesPanel'
 
 const formatBytes = (bytes: number) => formatRate(bytes).replace('/s', '')
 
@@ -33,7 +34,7 @@ const PATH_CHECKS: [id: string, label: string][] = [
 ]
 
 const VIEWS = [
-  ['overview', 'Overview'], ['path', 'Data path'], ['clients', 'Clients'],
+  ['overview', 'Overview'], ['profiles', 'WireGuard profile'], ['path', 'Data path'], ['clients', 'Clients'],
   ['forwarding', 'Port forwarding'], ['server', 'VPN server'], ['probe', 'External probe'],
   ['history', 'History'], ['notifications', 'Notifications'], ['diagnostics', 'Diagnostics'], ['events', 'Events'],
 ] as const
@@ -41,6 +42,7 @@ type ViewId = typeof VIEWS[number][0]
 
 const ICONS: Record<ViewId, ReactElement> = {
   overview: <><rect x="1" y="1" width="5.4" height="5.4" rx="1.2" /><rect x="8.6" y="1" width="5.4" height="5.4" rx="1.2" /><rect x="1" y="8.6" width="5.4" height="5.4" rx="1.2" /><rect x="8.6" y="8.6" width="5.4" height="5.4" rx="1.2" /></>,
+  profiles: <><path d="M3 2 h7 l2 2 v9 H3 Z" /><path d="M10 2 v3 h3 M5 8 h5 M5 10.5 h5" /></>,
   path: <><circle cx="2.6" cy="7.5" r="1.7" /><circle cx="12.4" cy="7.5" r="1.7" /><path d="M4.5 7.5 h6 M8.6 5.6 l2 1.9-2 1.9" /></>,
   clients: <><rect x="1.5" y="2" width="12" height="7.5" rx="1.4" /><path d="M5 12.8 h5 M7.5 9.5 v3.3" /></>,
   forwarding: <><path d="M1.5 7.5 h9 M7.5 4.5 l3.2 3-3.2 3" /><path d="M12.8 3 v9" /></>,
@@ -251,6 +253,10 @@ export function App() {
 
           <div className="card" style={{ marginTop: 12 }}><h3>Data path</h3>{pipeline(false)}</div>
           <div className="card" style={{ marginTop: 12 }}><h3>Recent transitions</h3>{feed(transitions.slice(0, 4))}</div>
+        </section>
+
+        <section className={view === 'profiles' ? 'view on' : 'view'} aria-labelledby="h-profiles">
+          <ProfilesPanel management={snapshot.profile_management} />
         </section>
 
         <section className={view === 'path' ? 'view on' : 'view'} aria-labelledby="h-path">

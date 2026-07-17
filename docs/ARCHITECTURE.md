@@ -106,7 +106,7 @@ Compatibility v1 state remains available for existing consumers.
 
 ## Extension boundaries
 
-Provider-specific behavior is currently isolated in WireGuard input, tunnel
-DNS defaults, expected identity, and Proton NAT-PMP. Supporting another provider
+Provider-specific examples are isolated from the provider-neutral WireGuard,
+DNS, identity-validation, and optional NAT-PMP capabilities. Supporting another provider
 requires an explicit capability model for DNS and port allocation; it must not
 weaken the fail-closed routing layers.

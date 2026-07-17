@@ -52,6 +52,13 @@ nav.side a.active svg { opacity: 1 }
 nav.side a:focus-visible { outline: 2px solid var(--id); outline-offset: 2px }
 .side-foot { margin-top: auto; padding: 10px; color: var(--ink-3); font-size: 11px }
 .side-foot code { color: var(--ink-3) }
+.profile-editor label { display: grid; gap: 6px; margin: 12px 0; color: var(--ink-2); font-size: 12px }
+.profile-editor input, .profile-editor textarea { width: 100%; box-sizing: border-box; background: var(--bg-side); color: var(--ink); border: 1px solid var(--border); border-radius: 5px; padding: 9px; font: inherit }
+.profile-editor textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical }
+.profile-editor .actions { display: flex; gap: 8px }
+.profile-editor button { border: 1px solid var(--border); border-radius: 5px; background: var(--card-in); color: var(--ink); padding: 8px 16px; cursor: pointer }
+.profile-editor button:disabled { opacity: .45; cursor: not-allowed }
+.profile-peer { border-top: 1px solid var(--border-soft); margin-top: 10px; padding-top: 10px; overflow-wrap: anywhere }
 
 /* ---------- top facts strip ---------- */
 .top {

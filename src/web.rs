@@ -1,10 +1,10 @@
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, path::Path, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Extension, Query, State},
-    http::{header, StatusCode},
+    extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::{sse::Event, Html, IntoResponse, Response, Sse},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures_util::Stream;
@@ -30,6 +30,94 @@ pub struct WebState {
     legacy: SharedState,
     publisher: StatePublisher,
     history: SharedHistory,
+    profiles: crate::profile_manager::ProfileManager,
+    auth: AdminAuth,
+}
+
+#[derive(Clone, Default)]
+pub struct AdminAuth {
+    token: Option<Arc<String>>,
+    trusted_origins: Arc<Vec<String>>,
+}
+
+impl AdminAuth {
+    pub fn load(config: &crate::config::WireGuardConfig) -> anyhow::Result<Self> {
+        let token = config
+            .admin_token_path
+            .as_ref()
+            .map(|path| read_protected_token(Path::new(path)))
+            .transpose()?
+            .map(Arc::new);
+        Ok(Self {
+            token,
+            trusted_origins: Arc::new(config.trusted_origins.clone()),
+        })
+    }
+
+    fn authorize(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+        let expected = self.token.as_ref().ok_or(StatusCode::FORBIDDEN)?;
+        let supplied = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        if !constant_time_equal(supplied.as_bytes(), expected.as_bytes()) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        if let Some(origin) = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+        {
+            let direct_host = headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok());
+            let same_origin = reqwest::Url::parse(origin)
+                .ok()
+                .and_then(|url| {
+                    let host = url.host_str()?;
+                    let authority = url
+                        .port()
+                        .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+                    Some(direct_host == Some(authority.as_str()))
+                })
+                .unwrap_or(false);
+            if !same_origin && !self.trusted_origins.iter().any(|trusted| trusted == origin) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_protected_token(path: &Path) -> anyhow::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > 4_096 {
+        anyhow::bail!("admin token must be a regular file no larger than 4 KiB");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("admin token must not be readable by group or others");
+        }
+    }
+    let token = std::fs::read_to_string(path)?.trim().to_owned();
+    if token.len() < 32 || token.len() > 512 {
+        anyhow::bail!("admin token must contain 32-512 characters");
+    }
+    Ok(token)
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 pub fn router(
@@ -37,6 +125,8 @@ pub fn router(
     publisher: StatePublisher,
     history: SharedHistory,
     notifications: crate::notifications::NotificationManager,
+    profiles: crate::profile_manager::ProfileManager,
+    auth: AdminAuth,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -44,6 +134,24 @@ pub fn router(
         .route("/api/v2/status", get(v2_status))
         .route("/api/v2/isolation-policy", get(isolation_policy))
         .route("/api/v2/events", get(events))
+        .route(
+            "/api/v2/wireguard/profiles",
+            get(profile_status).post(stage_profile),
+        )
+        .route(
+            "/api/v2/wireguard/profiles/validate",
+            post(validate_profile),
+        )
+        .route("/api/v2/wireguard/profiles/edit", post(edit_profile))
+        .route("/api/v2/wireguard/source", post(activate_profile_source))
+        .route(
+            "/api/v2/wireguard/profiles/{revision}/apply",
+            post(apply_profile),
+        )
+        .route(
+            "/api/v2/wireguard/profiles/{revision}",
+            delete(delete_profile),
+        )
         .route("/api/v2/history/usage", get(usage_history))
         .route("/api/v2/history/events", get(event_history))
         .route("/api/v2/history/vpn-server", get(vpn_server_history))
@@ -60,13 +168,137 @@ pub fn router(
         .route("/healthz", get(health))
         .route("/livez", get(liveness))
         .route("/readyz", get(readiness))
+        .layer(DefaultBodyLimit::max(300 * 1024))
         .layer(TraceLayer::new_for_http())
         .layer(Extension(notifications))
         .with_state(WebState {
             legacy,
             publisher,
             history,
+            profiles,
+            auth,
         })
+}
+
+#[derive(serde::Deserialize)]
+struct ProfileBody {
+    profile: String,
+}
+
+async fn profile_status(
+    State(state): State<WebState>,
+) -> Json<crate::profile_manager::ProfileManagementStatus> {
+    Json(state.profiles.status().await)
+}
+
+async fn validate_profile(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(mut input): Json<ProfileBody>,
+) -> Response {
+    use zeroize::Zeroize;
+    if let Err(status) = state.auth.authorize(&headers) {
+        input.profile.zeroize();
+        return status.into_response();
+    }
+    let result = state.profiles.validate(input.profile.as_bytes()).await;
+    input.profile.zeroize();
+    match result {
+        Ok(profile) => Json(profile).into_response(),
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, Json(error)).into_response(),
+    }
+}
+
+async fn stage_profile(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(mut input): Json<ProfileBody>,
+) -> Response {
+    use zeroize::Zeroize;
+    if let Err(status) = state.auth.authorize(&headers) {
+        input.profile.zeroize();
+        return status.into_response();
+    }
+    let source = std::mem::take(&mut input.profile).into_bytes();
+    input.profile.zeroize();
+    match state.profiles.stage(source).await {
+        Ok(revision) => (StatusCode::CREATED, Json(revision)).into_response(),
+        Err(error) => safe_profile_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn edit_profile(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::wireguard::StructuredProfileInput>,
+) -> Response {
+    if let Err(status) = state.auth.authorize(&headers) {
+        return status.into_response();
+    }
+    match state.profiles.stage_edit(input).await {
+        Ok(revision) => (StatusCode::CREATED, Json(revision)).into_response(),
+        Err(error) => safe_profile_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateSourceBody {
+    source: crate::config::ProfileSource,
+}
+
+async fn activate_profile_source(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(input): Json<ActivateSourceBody>,
+) -> Response {
+    if let Err(status) = state.auth.authorize(&headers) {
+        return status.into_response();
+    }
+    match state.profiles.activate_source(input.source).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => safe_profile_error(StatusCode::BAD_GATEWAY, &error),
+    }
+}
+
+async fn apply_profile(
+    State(state): State<WebState>,
+    AxumPath(revision): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = state.auth.authorize(&headers) {
+        return status.into_response();
+    }
+    match state.profiles.apply(&revision).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => safe_profile_error(StatusCode::BAD_GATEWAY, &error),
+    }
+}
+
+async fn delete_profile(
+    State(state): State<WebState>,
+    AxumPath(revision): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = state.auth.authorize(&headers) {
+        return status.into_response();
+    }
+    match state.profiles.delete(&revision).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => safe_profile_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+fn safe_profile_error(status: StatusCode, error: &anyhow::Error) -> Response {
+    tracing::warn!(error = %error, "profile management operation failed");
+    (
+        status,
+        Json(serde_json::json!({
+            "error": "profile_operation_failed",
+            "message": "The profile operation failed; enrolled traffic remains fail closed"
+        })),
+    )
+        .into_response()
 }
 
 async fn notification_settings(
@@ -198,7 +430,9 @@ async fn v1_status(State(state): State<WebState>) -> Json<AppState> {
 }
 
 async fn v2_status(State(state): State<WebState>) -> Json<CanonicalSnapshot> {
-    Json(state.publisher.subscribe().borrow().clone())
+    let mut snapshot = state.publisher.subscribe().borrow().clone();
+    snapshot.profile_management = state.profiles.status().await;
+    Json(snapshot)
 }
 
 async fn isolation_policy(
@@ -293,6 +527,10 @@ async fn liveness() -> impl IntoResponse {
 }
 
 async fn readiness(State(state): State<WebState>) -> impl IntoResponse {
+    let profile = state.profiles.status().await;
+    if profile.lifecycle == crate::profile_manager::ProfileLifecycle::Unconfigured {
+        return text_status(true, "ready: unconfigured\n", "unreachable\n").into_response();
+    }
     let snapshot = state.publisher.subscribe().borrow().clone();
     let ready = !matches!(
         snapshot.availability,
@@ -302,7 +540,7 @@ async fn readiness(State(state): State<WebState>) -> impl IntoResponse {
         .values()
         .filter(|check| check.impact == crate::domain::Impact::Critical)
         .all(|check| check.status != CheckStatus::Failed);
-    text_status(ready, "ready\n", "data_plane_not_ready\n")
+    text_status(ready, "ready\n", "data_plane_not_ready\n").into_response()
 }
 
 fn text_status(ok: bool, success: &'static str, failure: &'static str) -> impl IntoResponse {
@@ -322,6 +560,98 @@ mod tests {
     use super::*;
     use crate::domain::{CheckStatus, Impact};
 
+    fn test_profile_manager() -> crate::profile_manager::ProfileManager {
+        let config: crate::config::Config = serde_yaml::from_str("{}").unwrap();
+        crate::profile_manager::ProfileManager::new(
+            config.clone(),
+            None,
+            crate::enforcement::EnforcementCoordinator::new(config),
+            None,
+            tokio::sync::watch::channel(None).0,
+        )
+    }
+
+    fn authenticated_headers(token: &str, origin: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        if let Some(origin) = origin {
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn profile_mutation_requires_token_and_rejects_untrusted_origins() {
+        let auth = AdminAuth {
+            token: Some(Arc::new("a".repeat(32))),
+            trusted_origins: Arc::new(vec!["https://egressy.example".into()]),
+        };
+        assert_eq!(
+            auth.authorize(&HeaderMap::new()),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            auth.authorize(&authenticated_headers(&"b".repeat(32), None)),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            auth.authorize(&authenticated_headers(
+                &"a".repeat(32),
+                Some("https://evil.example")
+            )),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert!(auth
+            .authorize(&authenticated_headers(
+                &"a".repeat(32),
+                Some("https://egressy.example")
+            ))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn profile_validation_response_never_returns_secrets() {
+        let token = "a".repeat(32);
+        let mut config: crate::config::Config = serde_yaml::from_str("{}").unwrap();
+        config.wireguard.admin_token_path = Some("configured-for-test".into());
+        let manager = crate::profile_manager::ProfileManager::new(
+            config.clone(),
+            None,
+            crate::enforcement::EnforcementCoordinator::new(config),
+            None,
+            tokio::sync::watch::channel(None).0,
+        );
+        let state = WebState {
+            legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
+            publisher: StatePublisher::new(CanonicalSnapshot::default()),
+            history: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            profiles: manager,
+            auth: AdminAuth {
+                token: Some(Arc::new(token.clone())),
+                trusted_origins: Arc::new(Vec::new()),
+            },
+        };
+        let response = validate_profile(
+            State(state),
+            authenticated_headers(&token, None),
+            Json(ProfileBody {
+                profile: "[Interface]\nPrivateKey = fake-private\nAddress = 10.0.0.2/32\nDNS = 10.0.0.1\n[Peer]\nPublicKey = fake-public\nPresharedKey = fake-psk\nEndpoint = vpn.example:51820\nAllowedIPs = 0.0.0.0/0\n".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("fake-private"));
+        assert!(!body.contains("fake-psk"));
+        assert!(body.contains("private_key_configured"));
+    }
+
     #[tokio::test]
     async fn notification_settings_handler_persists_and_returns_only_masked_values() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -336,6 +666,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher: StatePublisher::new(CanonicalSnapshot::default()),
             history,
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
         let response = update_notification_settings(
             State(state),
@@ -376,6 +708,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher: StatePublisher::new(CanonicalSnapshot::default()),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
         assert_eq!(
             usage_history(State(unavailable), Query(UsageHistoryQuery::default()))
@@ -408,6 +742,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher: StatePublisher::new(CanonicalSnapshot::default()),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(Some(store.clone()))),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
         let response = usage_history(
             State(state),
@@ -435,6 +771,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher: StatePublisher::new(CanonicalSnapshot::default()),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(Some(store.clone()))),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
 
         let invalid = usage_history(
@@ -468,6 +806,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher: StatePublisher::new(CanonicalSnapshot::default()),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(Some(store))),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
         let response =
             usage_history(State(state.clone()), Query(UsageHistoryQuery::default())).await;
@@ -491,6 +831,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher: StatePublisher::new(CanonicalSnapshot::default()),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(Some(store.clone()))),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
         for message in ["attempt to write a readonly database", "database is locked"] {
             *state.history.write().await = Some(store.clone());
@@ -561,6 +903,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher: StatePublisher::new(snapshot),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
         let Json(policy) = isolation_policy(State(state)).await;
         let value = serde_json::to_value(policy).unwrap();
@@ -586,6 +930,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher: StatePublisher::new(snapshot),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
 
         let response = metrics(State(state)).await;
@@ -650,6 +996,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(legacy)),
             publisher: StatePublisher::new(CanonicalSnapshot::default()),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
 
         let Json(response) = v1_status(State(state)).await;
@@ -672,6 +1020,8 @@ mod tests {
             legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
             publisher,
             history: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
 
         let Json(response) = v2_status(State(state)).await;
@@ -718,6 +1068,8 @@ mod tests {
             legacy,
             publisher: StatePublisher::new(snapshot),
             history: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
         };
 
         assert_eq!(
@@ -727,6 +1079,29 @@ mod tests {
         assert_eq!(
             readiness(State(state)).await.into_response().status(),
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_is_live_and_management_ready_but_tunnel_unhealthy() {
+        let state = WebState {
+            legacy: std::sync::Arc::new(tokio::sync::RwLock::new(AppState::default())),
+            publisher: StatePublisher::new(CanonicalSnapshot::default()),
+            history: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            profiles: test_profile_manager(),
+            auth: AdminAuth::default(),
+        };
+        assert_eq!(liveness().await.into_response().status(), StatusCode::OK);
+        assert_eq!(
+            readiness(State(state.clone()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            health(State(state)).await.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

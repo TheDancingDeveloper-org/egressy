@@ -34,32 +34,41 @@ These values must match the Docker network and installed host policy.
 | Field | Meaning |
 |---|---|
 | `interface` | Managed interface name, normally `wg0`. |
+| `source` | Explicitly selects `mounted` or `gui_managed`. |
 | `config_path` | Protected raw profile path. |
 | `config_base64_path` | Optional protected base64 profile path. |
 | `manage` | Whether Egressy starts and stops the interface. |
+| `profile_database_path` | GUI-managed encrypted revision database. |
+| `storage_key_path` | Protected external 32-byte base64 AEAD key. |
+| `admin_token_path` | Protected bearer token for profile mutation. |
+| `trusted_origins` | Reviewed reverse-proxy browser origins. |
 
 The normal managed mode rewrites a tmpfs copy with `Table = off`. Do not add
 PostUp/PostDown commands that compete with Egressy firewall ownership.
 
-### `proton`
+### `port_forwarding`
 
-`port_forwarding` enables NAT-PMP. `natpmp_gateway` is the provider gateway,
+`port_forwarding.backend` is `disabled` by default. `nat_pmp` enables the
+optional backend. `gateway` is the provider service address,
 `refresh_seconds` is the renewal interval, and `lifetime_seconds` is the
 requested lease. Refresh must be shorter than lifetime. Defaults are tuned for
-Proton's 60-second lease.
+the configured NAT-PMP lease.
 
 ### `dns`
 
-`enabled`, `listen`, and `upstream` control the bounded UDP/TCP forwarder.
+`enabled`, `listen`, and `upstream.source` control the bounded UDP/TCP forwarder.
+Use `profile` to derive IPv4 DNS from the profile or `explicit` with
+`upstream.addresses` for reviewed overrides.
 `timeout_ms` limits an upstream attempt and `max_concurrent_queries` bounds
 load. Enrolled clients should use only the gateway listener; firewall policy
 rejects other plain DNS destinations.
 
-### `probe`
+### `probe` and `validation.identity`
 
 The internal companion URL is polled at `interval_seconds`. `token_path` may
-protect the local status exchange. `expected_identity` is matched against the
-safe provider organization returned by the companion's identity endpoint.
+protect the local status exchange. Optional identity validation uses bounded
+`plain_text_contains`, allowlisted `json_string_contains`, or allowlisted
+`json_boolean` matchers and remains advisory.
 
 The companion itself is configured with `EGRESSY_PROBE_*` variables in
 Compose, including DNS address, identity URL, expected identity, token, and

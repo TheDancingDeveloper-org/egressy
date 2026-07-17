@@ -2,6 +2,7 @@
 /config/config.yaml
 /mullvad/
 *.conf
+!tests/fixtures/wireguard/*.conf
 .env
 /ui/node_modules/
 /ui/test-results/

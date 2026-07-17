@@ -6,7 +6,7 @@ services:
       egressy.enabled: "true"
       egressy.usage-id: "example/example-client"
       egressy.isolation-id: "example-client"
-      # Proton allocates one public port per tunnel. Exactly one client can opt in.
+      # A tunnel supplies at most one public port. Exactly one client can opt in.
       egressy.port-forward: "true"
       egressy.target-port: "6881"
     networks:

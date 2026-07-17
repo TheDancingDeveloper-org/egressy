@@ -3,6 +3,13 @@
 Egressy exposes operational state through versioned JSON endpoints, health
 checks, metrics, server-sent events, and its embedded dashboard.
 
+WireGuard profile management is available under `/api/v2/wireguard`. Complete
+profiles and replacement keys are write-only request fields. Mutation and
+source-activation operations require the protected administrator bearer token
+and same-origin or explicitly trusted-origin browser requests. Responses expose
+only parsed non-secret metadata and `*_configured` flags; the active profile is
+not downloadable.
+
 ## Compatibility endpoints
 
 `GET /api/v1/status` retains the original `AppState` fields and meanings:

@@ -18,9 +18,9 @@ pub struct AppState {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TrafficState {
-    /// Bytes per second received from Proton through WireGuard.
+    /// Bytes per second received through WireGuard.
     pub download_bytes_per_second: u64,
-    /// Bytes per second sent to Proton through WireGuard.
+    /// Bytes per second sent through WireGuard.
     pub upload_bytes_per_second: u64,
     pub downloaded_bytes: u64,
     pub uploaded_bytes: u64,

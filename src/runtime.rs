@@ -15,6 +15,7 @@ use tokio::{
     time::{interval, sleep},
 };
 use tracing::{error, info, warn};
+use zeroize::Zeroize;
 
 use crate::{
     config::Config,
@@ -42,15 +43,65 @@ pub async fn run(
     // exists, enrolled traffic is rejected instead of escaping via the uplink.
     let enforcement = EnforcementCoordinator::new(config.clone());
     enforcement.reconcile_base().await?;
-    let configured_peer = if config.wireguard.manage {
-        Some(read_configured_peer(&config).await?)
-    } else {
-        None
+    let profile_store = config
+        .wireguard
+        .storage_key_path
+        .as_ref()
+        .and_then(|key_path| {
+            match crate::profiles::ProfileStore::open(
+                &config.wireguard.profile_database_path,
+                std::path::Path::new(key_path),
+            ) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    warn!(%error, "managed profile storage is unavailable; plaintext fallback is disabled");
+                    None
+                }
+            }
+        });
+    let active_profile = match config.wireguard.source {
+        crate::config::ProfileSource::Mounted => match load_mounted_profile(&config).await {
+            Ok(profile) => profile,
+            Err(error) => {
+                warn!(%error, "selected mounted WireGuard profile is unusable; management remains available");
+                None
+            }
+        },
+        crate::config::ProfileSource::GuiManaged => match &profile_store {
+            Some(store) => match store.active().await {
+                Ok(active) => active.map(|(_, profile)| profile),
+                Err(error) => {
+                    warn!(%error, "selected managed WireGuard profile is unusable; management remains available");
+                    None
+                }
+            },
+            None => None,
+        },
     };
-    if config.wireguard.manage {
-        wireguard_up(&config).await?;
-    }
+    let active_profile = match active_profile {
+        Some(profile) => match validate_profile_capabilities(&config, &profile) {
+            Ok(()) => Some(profile),
+            Err(error) => {
+                warn!(%error, "selected profile is incompatible with configured capabilities; management remains available");
+                None
+            }
+        },
+        None => None,
+    };
+    let configured_peer = active_profile
+        .as_ref()
+        .and_then(configured_peer_from_profile);
+    let initial_dns_upstream = dns_upstream(&config, active_profile.as_ref());
+    let (dns_upstream_tx, dns_upstream_rx) = watch::channel(initial_dns_upstream);
     let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+    let profile_manager = crate::profile_manager::ProfileManager::new(
+        config.clone(),
+        profile_store,
+        enforcement.clone(),
+        active_profile.clone(),
+        dns_upstream_tx,
+    );
+    profile_manager.initialize().await?;
     let publisher = StatePublisher::new(CanonicalSnapshot {
         topology: TopologyStatus {
             network: config.network.name.clone(),
@@ -135,16 +186,14 @@ pub async fn run(
         ))
     });
     let telemetry_metrics = crate::telemetry::TelemetryMetrics::new();
-    let vpn_server_task = configured_peer.map(|peer| {
-        tokio::spawn(monitor_vpn_server(
-            config.clone(),
-            peer,
-            publisher.clone(),
-            history.clone(),
-            crate::telemetry::TelemetryMetrics::new(),
-            notifications.clone(),
-        ))
-    });
+    let vpn_server_task = tokio::spawn(monitor_vpn_server(
+        config.clone(),
+        profile_manager.clone(),
+        publisher.clone(),
+        history.clone(),
+        crate::telemetry::TelemetryMetrics::new(),
+        notifications.clone(),
+    ));
     publisher
         .observe(
             "telemetry.otel",
@@ -194,22 +243,10 @@ pub async fn run(
     publisher
         .observe(
             "gateway.routes",
-            if config.wireguard.manage {
-                CheckStatus::Healthy
-            } else {
-                CheckStatus::Unknown
-            },
+            CheckStatus::Unknown,
             Impact::Critical,
-            if config.wireguard.manage {
-                "routes.policy_installed"
-            } else {
-                "routes.verification_external"
-            },
-            if config.wireguard.manage {
-                "Gateway source-policy routes were installed"
-            } else {
-                "WireGuard and route management are external and unverified"
-            },
+            "routes.awaiting_profile",
+            "Gateway routes are awaiting an active profile",
             None,
             None,
         )
@@ -229,17 +266,41 @@ pub async fn run(
 
     let listen: SocketAddr = config.listen.parse()?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    let server = axum::serve(
-        listener,
-        web::router(
-            state.clone(),
-            publisher.clone(),
-            history.clone(),
-            notifications.clone(),
-        ),
+    let app = web::router(
+        state.clone(),
+        publisher.clone(),
+        history.clone(),
+        notifications.clone(),
+        profile_manager.clone(),
+        web::AdminAuth::load(&config.wireguard)?,
     );
+    let mut server = tokio::spawn(async move { axum::serve(listener, app).await });
     info!(%listen, "dashboard listening");
     notifications.stack_started().await;
+
+    if config.wireguard.manage {
+        if let Some(profile) = &active_profile {
+            match wireguard_up(&config, profile).await {
+                Ok(()) => {
+                    publisher
+                        .observe(
+                            "gateway.routes",
+                            CheckStatus::Healthy,
+                            Impact::Critical,
+                            "routes.policy_installed",
+                            "Gateway source-policy routes were installed",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    warn!(%error, "WireGuard startup failed; management remains available and traffic stays blocked");
+                    profile_manager.mark_degraded().await;
+                }
+            }
+        }
+    }
 
     // Docker enrollment and tunnel changes must interrupt the NAT-PMP renewal
     // sleep so stale DNAT is removed at the reconciliation cadence rather than
@@ -256,6 +317,7 @@ pub async fn run(
     ));
     let mut tunnel_task = tokio::spawn(monitor_tunnel(
         config.clone(),
+        profile_manager.clone(),
         state.clone(),
         publisher.clone(),
         enforcement.clone(),
@@ -278,7 +340,6 @@ pub async fn run(
     ));
     let mut dns_task = if config.dns.enabled {
         let listen = config.dns.listen.parse()?;
-        let upstream = config.dns.upstream.parse()?;
         publisher
             .observe(
                 "dns.listener",
@@ -292,7 +353,7 @@ pub async fn run(
             .await;
         Some(tokio::spawn(crate::dns::supervise(crate::dns::Settings {
             listen,
-            upstream,
+            upstream: dns_upstream_rx,
             timeout: Duration::from_millis(config.dns.timeout_ms),
             max_concurrent_queries: config.dns.max_concurrent_queries,
             publisher: Some(publisher.clone()),
@@ -302,7 +363,7 @@ pub async fn run(
     };
 
     let run_result: anyhow::Result<()> = tokio::select! {
-        result = server => result.context("HTTP server failed"),
+        result = &mut server => result.context("HTTP server task panicked")?.context("HTTP server failed"),
         _ = signal::ctrl_c() => {
             info!("shutdown requested");
             Ok(())
@@ -336,10 +397,9 @@ pub async fn run(
     if let Some(task) = telemetry_monitor_task {
         stop_task(task).await;
     }
-    if let Some(task) = vpn_server_task {
-        stop_task(task).await;
-    }
+    stop_task(vpn_server_task).await;
     stop_task(notification_monitor_task).await;
+    stop_task(server).await;
     if let Some(store) = history.read().await.clone() {
         if let Err(error) = store.shutdown().await {
             warn!(%error, "history writer did not flush cleanly during shutdown");
@@ -376,19 +436,15 @@ async fn stop_task<T>(task: tokio::task::JoinHandle<T>) {
     }
 }
 
-async fn read_configured_peer(
-    config: &Config,
-) -> anyhow::Result<crate::vpn_server::ConfiguredPeer> {
-    let runtime_path = prepare_wireguard_profile(config).await?;
-    let profile = tokio::fs::read_to_string(runtime_path)
-        .await
-        .context("reading WireGuard profile for safe endpoint metadata")?;
-    crate::vpn_server::parse_wireguard_profile(&profile)
+fn configured_peer_from_profile(
+    profile: &crate::wireguard::WireGuardProfile,
+) -> Option<crate::vpn_server::ConfiguredPeer> {
+    crate::vpn_server::parse_wireguard_profile(&profile.render()).ok()
 }
 
 async fn monitor_vpn_server(
     config: Config,
-    peer: crate::vpn_server::ConfiguredPeer,
+    profiles: crate::profile_manager::ProfileManager,
     publisher: StatePublisher,
     history: SharedHistory,
     telemetry_metrics: crate::telemetry::TelemetryMetrics,
@@ -400,6 +456,9 @@ async fn monitor_vpn_server(
     let mut rtt_above_threshold = false;
     loop {
         ticker.tick().await;
+        let Some(peer) = profiles.configured_peer().await else {
+            continue;
+        };
         let now_ms = unix_ms();
         let now_seconds = now_ms / 1_000;
         let handshake = wireguard_handshake(&config.wireguard.interface)
@@ -1111,6 +1170,7 @@ fn record_client_traffic_sample(traffic: &mut crate::state::ClientTrafficState, 
 
 async fn monitor_tunnel(
     config: Config,
+    profiles: crate::profile_manager::ProfileManager,
     state: SharedState,
     publisher: StatePublisher,
     enforcement: EnforcementCoordinator,
@@ -1124,6 +1184,9 @@ async fn monitor_tunnel(
     let mut tunnel_successes = 0_u32;
     loop {
         ticker.tick().await;
+        if !profiles.has_active_profile().await {
+            continue;
+        }
         match read_interface_counters(&config.wireguard.interface).await {
             Ok(counters) => {
                 let now = Instant::now();
@@ -1186,8 +1249,10 @@ async fn monitor_tunnel(
                 let up =
                     handshake.is_some_and(|value| value != 0 && now.saturating_sub(value) < 180);
                 if up {
+                    profiles.mark_active().await;
                     enforcement.enable_dnat().await;
                 } else {
+                    profiles.mark_degraded().await;
                     enforcement.disable_dnat().await?;
                     invalidate_published_forward(&state, &publisher, PortForwardPhase::Unavailable)
                         .await;
@@ -1249,6 +1314,7 @@ async fn monitor_tunnel(
                 }
             }
             Err(error) => {
+                profiles.mark_degraded().await;
                 enforcement.disable_dnat().await?;
                 invalidate_published_forward(&state, &publisher, PortForwardPhase::Unavailable)
                     .await;
@@ -1316,8 +1382,7 @@ async fn monitor_tunnel(
             invalidate_published_forward(&state, &publisher, PortForwardPhase::Unavailable).await;
             notify_port_change(&port_change_tx);
             sleep(Duration::from_secs(delay)).await;
-            wireguard_down(&config).await;
-            match wireguard_up(&config).await {
+            match profiles.recover().await {
                 Ok(()) => {
                     tunnel_failures = 0;
                     publisher
@@ -1393,11 +1458,11 @@ async fn maintain_port_forward(
     enforcement: EnforcementCoordinator,
     mut port_change_rx: watch::Receiver<u64>,
 ) -> anyhow::Result<()> {
-    if !config.proton.port_forwarding {
+    if config.port_forwarding.backend == crate::config::PortForwardingBackend::Disabled {
         futures_util::future::pending::<()>().await;
         return Ok(());
     }
-    let client = NatPmpClient::new(config.proton.natpmp_gateway);
+    let client = NatPmpClient::new(config.port_forwarding.gateway);
     let mut assigned_port = 0_u16;
     let mut active_forward = None;
 
@@ -1445,7 +1510,7 @@ async fn maintain_port_forward(
             .await?;
             wait_for_port_change(
                 &mut port_change_rx,
-                Duration::from_secs(config.proton.refresh_seconds),
+                Duration::from_secs(config.port_forwarding.refresh_seconds),
             )
             .await;
             continue;
@@ -1458,7 +1523,7 @@ async fn maintain_port_forward(
                 &client,
                 assigned_port,
                 if assigned_port == 0 { 1 } else { assigned_port },
-                config.proton.lifetime_seconds,
+                config.port_forwarding.lifetime_seconds,
             )
             .await
             {
@@ -1560,7 +1625,7 @@ async fn maintain_port_forward(
         }
         wait_for_port_change(
             &mut port_change_rx,
-            Duration::from_secs(config.proton.refresh_seconds),
+            Duration::from_secs(config.port_forwarding.refresh_seconds),
         )
         .await;
     }
@@ -1756,33 +1821,45 @@ async fn select_port_target(state: &SharedState) -> Option<(String, DnatTarget)>
 }
 
 async fn record_port_error(state: &SharedState, error: String) {
-    warn!(%error, "Proton port forwarding failed");
+    warn!(%error, "port forwarding failed");
     let mut state = state.write().await;
     state.port_forward.active = false;
-    state.last_error = Some(format!("Proton port forwarding failed: {error}"));
+    state.last_error = Some(format!("port forwarding failed: {error}"));
 }
 
-async fn wireguard_up(config: &Config) -> anyhow::Result<()> {
-    let runtime_path = prepare_wireguard_profile(config).await?;
+pub(crate) async fn wireguard_up(
+    config: &Config,
+    profile: &crate::wireguard::WireGuardProfile,
+) -> anyhow::Result<()> {
+    let runtime_path = prepare_wireguard_profile(config, profile).await?;
     let runtime_path = runtime_path
         .to_str()
         .context("WireGuard runtime path is not valid UTF-8")?;
     command("wg-quick", &["up", runtime_path]).await?;
-    configure_gateway_routes(config).await
+    configure_gateway_routes(config, &profile.ipv4_dns()).await
 }
 
-async fn prepare_wireguard_profile(config: &Config) -> anyhow::Result<std::path::PathBuf> {
-    let profile = if let Some(encoded_path) = &config.wireguard.config_base64_path {
-        let encoded = tokio::fs::read_to_string(encoded_path)
+pub(crate) async fn load_mounted_profile(
+    config: &Config,
+) -> anyhow::Result<Option<crate::wireguard::WireGuardProfile>> {
+    let mut profile = if let Some(encoded_path) = &config.wireguard.config_base64_path {
+        let mut encoded = tokio::fs::read_to_string(encoded_path)
             .await
             .context("reading base64 WireGuard Docker secret")?;
-        STANDARD
+        let decoded = STANDARD
             .decode(encoded.trim())
-            .context("decoding base64 WireGuard Docker secret")?
-    } else {
-        let metadata = tokio::fs::metadata(&config.wireguard.config_path)
-            .await
-            .context("WireGuard configuration must be mounted as a secret")?;
+            .context("decoding base64 WireGuard Docker secret");
+        encoded.zeroize();
+        decoded?
+    } else if let Some(path) = &config.wireguard.config_path {
+        let metadata = match tokio::fs::metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("reading mounted WireGuard metadata"),
+        };
+        if !metadata.is_file() || metadata.len() > 256 * 1024 {
+            bail!("WireGuard configuration must be a regular file no larger than 256 KiB");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1790,26 +1867,35 @@ async fn prepare_wireguard_profile(config: &Config) -> anyhow::Result<std::path:
                 bail!("WireGuard configuration must not be readable by group or others");
             }
         }
-        tokio::fs::read(&config.wireguard.config_path)
+        tokio::fs::read(path)
             .await
             .context("reading mounted WireGuard configuration")?
+    } else {
+        return Ok(None);
     };
-    if !profile.starts_with(b"[Interface]") || !profile.windows(6).any(|value| value == b"[Peer]") {
-        bail!("decoded WireGuard secret is not a supported configuration");
-    }
+    let parsed = crate::wireguard::WireGuardProfile::parse(&profile);
+    profile.zeroize();
+    Ok(Some(parsed?))
+}
+
+pub(crate) async fn prepare_wireguard_profile(
+    config: &Config,
+    profile: &crate::wireguard::WireGuardProfile,
+) -> anyhow::Result<std::path::PathBuf> {
     let runtime_path =
         std::path::Path::new("/run/egressy").join(format!("{}.conf", config.wireguard.interface));
     let runtime_directory = runtime_path
         .parent()
         .context("WireGuard runtime path has no parent")?;
     tokio::fs::create_dir_all(runtime_directory).await?;
+    verify_tmpfs(runtime_directory).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(runtime_directory, std::fs::Permissions::from_mode(0o700))
             .await?;
     }
-    tokio::fs::write(&runtime_path, force_table_off(profile)?).await?;
+    tokio::fs::write(&runtime_path, profile.render()).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1818,31 +1904,30 @@ async fn prepare_wireguard_profile(config: &Config) -> anyhow::Result<std::path:
     Ok(runtime_path)
 }
 
-fn force_table_off(config: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-    let config = String::from_utf8(config).context("WireGuard configuration is not UTF-8")?;
-    let mut output = String::with_capacity(config.len() + 12);
-    let mut inserted = false;
-    for line in config.lines() {
-        output.push_str(line);
-        output.push('\n');
-        if line.trim() == "[Interface]" {
-            output.push_str("Table = off\n");
-            inserted = true;
-        } else if line.trim_start().starts_with("Table") {
-            bail!("WireGuard configuration must not define Table; Egressy manages policy routing");
-        }
+async fn verify_tmpfs(directory: &std::path::Path) -> anyhow::Result<()> {
+    let mounts = tokio::fs::read_to_string("/proc/self/mountinfo").await?;
+    let directory = directory.to_string_lossy();
+    let mounted = mounts.lines().any(|line| {
+        let mut halves = line.split(" - ");
+        let before = halves.next().unwrap_or_default();
+        let after = halves.next().unwrap_or_default();
+        before.split_whitespace().nth(4) == Some(directory.as_ref())
+            && after.split_whitespace().next() == Some("tmpfs")
+    });
+    if !mounted {
+        bail!("/run/egressy must be a dedicated tmpfs mount");
     }
-    if !inserted {
-        bail!("WireGuard configuration has no [Interface] section");
-    }
-    Ok(output.into_bytes())
+    Ok(())
 }
 
-async fn configure_gateway_routes(config: &Config) -> anyhow::Result<()> {
+pub(crate) async fn configure_gateway_routes(
+    config: &Config,
+    profile_dns: &[Ipv4Addr],
+) -> anyhow::Result<()> {
     let table = config.network.route_table.to_string();
     let subnet = config.network.subnet.to_string();
     let tunnel = &config.wireguard.interface;
-    let gateway = config.proton.natpmp_gateway.to_string();
+    let service_routes = tunnel_service_routes(config, profile_dns);
     let local_gateway = config.network.gateway_ip.to_string();
 
     // Forwarded packets retain the enrolled container's source address, so a
@@ -1884,14 +1969,118 @@ async fn configure_gateway_routes(config: &Config) -> anyhow::Result<()> {
         ],
     )
     .await?;
-    command(
-        "ip",
-        &["route", "replace", &gateway, "dev", tunnel, "scope", "link"],
-    )
-    .await
+    for destination in service_routes {
+        command(
+            "ip",
+            &[
+                "route",
+                "replace",
+                &destination.to_string(),
+                "dev",
+                tunnel,
+                "scope",
+                "link",
+            ],
+        )
+        .await?;
+    }
+    Ok(())
 }
 
-async fn wireguard_down(config: &Config) {
+pub(crate) async fn reconcile_gateway_routes(
+    config: &Config,
+    previous_profile_dns: &[Ipv4Addr],
+    desired_profile_dns: &[Ipv4Addr],
+) -> anyhow::Result<()> {
+    configure_gateway_routes(config, desired_profile_dns).await?;
+    let desired = tunnel_service_routes(config, desired_profile_dns);
+    for address in previous_profile_dns {
+        if desired.contains(address) {
+            continue;
+        }
+        let address = address.to_string();
+        let output = Command::new("ip")
+            .args([
+                "route",
+                "del",
+                &address,
+                "dev",
+                &config.wireguard.interface,
+                "scope",
+                "link",
+            ])
+            .output()
+            .await?;
+        if !output.status.success()
+            && !String::from_utf8_lossy(&output.stderr).contains("No such process")
+        {
+            bail!("removing obsolete tunnel service route failed");
+        }
+    }
+    Ok(())
+}
+
+fn tunnel_service_routes(
+    config: &Config,
+    profile_dns: &[Ipv4Addr],
+) -> std::collections::BTreeSet<Ipv4Addr> {
+    let mut routes = profile_dns
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if config.port_forwarding.backend == crate::config::PortForwardingBackend::NatPmp {
+        routes.insert(config.port_forwarding.gateway);
+    }
+    if config.dns.enabled
+        && config.dns.upstream.source == crate::config::DnsUpstreamSource::Explicit
+    {
+        routes.extend(
+            config
+                .dns
+                .upstream
+                .addresses
+                .iter()
+                .filter_map(|address| address.parse::<SocketAddr>().ok())
+                .filter_map(|address| match address.ip() {
+                    std::net::IpAddr::V4(address) => Some(address),
+                    std::net::IpAddr::V6(_) => None,
+                }),
+        );
+    }
+    routes
+}
+
+fn dns_upstream(
+    config: &Config,
+    profile: Option<&crate::wireguard::WireGuardProfile>,
+) -> Option<SocketAddr> {
+    match config.dns.upstream.source {
+        crate::config::DnsUpstreamSource::Profile => profile
+            .and_then(|profile| profile.ipv4_dns().into_iter().next())
+            .map(|address| SocketAddr::new(address.into(), 53)),
+        crate::config::DnsUpstreamSource::Explicit => config
+            .dns
+            .upstream
+            .addresses
+            .first()
+            .and_then(|address| address.parse().ok()),
+    }
+}
+
+pub(crate) fn validate_profile_capabilities(
+    config: &Config,
+    profile: &crate::wireguard::WireGuardProfile,
+) -> anyhow::Result<()> {
+    if config.dns.enabled
+        && config.dns.upstream.source == crate::config::DnsUpstreamSource::Profile
+        && profile.ipv4_dns().is_empty()
+    {
+        bail!("DNS forwarding uses the profile, but the profile has no usable IPv4 DNS address");
+    }
+    Ok(())
+}
+
+pub(crate) async fn wireguard_down(config: &Config) {
     let runtime_path =
         std::path::Path::new("/run/egressy").join(format!("{}.conf", config.wireguard.interface));
     let runtime_path = runtime_path.to_string_lossy();
@@ -1919,7 +2108,7 @@ async fn wireguard_handshake(interface: &str) -> anyhow::Result<Option<u64>> {
         .max())
 }
 
-async fn command(program: &str, args: &[&str]) -> anyhow::Result<()> {
+pub(crate) async fn command(program: &str, args: &[&str]) -> anyhow::Result<()> {
     let output = Command::new(program)
         .args(args)
         .kill_on_drop(true)
@@ -2020,22 +2209,44 @@ mod tests {
     }
 
     #[test]
-    fn direct_profile_without_table_gets_table_off() {
-        let config =
-            force_table_off(b"[Interface]\nPrivateKey=x\n\n[Peer]\nPublicKey=y\n".to_vec())
+    fn service_routes_are_capability_driven() {
+        let disabled: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(tunnel_service_routes(&disabled, &[]).is_empty());
+        let enabled: Config =
+            serde_yaml::from_str("port_forwarding:\n  backend: nat_pmp\n  gateway: 10.2.0.1\n")
                 .unwrap();
-        let config = String::from_utf8(config).unwrap();
-        assert!(config.starts_with("[Interface]\nTable = off\n"));
+        assert!(tunnel_service_routes(&enabled, &[]).contains(&"10.2.0.1".parse().unwrap()));
     }
 
     #[test]
-    fn direct_profile_rejects_automatic_and_numeric_tables() {
-        for table in ["auto", "123"] {
-            assert!(force_table_off(
-                format!("[Interface]\nTable = {table}\n[Peer]\n").into_bytes()
-            )
-            .is_err());
-        }
+    fn explicit_and_profile_dns_routes_are_derived() {
+        let explicit: Config = serde_yaml::from_str(
+            "dns:\n  upstream:\n    source: explicit\n    addresses: [10.64.0.1:53]\n",
+        )
+        .unwrap();
+        assert!(tunnel_service_routes(&explicit, &[]).contains(&"10.64.0.1".parse().unwrap()));
+        let profile: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(
+            tunnel_service_routes(&profile, &["10.7.0.1".parse().unwrap()])
+                .contains(&"10.7.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn profile_dns_is_required_only_when_selected() {
+        let profile = crate::wireguard::WireGuardProfile::parse(
+            b"[Interface]\nPrivateKey=x\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=y\nAllowedIPs=0.0.0.0/0\n",
+        )
+        .unwrap();
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(validate_profile_capabilities(&config, &profile).is_err());
+        let disabled: Config = serde_yaml::from_str("dns:\n  enabled: false\n").unwrap();
+        assert!(validate_profile_capabilities(&disabled, &profile).is_ok());
+        let explicit: Config = serde_yaml::from_str(
+            "dns:\n  upstream:\n    source: explicit\n    addresses: [10.0.0.1:53]\n",
+        )
+        .unwrap();
+        assert!(validate_profile_capabilities(&explicit, &profile).is_ok());
     }
 
     #[tokio::test]

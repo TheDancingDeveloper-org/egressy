@@ -1,6 +1,6 @@
 {
   "openapi": "3.1.0",
-  "info": { "title": "Egressy API", "version": "2.0.0" },
+  "info": { "title": "Egressy API", "version": "2.1.0" },
   "paths": {
     "/api/v2/status": {
       "get": {
@@ -27,6 +27,51 @@
         "responses": {
           "200": { "description": "Server-sent transition events" }
         }
+      }
+    },
+    "/api/v2/wireguard/profiles": {
+      "get": { "responses": { "200": { "description": "Profile lifecycle and redacted metadata", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProfileManagementStatus" } } } } } },
+      "post": {
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProfileWrite" } } } },
+        "responses": { "201": { "description": "Encrypted staged revision" }, "401": { "description": "Administrator token required" }, "403": { "description": "Mutation disabled or origin rejected" }, "422": { "description": "Candidate invalid" } }
+      }
+    },
+    "/api/v2/wireguard/profiles/validate": {
+      "post": {
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProfileWrite" } } } },
+        "responses": { "200": { "description": "Redacted candidate metadata", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RedactedProfile" } } } }, "401": { "description": "Administrator token required" }, "422": { "description": "Line-specific safe validation errors" } }
+      }
+    },
+    "/api/v2/wireguard/profiles/edit": {
+      "post": {
+        "security": [{ "bearerAuth": [] }],
+        "description": "Stage a structured edit; omitted secret fields preserve the active stored value",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "properties": { "private_key": { "type": ["string", "null"], "writeOnly": true }, "addresses": { "type": "array", "items": { "type": "string" } }, "dns": { "type": "array", "items": { "type": "string" } }, "listen_port": { "type": ["integer", "null"] }, "mtu": { "type": ["integer", "null"] }, "peers": { "type": "array", "maxItems": 32, "items": { "type": "object" } } }, "required": ["addresses", "dns", "listen_port", "mtu", "peers"] } } } },
+        "responses": { "201": { "description": "Encrypted staged revision with redacted metadata" }, "401": { "description": "Administrator token required" }, "400": { "description": "Invalid structured edit" } }
+      }
+    },
+    "/api/v2/wireguard/source": {
+      "post": {
+        "security": [{ "bearerAuth": [] }],
+        "description": "Transactionally activate the explicitly selected mounted or GUI-managed source",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["source"], "properties": { "source": { "enum": ["mounted", "gui_managed"] } } } } } },
+        "responses": { "200": { "description": "Safe apply and rollback result" }, "401": { "description": "Administrator token required" }, "502": { "description": "Source activation failed and was rolled back or left fail closed" } }
+      }
+    },
+    "/api/v2/wireguard/profiles/{revision}/apply": {
+      "post": {
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "revision", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{24}$" } }],
+        "responses": { "200": { "description": "Safe apply and rollback result" }, "401": { "description": "Administrator token required" }, "502": { "description": "Apply failed; previous profile restored or traffic blocked" } }
+      }
+    },
+    "/api/v2/wireguard/profiles/{revision}": {
+      "delete": {
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "revision", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{24}$" } }],
+        "responses": { "204": { "description": "Inactive revision deleted" }, "400": { "description": "Active or missing revision" }, "401": { "description": "Administrator token required" } }
       }
     },
     "/api/v2/settings/notifications": {
@@ -124,7 +169,28 @@
     }
   },
   "components": {
+    "securitySchemes": { "bearerAuth": { "type": "http", "scheme": "bearer" } },
     "schemas": {
+      "ProfileWrite": {
+        "type": "object", "additionalProperties": false, "required": ["profile"],
+        "properties": { "profile": { "type": "string", "maxLength": 262144, "writeOnly": true, "description": "Complete WireGuard profile; never returned" } }
+      },
+      "RedactedProfile": {
+        "type": "object", "description": "Bounded parsed metadata; contains no private or preshared key values",
+        "required": ["interface", "peers", "peer_count", "ipv4_full_tunnel", "full_tunnel_peer", "warnings", "apply_kind"],
+        "properties": {
+          "interface": { "type": "object", "properties": { "private_key_configured": { "type": "boolean" }, "addresses": { "type": "array", "items": { "type": "string" } }, "dns": { "type": "array", "items": { "type": "string" } }, "listen_port": { "type": ["integer", "null"] }, "mtu": { "type": ["integer", "null"] } } },
+          "peers": { "type": "array", "maxItems": 32, "items": { "type": "object" } },
+          "peer_count": { "type": "integer", "maximum": 32 }, "ipv4_full_tunnel": { "type": "boolean" }, "full_tunnel_peer": { "type": ["integer", "null"] },
+          "warnings": { "type": "array", "items": { "type": "object" } },
+          "apply_kind": { "enum": ["no_change", "dns_reload", "sync_conf", "sync_conf_and_routes", "tunnel_recycle"] }
+        }
+      },
+      "ProfileManagementStatus": {
+        "type": "object",
+        "required": ["lifecycle", "source", "source_mutable", "active_revision", "active", "revisions", "last_apply", "management_available", "mutation_authorized", "ipv4_only"],
+        "properties": { "lifecycle": { "enum": ["unconfigured", "validating", "applying", "active", "degraded", "apply_failed", "recovering"] }, "source": { "enum": ["mounted", "gui_managed"] }, "source_mutable": { "type": "boolean" }, "active_revision": { "type": ["string", "null"] }, "active": { "oneOf": [{ "$ref": "#/components/schemas/RedactedProfile" }, { "type": "null" }] }, "revisions": { "type": "array", "maxItems": 100, "items": { "type": "object" } }, "last_apply": { "type": ["object", "null"] }, "management_available": { "type": "boolean" }, "mutation_authorized": { "type": "boolean" }, "ipv4_only": { "type": "boolean" } }
+      },
       "NotificationSettingsView": {
         "type": "object",
         "required": ["enabled", "provider", "destination", "webhook_configured", "telegram_chat_id_configured", "hmac_secret_configured", "timeout_seconds", "rtt_threshold_ms", "alert_stack_started", "alert_vpn_disconnected", "alert_vpn_reconnected", "alert_rtt_above_threshold", "alert_diagnostic_failed", "updated_at_unix_ms"],
@@ -166,7 +232,7 @@
       },
       "CanonicalSnapshot": {
         "type": "object",
-        "required": ["schema_version", "sequence", "generated_at_unix_ms", "protection", "availability", "checks", "transitions", "port_forward", "recovery", "external_probe", "vpn_server", "isolation_policy", "topology", "clients", "traffic"],
+        "required": ["schema_version", "sequence", "generated_at_unix_ms", "protection", "availability", "checks", "transitions", "port_forward", "recovery", "external_probe", "vpn_server", "isolation_policy", "topology", "clients", "traffic", "profile_management"],
         "properties": {
           "schema_version": { "type": "integer", "const": 2 },
           "sequence": { "type": "integer" },
@@ -182,7 +248,8 @@
           "isolation_policy": { "$ref": "#/components/schemas/IsolationPolicy" },
           "topology": { "type": "object" }
           ,"clients": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/ClientState" } }
-          ,"traffic": { "type": "object" }
+          ,"traffic": { "type": "object" },
+          "profile_management": { "$ref": "#/components/schemas/ProfileManagementStatus" }
         }
       },
       "ExternalProbeResult": {

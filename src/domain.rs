@@ -239,6 +239,7 @@ pub struct CanonicalSnapshot {
     pub clients: BTreeMap<String, ClientState>,
     pub traffic: TrafficState,
     pub last_client_path_success_at_unix_ms: Option<u64>,
+    pub profile_management: crate::profile_manager::ProfileManagementStatus,
 }
 
 impl CanonicalSnapshot {
