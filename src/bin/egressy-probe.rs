@@ -219,9 +219,11 @@ async fn run_checks(
             )
             .await;
         } else {
-            let mut snapshot = result.write().await;
-            snapshot.https_egress_ok = true;
-            snapshot.vpn_identity_ok = true;
+            {
+                let mut snapshot = result.write().await;
+                snapshot.https_egress_ok = true;
+                snapshot.vpn_identity_ok = true;
+            }
             futures_util::future::pending::<()>().await;
         }
     };

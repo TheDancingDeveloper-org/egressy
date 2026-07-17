@@ -22,6 +22,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: python3 -m unittest external-probe/test_external_probe_service.py
+      - run: cargo build --locked --release --bins
+      - run: tests/probe-network.sh
 
   dashboard:
     runs-on: ubuntu-latest
@@ -40,3 +42,7 @@ jobs:
         run: npm run build
       - working-directory: ui
         run: git diff --exit-code -- src/generated.ts dist/index.html
+      - working-directory: ui
+        run: npx playwright install --with-deps chromium
+      - working-directory: ui
+        run: npm run test:e2e

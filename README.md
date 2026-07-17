@@ -69,7 +69,7 @@ tunnels, and hostile multi-tenant isolation are not currently supported.
 ### 1. Clone and configure
 
 ```sh
-git clone https://github.com/YOUR-ACCOUNT/egressy.git
+git clone https://github.com/AusAgentSmith-org/egressy.git
 cd egressy
 cp config/config.example.yaml config/config.yaml
 ```
@@ -93,7 +93,7 @@ networks before running it.
 Build the image, validate configuration, and inspect the generated host script:
 
 ```sh
-docker build -t egressy:local .
+docker build -t egressy:local -t ghcr.io/ausagentsmith-org/egressy:0.1.0 .
 docker run --rm \
   -v "$PWD/config/config.yaml:/etc/egressy/config.yaml:ro" \
   egressy:local check

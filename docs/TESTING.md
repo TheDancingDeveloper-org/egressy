@@ -12,6 +12,8 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 python3 -m unittest external-probe/test_external_probe_service.py
+cargo build --locked --release --bins
+tests/probe-network.sh
 ```
 
 Dashboard checks:
@@ -38,6 +40,13 @@ docker compose config
 docker build --pull -t egressy:test .
 docker build -t egressy-external-probe:test external-probe
 ```
+
+The release probe smoke test starts `target/release/egressy-probe` on loopback,
+checks its liveness and authenticated status endpoint, and validates the JSON
+contract. It uses an unreachable loopback DNS address intentionally and does
+not mutate host routes, firewall state, or Docker networks. Set
+`EGRESSY_PROBE_URL` (and optionally `EGRESSY_PROBE_TOKEN`) to add an opt-in
+check against a disposable live deployment.
 
 For multi-platform validation with Buildx:
 
