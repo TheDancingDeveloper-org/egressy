@@ -2,6 +2,11 @@ import { useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 
 export interface TrafficSample { at_unix_ms: number; download: number; upload: number }
 
+export interface ClientTrafficView {
+  name: string
+  history: { sampled_at_unix_ms: number; downloaded_bytes: number; uploaded_bytes: number }[]
+}
+
 const W = 1000, H = 148, PAD_TOP = 8, PAD_BOTTOM = 18
 const DOWN = '#3987e5', UP = '#199e70'
 
@@ -58,5 +63,28 @@ export function ThroughputChart({ samples }: { samples: TrafficSample[] }) {
         <b style={{ color: DOWN }}>↓ {formatRate(hovered.download)}</b><br />
         <b style={{ color: UP }}>↑ {formatRate(hovered.upload)}</b>
       </div>}
+  </div>
+}
+
+const clientRateSamples = (client: ClientTrafficView): TrafficSample[] => client.history.slice(-120).map((sample, index, samples) => {
+  const previous = samples[index - 1]
+  if (!previous) return { at_unix_ms: sample.sampled_at_unix_ms, download: 0, upload: 0 }
+  const seconds = Math.max(0.001, (sample.sampled_at_unix_ms - previous.sampled_at_unix_ms) / 1000)
+  return {
+    at_unix_ms: sample.sampled_at_unix_ms,
+    download: Math.max(0, sample.downloaded_bytes - previous.downloaded_bytes) / seconds,
+    upload: Math.max(0, sample.uploaded_bytes - previous.uploaded_bytes) / seconds,
+  }
+})
+
+export function ClientThroughputChart({ clients }: { clients: ClientTrafficView[] }) {
+  const visible = clients.map(client => ({ ...client, samples: clientRateSamples(client) }))
+    .filter(client => client.samples.length >= 2)
+  if (visible.length === 0) return <div className="chart-empty">Collecting per-container throughput samples…</div>
+  return <div className="client-throughput-grid">
+    {visible.map(client => <div className="client-throughput" key={client.name}>
+      <div className="chart-head"><h4>{client.name}</h4></div>
+      <ThroughputChart samples={client.samples} />
+    </div>)}
   </div>
 }

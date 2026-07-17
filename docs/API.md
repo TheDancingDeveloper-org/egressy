@@ -142,6 +142,10 @@ cardinality to twice the inventory size. Container-controlled label values are
 escaped. Process-wide DNS counters report client UDP queries, upstream UDP
 attempts and timeouts, exhausted UDP queries, TCP fallbacks, and successful TCP
 fallback recovery without workload-controlled labels.
+The overview dashboard derives short-window per-container throughput from the
+bounded live client samples. The History workload view uses the same persisted
+SQLite usage buckets to render long-lived aggregate download/upload bandwidth;
+the existing retention and bucket settings apply.
 
 ## Liveness and readiness
 

@@ -94,6 +94,8 @@ interval so every renewal can receive correlated evidence.
 `retention_days` bounds age, `bucket_seconds` controls aggregation resolution,
 and `writer_capacity` bounds the asynchronous queue. Database failure degrades
 history only; it does not relax routing protection.
+Per-workload bandwidth history is stored in the same SQLite buckets and follows
+the configured retention and bucket lifecycle.
 
 ### `otel`
 

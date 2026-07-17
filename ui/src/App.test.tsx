@@ -28,7 +28,7 @@ test('shows Docker route-intent mismatch without changing compliance', async () 
   }) }))
   window.location.hash = '#clients'
   render(<App />)
-  expect(await screen.findByText('dual-network')).toBeInTheDocument()
+  expect((await screen.findAllByText('dual-network')).length).toBeGreaterThan(0)
   expect(screen.getByText('mismatch')).toBeInTheDocument()
   expect(screen.getByText('non-compliant')).toBeInTheDocument()
   expect(screen.getByText('↓ 2.0 KiB')).toBeInTheDocument()

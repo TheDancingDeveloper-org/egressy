@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactElement, type MouseEvent as ReactMouseEvent } from 'react'
 import { EventHistory, fetchEventHistory, fetchSnapshot, fetchUsageHistory, fetchVpnServerHistory, Snapshot, UsageHistory, VpnServerHistory } from './api'
-import { ThroughputChart, TrafficSample, formatRate } from './ThroughputChart'
+import { ClientThroughputChart, ThroughputChart, TrafficSample, formatRate } from './ThroughputChart'
 import { NotificationsPanel } from './NotificationsPanel'
 import { ProfilesPanel } from './ProfilesPanel'
 
@@ -251,6 +251,20 @@ export function App() {
             <ThroughputChart samples={samples} />
           </div>
 
+          <div className="card chart-card" style={{ marginTop: 12 }}>
+            <div className="chart-head"><h3 style={{ margin: 0 }}>Throughput · connected containers</h3>
+              <span className="sub">Per-container rates derived from enrolled nftables samples</span></div>
+            <ClientThroughputChart clients={clients.map(client => ({ name: client.name, history: client.traffic.history }))} />
+          </div>
+
+          <div className="card" style={{ marginTop: 12 }}><h3>Connected clients</h3>
+            {clients.length === 0 ? <div className="empty">No connected clients observed</div> :
+              <div className="client-list">{clients.map(client => <div className="client-list-item" key={client.container_id}>
+                <span className={`dot ${client.running ? 'ok' : 'mut'}`} />
+                <b>{client.name}</b><span className="reason mono">{client.ipv4_address}</span>
+              </div>)}</div>}
+          </div>
+
           <div className="card" style={{ marginTop: 12 }}><h3>Data path</h3>{pipeline(false)}</div>
           <div className="card" style={{ marginTop: 12 }}><h3>Recent transitions</h3>{feed(transitions.slice(0, 4))}</div>
         </section>
@@ -381,6 +395,18 @@ export function App() {
               </table>
             </div>
             {usageHistory.truncated && <div className="notice warn"><WarnGlyph />The result reached its bounded row limit; select a shorter range.</div>}
+            <div className="card chart-card" style={{ marginTop: 12 }}>
+              <div className="chart-head"><h3 style={{ margin: 0 }}>Workload bandwidth</h3>
+                <span className="sub">Persisted SQLite usage buckets · aggregate download/upload rate</span></div>
+              <ThroughputChart samples={[...usageHistory.points.reduce((buckets, point) => {
+                const current = buckets.get(point.bucket_start_unix_ms) ?? { at_unix_ms: point.bucket_start_unix_ms, download: 0, upload: 0 }
+                const seconds = Math.max(1, usageHistory.bucket_seconds)
+                current.download += point.download_bytes / seconds
+                current.upload += point.upload_bytes / seconds
+                buckets.set(point.bucket_start_unix_ms, current)
+                return buckets
+              }, new Map<number, TrafficSample>()).values()].sort((left, right) => left.at_unix_ms - right.at_unix_ms)} />
+            </div>
           </>}
           {vpnServerHistory && <div className="card" style={{ marginTop: 12 }}><h3>VPN endpoint latency</h3>
             <div className="tbl"><table><thead><tr><th>Bucket</th><th>Runtime endpoint</th><th>Active</th><th>Measured</th><th>RTT min / avg / max</th></tr></thead><tbody>
