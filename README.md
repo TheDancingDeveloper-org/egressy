@@ -265,6 +265,13 @@ bridge isolation, or running an internet-facing validator.
 - [Security](docs/SECURITY.md)
 - [Testing and contributing](docs/TESTING.md)
 
+Documentation-only commits do not run compile/test builds, publish a new
+container image, or redeploy the dashboard. CI, image, and Pages workflows use
+path filters, so a commit that changes only this README, `AGENTS.md`, `docs/**`,
+or contributor/security Markdown leaves the existing release image and
+deployment untouched. If a commit includes functional source, configuration,
+Dockerfile, or UI changes, the normal validation and publication path runs.
+
 ## Project status
 
 Egressy is an early release intended for operators comfortable reviewing Linux

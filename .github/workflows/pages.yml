@@ -3,6 +3,12 @@ name: Dashboard demo
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "AGENTS.md"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
   workflow_dispatch:
 
 permissions:

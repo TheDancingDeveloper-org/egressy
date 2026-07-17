@@ -71,6 +71,14 @@ filesystem or firewall identifiers.
 
 ## Required validation
 
+Documentation-only changes (for example `README.md`, `AGENTS.md`, `docs/**`,
+or other Markdown) must not run compile/test builds, publish container images,
+or trigger a deployment. Use the path filters in `.woodpecker.yml` and
+`.github/workflows/` to skip those jobs when no functional source,
+configuration, Dockerfile, or UI asset changed.
+If a commit mixes documentation with functional changes, the functional paths
+must win and the normal build/publish path must run.
+
 Before a Rust commit:
 
 ```sh

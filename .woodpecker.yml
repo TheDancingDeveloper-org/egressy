@@ -14,6 +14,14 @@ steps:
       - npm run build
       - npm run test:e2e
       - git diff --exit-code -- src/generated.ts dist/index.html
+    when:
+      - path:
+          exclude:
+            - "*.md"
+            - "docs/**"
+            - "AGENTS.md"
+            - "CONTRIBUTING.md"
+            - "SECURITY.md"
 
   - name: test
     image: rust:1.97
@@ -23,6 +31,14 @@ steps:
       - cargo fmt --check
       - cargo clippy --all-targets -- -D warnings
       - cargo test --all-targets
+    when:
+      - path:
+          exclude:
+            - "*.md"
+            - "docs/**"
+            - "AGENTS.md"
+            - "CONTRIBUTING.md"
+            - "SECURITY.md"
 
   - name: publish-gateway
     image: woodpeckerci/plugin-docker-buildx
@@ -40,6 +56,13 @@ steps:
     when:
       - event: push
         branch: main
+        path:
+          exclude:
+            - "*.md"
+            - "docs/**"
+            - "AGENTS.md"
+            - "CONTRIBUTING.md"
+            - "SECURITY.md"
 
   - name: publish-external-probe
     image: woodpeckerci/plugin-docker-buildx
@@ -59,3 +82,10 @@ steps:
     when:
       - event: push
         branch: main
+        path:
+          exclude:
+            - "*.md"
+            - "docs/**"
+            - "AGENTS.md"
+            - "CONTRIBUTING.md"
+            - "SECURITY.md"
