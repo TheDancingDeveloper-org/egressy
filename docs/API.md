@@ -139,7 +139,9 @@ single-file dashboard differs from a clean build.
 `egressy_client_traffic_packets_total`, labelled only by current container ID
 and direction. Only currently enrolled clients produce series, bounding live
 cardinality to twice the inventory size. Container-controlled label values are
-escaped.
+escaped. Process-wide DNS counters report client UDP queries, upstream UDP
+attempts and timeouts, exhausted UDP queries, TCP fallbacks, and successful TCP
+fallback recovery without workload-controlled labels.
 
 ## Liveness and readiness
 

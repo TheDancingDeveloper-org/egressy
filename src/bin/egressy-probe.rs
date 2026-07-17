@@ -768,10 +768,10 @@ fn load_external_probe_config() -> anyhow::Result<Option<ExternalProbeConfig>> {
         bail!("EGRESSY_EXTERNAL_PROBE_URL must not use a Tailscale hostname");
     }
 
-    let interval_seconds = env("EGRESSY_EXTERNAL_PROBE_INTERVAL_SECONDS", "300")
+    let interval_seconds = env("EGRESSY_EXTERNAL_PROBE_INTERVAL_SECONDS", "10")
         .parse::<u64>()
         .context("invalid EGRESSY_EXTERNAL_PROBE_INTERVAL_SECONDS")?;
-    let timeout_seconds = env("EGRESSY_EXTERNAL_PROBE_TIMEOUT_SECONDS", "10")
+    let timeout_seconds = env("EGRESSY_EXTERNAL_PROBE_TIMEOUT_SECONDS", "5")
         .parse::<u64>()
         .context("invalid EGRESSY_EXTERNAL_PROBE_TIMEOUT_SECONDS")?;
     if interval_seconds == 0 {

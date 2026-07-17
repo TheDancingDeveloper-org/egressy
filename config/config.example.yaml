@@ -34,11 +34,14 @@ dns:
     addresses: []
   timeout_ms: 2000
   max_concurrent_queries: 128
+  udp_attempts: 2
+  failure_threshold: 3
+  success_threshold: 2
 
 probe:
   enabled: true
   url: http://172.30.0.5:8081/status
-  interval_seconds: 30
+  interval_seconds: 10
   # Optional shared-token file. If configured, mount the same protected value
   # into the probe and expose it there as EGRESSY_PROBE_TOKEN.
   token_path: null
@@ -56,8 +59,8 @@ external_probe:
   enabled: false
   instance_id: example-gateway
   url: https://probe.example.com/api/v1/check
-  interval_seconds: 300
-  timeout_seconds: 10
+  interval_seconds: 10
+  timeout_seconds: 5
   token_path: null
 
 persistence:

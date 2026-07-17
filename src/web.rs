@@ -480,6 +480,7 @@ async fn metrics(State(state): State<WebState>) -> Response {
             ));
         }
     }
+    output.push_str(&crate::dns::prometheus_metrics());
     (
         [(
             header::CONTENT_TYPE,
@@ -952,6 +953,8 @@ mod tests {
                 .count(),
             2
         );
+        assert!(body.contains("egressy_dns_upstream_udp_timeouts_total"));
+        assert!(body.contains("egressy_dns_upstream_tcp_fallback_successes_total"));
     }
 
     fn route_intent_client() -> crate::state::ClientState {

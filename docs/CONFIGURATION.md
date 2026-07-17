@@ -59,9 +59,12 @@ the configured NAT-PMP lease.
 `enabled`, `listen`, and `upstream.source` control the bounded UDP/TCP forwarder.
 Use `profile` to derive IPv4 DNS from the profile or `explicit` with
 `upstream.addresses` for reviewed overrides.
-`timeout_ms` limits an upstream attempt and `max_concurrent_queries` bounds
-load. Enrolled clients should use only the gateway listener; firewall policy
-rejects other plain DNS destinations.
+`timeout_ms` limits each upstream attempt and `max_concurrent_queries` bounds
+load. `udp_attempts` retries transient UDP loss before falling back to TCP to
+the same in-tunnel resolver. `failure_threshold` and `success_threshold`
+provide global check hysteresis while individual failures remain logged.
+Enrolled clients should use only the gateway listener; firewall policy rejects
+other plain DNS destinations.
 
 ### `probe` and `validation.identity`
 
@@ -80,6 +83,10 @@ This daemon section gates ingestion and staleness reporting. It is disabled by
 default. The companion performs outbound validation using its
 `EGRESSY_EXTERNAL_PROBE_*` environment variables. Keep the settings aligned.
 The endpoint must use HTTPS, a DNS hostname, and a public non-tailnet address.
+The default external interval is 10 seconds with a 5-second timeout, while the
+daemon polls the companion every 10 seconds. With NAT-PMP enabled, their
+combined worst-case propagation time must remain shorter than the lease refresh
+interval so every renewal can receive correlated evidence.
 
 ### `persistence`
 

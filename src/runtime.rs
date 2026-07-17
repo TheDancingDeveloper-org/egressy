@@ -356,6 +356,9 @@ pub async fn run(
             upstream: dns_upstream_rx,
             timeout: Duration::from_millis(config.dns.timeout_ms),
             max_concurrent_queries: config.dns.max_concurrent_queries,
+            udp_attempts: config.dns.udp_attempts,
+            failure_threshold: config.dns.failure_threshold,
+            success_threshold: config.dns.success_threshold,
             publisher: Some(publisher.clone()),
         })))
     } else {

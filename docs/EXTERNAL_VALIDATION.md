@@ -80,6 +80,10 @@ companion performs the request and uses `EGRESSY_EXTERNAL_PROBE_*` variables:
 
 Use identical instance, timeout, and token settings across components. Keep the
 token in protected mounted files, not tracked YAML or Compose.
+The default external request interval is 10 seconds with a 5-second timeout.
+The daemon polls the companion every 10 seconds. When NAT-PMP is enabled, their
+combined worst-case propagation time must remain shorter than the lease refresh
+interval so every renewal has an opportunity to receive correlated evidence.
 
 ## Limitations
 

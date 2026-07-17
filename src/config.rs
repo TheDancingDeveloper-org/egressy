@@ -73,6 +73,18 @@ fn default_dns_concurrency() -> usize {
     128
 }
 
+fn default_dns_udp_attempts() -> u32 {
+    2
+}
+
+fn default_dns_failure_threshold() -> u32 {
+    3
+}
+
+fn default_dns_success_threshold() -> u32 {
+    2
+}
+
 fn default_probe_url() -> String {
     "http://172.30.0.5:8081/status".to_owned()
 }
@@ -86,11 +98,11 @@ fn default_external_probe_instance_id() -> String {
 }
 
 fn default_external_probe_interval_seconds() -> u64 {
-    300
+    10
 }
 
 fn default_external_probe_timeout_seconds() -> u64 {
-    10
+    5
 }
 
 fn default_history_path() -> String {
@@ -254,6 +266,9 @@ pub struct DnsConfig {
     pub upstream: DnsUpstreamConfig,
     pub timeout_ms: u64,
     pub max_concurrent_queries: usize,
+    pub udp_attempts: u32,
+    pub failure_threshold: u32,
+    pub success_threshold: u32,
 }
 
 impl Default for DnsConfig {
@@ -264,6 +279,9 @@ impl Default for DnsConfig {
             upstream: DnsUpstreamConfig::default(),
             timeout_ms: default_dns_timeout_ms(),
             max_concurrent_queries: default_dns_concurrency(),
+            udp_attempts: default_dns_udp_attempts(),
+            failure_threshold: default_dns_failure_threshold(),
+            success_threshold: default_dns_success_threshold(),
         }
     }
 }
@@ -540,8 +558,13 @@ impl Config {
                 "reconcile.apply_gateway_firewall=false is unsafe: Egressy must own the fail-closed gateway firewall"
             );
         }
-        if self.dns.timeout_ms == 0 || self.dns.max_concurrent_queries == 0 {
-            bail!("dns timeout and concurrency limit must be greater than zero");
+        if self.dns.timeout_ms == 0
+            || self.dns.max_concurrent_queries == 0
+            || self.dns.udp_attempts == 0
+            || self.dns.failure_threshold == 0
+            || self.dns.success_threshold == 0
+        {
+            bail!("dns timeout, concurrency, attempts, and thresholds must be greater than zero");
         }
         if self.recovery.failure_threshold == 0 || self.recovery.success_threshold == 0 {
             bail!("recovery thresholds must be greater than zero");
@@ -579,6 +602,18 @@ impl Config {
             if self.external_probe.timeout_seconds >= self.external_probe.interval_seconds {
                 bail!(
                     "external_probe.timeout_seconds must be shorter than external_probe.interval_seconds"
+                );
+            }
+            if self.port_forwarding.backend == PortForwardingBackend::NatPmp
+                && self
+                    .external_probe
+                    .interval_seconds
+                    .saturating_add(self.external_probe.timeout_seconds)
+                    .saturating_add(self.probe.interval_seconds)
+                    >= self.port_forwarding.refresh_seconds
+            {
+                bail!(
+                    "external probe interval, timeout, and daemon poll interval must total less than port_forwarding.refresh_seconds"
                 );
             }
         }
@@ -804,6 +839,8 @@ mod tests {
         // default without explicit operator sign-off.
         let config: Config = serde_yaml::from_str("{}").unwrap();
         assert!(!config.external_probe.enabled);
+        assert_eq!(config.external_probe.interval_seconds, 10);
+        assert_eq!(config.external_probe.timeout_seconds, 5);
     }
 
     #[test]
@@ -882,6 +919,21 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn external_verification_cycle_must_fit_before_natpmp_renewal() {
+        let valid: Config = serde_yaml::from_str(
+            "port_forwarding:\n  backend: nat_pmp\n  refresh_seconds: 45\nexternal_probe:\n  enabled: true\n  url: https://probe.example.com/api/v1/check\n  interval_seconds: 10\n  timeout_seconds: 5\nprobe:\n  interval_seconds: 10\n",
+        )
+        .unwrap();
+        valid.validate().unwrap();
+
+        let invalid: Config = serde_yaml::from_str(
+            "port_forwarding:\n  backend: nat_pmp\n  refresh_seconds: 45\nexternal_probe:\n  enabled: true\n  url: https://probe.example.com/api/v1/check\n  interval_seconds: 20\n  timeout_seconds: 10\nprobe:\n  interval_seconds: 15\n",
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
