@@ -130,6 +130,7 @@ export function App() {
   const transitions = [...snapshot.transitions].reverse()
   const probe = snapshot.external_probe
   const forward = snapshot.port_forward
+  const forwards = Object.entries(snapshot.port_forwards ?? {})
   const vpnServer = snapshot.vpn_server
   const usageByClient = [...(usageHistory?.points ?? []).reduce((totals, point) => {
     const existing = totals.get(point.usage_id) ?? { usage_id: point.usage_id, source: point.usage_id_source, name: point.name, down: 0, up: 0, samples: 0 }
@@ -249,6 +250,20 @@ export function App() {
                   <p className="sub">{snapshot.recovery.next_attempt_at_unix_ms ? `Next attempt ${ago(now, snapshot.recovery.next_attempt_at_unix_ms).replace(' ago', '')}` : 'Recovery cycle in progress.'}</p></>
                 : <><div className="big dim">inactive</div><p className="sub">No recovery cycle running.</p></>}
             </div>
+          </div>
+          <div className="tbl" style={{ marginTop: 12 }}>
+            <table>
+              <thead><tr><th>Usage ID</th><th>Phase</th><th>Target</th><th>Internal</th><th>External</th><th>DNAT</th></tr></thead>
+              <tbody>
+                {forwards.length === 0 && <tr><td colSpan={6} className="empty">No forwarding leases observed</td></tr>}
+                {forwards.map(([usageId, lease]) => <tr key={usageId}>
+                  <td className="mono">{usageId}</td><td><StatusPill status={lease.phase} /></td>
+                  <td>{lease.requested_target ?? 'none'}</td><td className="mono">{lease.internal_port ?? '—'}</td>
+                  <td className="mono">{lease.external_port ?? '—'}</td>
+                  <td><span className={`pill ${lease.dnat_installed ? 'ok' : 'mut'}`}>{lease.dnat_installed ? 'installed' : 'not installed'}</span></td>
+                </tr>)}
+              </tbody>
+            </table>
           </div>
 
           <div className="card chart-card">

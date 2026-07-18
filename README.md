@@ -42,8 +42,8 @@ paths and failure behavior.
 - Router-owned WireGuard policy routes that preserve management traffic.
 - Restricted, read-only Docker discovery and label-aware enrollment.
 - UDP/TCP DNS forwarding to the tunnel resolver with leak rejection.
-- Optional NAT-PMP with matching TCP/UDP allocation and dynamic DNAT to
-  one compliant target.
+- Optional NAT-PMP with matching TCP/UDP allocations and dynamic per-client
+  DNAT for up to five compliant targets.
 - Bounded tunnel recovery with backoff and firewall preservation.
 - Enrolled-path DNS, HTTPS, and provider-identity validation companion.
 - Optional advisory internet-path validator for development and release tests.
@@ -203,18 +203,20 @@ default route and public exit are correct before enrolling real workloads.
 
 ## Port forwarding
 
-A configured tunnel supplies at most one forwarded port. Exactly one enrolled client may
-request it:
+A configured tunnel may supply multiple forwarded ports. Each enrolled client
+requests its own lease with a stable, unique usage ID and target port:
 
 ```yaml
 labels:
   egressy.enabled: "true"
+  egressy.usage-id: "personal-arr/qbittorrent"
   egressy.port-forward: "true"
   egressy.target-port: "6881"
 ```
 
 The `egressy` daemon requests matching TCP and UDP mappings, refreshes them
-before expiry, and installs DNAT only while one unique compliant target exists.
+before expiry, and reconciles each DNAT independently. Duplicate target ports
+or usage IDs are rejected without disturbing unrelated healthy leases.
 A reported mapping is not proof of internet reachability; use the optional
 external validator for that advisory check.
 

@@ -52,7 +52,9 @@ PostUp/PostDown commands that compete with Egressy firewall ownership.
 optional backend. `gateway` is the provider service address,
 `refresh_seconds` is the renewal interval, and `lifetime_seconds` is the
 requested lease. Refresh must be shorter than lifetime. Defaults are tuned for
-the configured NAT-PMP lease.
+the configured NAT-PMP lease. `max_leases` bounds concurrent leases from 1 to
+5. `primary_usage_id` projects one designated lease into the backward-compatible
+singular API field; when unset, a sole lease is selected automatically.
 
 ### `dns`
 
@@ -125,8 +127,8 @@ is rejected because managed routing without a fail-closed owner is unsafe.
 |---|---|
 | `egressy.enabled=true` | Requests enrollment and monitoring. |
 | `egressy.usage-id` | Stable history identity across container recreation. |
-| `egressy.port-forward=true` | Selects the sole forwarding target. |
-| `egressy.target-port` | TCP/UDP destination port inside that client. |
+| `egressy.port-forward=true` | Requests an independent forwarding lease. |
+| `egressy.target-port` | Unique NAT-PMP lease key and TCP/UDP destination port inside that client. |
 | `egressy.isolation-id` | Stable shared-bridge policy identity. |
 | `egressy.isolation-allow` | Comma-separated destination and port allowances. |
 

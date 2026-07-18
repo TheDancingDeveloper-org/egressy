@@ -14,7 +14,7 @@ export interface ClientTraffic { download_packets: number; downloaded_bytes: num
 export type UsageIdentitySource = 'explicit_label' | 'compose_service' | 'container_lifetime'
 export interface UsageHistoryPoint { bucket_start_unix_ms: number; usage_id: string; usage_id_source: UsageIdentitySource; name: string; download_bytes: number; upload_bytes: number; download_packets: number; upload_packets: number; sample_count: number }
 export interface UsageHistory { from_unix_ms: number; to_unix_ms: number; bucket_seconds: number; points: UsageHistoryPoint[]; truncated: boolean }
-export interface HistoricalEvent { id: number; timestamp_unix_ms: number; kind: 'transition' | 'port_forward'; component: string; from_status: string | null; to_status: string | null; reason_code: string; safe_message: string; external_port: number | null; port_forward_phase: string | null }
+export interface HistoricalEvent { id: number; timestamp_unix_ms: number; kind: 'transition' | 'port_forward'; component: string; from_status: string | null; to_status: string | null; reason_code: string; safe_message: string; external_port: number | null; port_forward_phase: string | null; usage_id: string | null }
 export interface EventHistory { events: HistoricalEvent[]; next_before_id: number | null }
 export interface VpnServerLatency { status: 'measured' | 'timeout' | 'unsupported' | 'resolution_failed' | 'unavailable'; sampled_at_unix_ms: number | null; latest_rtt_ms: number | null; recent_min_rtt_ms: number | null; recent_average_rtt_ms: number | null; recent_max_rtt_ms: number | null; loss_ratio: number | null; sample_count: number }
 export interface VpnServer { configured_endpoint_host: string | null; configured_endpoint_port: number | null; configured_address_family: string | null; allowed_ips_posture: string; runtime_endpoint_address: string | null; runtime_endpoint_port: number | null; provider_inferred: string | null; region_inferred: string | null; inference_source: string | null; inference_confidence: string | null; active: boolean; latest_handshake_unix: number | null; handshake_age_seconds: number | null; observed_at_unix_ms: number | null; latency: VpnServerLatency }
@@ -55,7 +55,8 @@ export interface ProfileManagement {
 export interface Snapshot {
   schema_version: 2; sequence: number; generated_at_unix_ms: number; protection: Protection
   availability: Availability; checks: Record<string, Check>; transitions: Transition[]
-  port_forward: { phase: string; requested_target: string | null; external_port: number | null; dnat_installed: boolean; lease_acquired_at_unix_ms: number | null; lease_expires_at_unix_ms: number | null; externally_verified: boolean | null }
+  port_forward: { phase: string; requested_target: string | null; internal_port: number | null; external_port: number | null; dnat_installed: boolean; lease_acquired_at_unix_ms: number | null; lease_expires_at_unix_ms: number | null; externally_verified: boolean | null }
+  port_forwards: Record<string, Snapshot['port_forward']>
   recovery: { active: boolean; attempt: number; reason_code?: string; next_attempt_at_unix_ms?: number }
   external_probe: {
     status: 'unknown' | 'healthy' | 'degraded' | 'unavailable'

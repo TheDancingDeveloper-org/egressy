@@ -262,6 +262,7 @@ pub async fn run(
         &config.docker_socket,
         config.network.name.clone(),
         config.network.subnet,
+        config.port_forwarding.max_leases,
     )?;
 
     let listen: SocketAddr = config.listen.parse()?;
@@ -696,14 +697,8 @@ async fn reconcile_docker(
             Ok(clients) => {
                 let target_count = clients
                     .values()
-                    .filter(|client| client.port_forward_target)
+                    .filter(|client| client.port_forward_target && client.compliant)
                     .count();
-                if target_count > 1 {
-                    state.write().await.last_error = Some(
-                        "more than one container requests Proton's single forwarded port"
-                            .to_owned(),
-                    );
-                }
                 let existing_traffic = state
                     .read()
                     .await
@@ -729,14 +724,6 @@ async fn reconcile_docker(
                 enforcement
                     .reconcile_clients(&clients, port_inputs_changed)
                     .await?;
-                if port_inputs_changed {
-                    invalidate_published_forward(
-                        &state,
-                        &publisher,
-                        PortForwardPhase::WaitingForTarget,
-                    )
-                    .await;
-                }
                 state.write().await.clients = clients.clone();
                 if port_inputs_changed {
                     notify_port_change(&port_change_tx);
@@ -754,7 +741,7 @@ async fn reconcile_docker(
                     .any(|client| client.route_intent.status == RouteIntentStatus::Unknown);
                 let client_count = clients.len();
                 publisher
-                    .mutate(|snapshot| snapshot.clients = clients)
+                    .mutate(|snapshot| snapshot.clients = clients.clone())
                     .await;
                 publisher
                     .observe(
@@ -812,25 +799,33 @@ async fn reconcile_docker(
                 publisher
                     .observe(
                         "port_forward.target_selection",
-                        if target_count > 1 || invalid_labels {
+                        if invalid_labels || clients.values().any(|client| {
+                            client.port_forward_target && !client.compliant
+                        }) {
                             CheckStatus::Degraded
                         } else {
                             CheckStatus::Healthy
                         },
                         Impact::Optional,
-                        if target_count > 1 {
-                            "port_forward.target_ambiguous"
-                        } else if invalid_labels {
+                        if invalid_labels {
                             "port_forward.target_port_invalid"
+                        } else if clients.values().any(|client| {
+                            client.port_forward_target && !client.compliant
+                        }) {
+                            "port_forward.target_ineligible"
                         } else {
                             "port_forward.target_valid"
                         },
-                        if target_count > 1 {
-                            "More than one enrolled container requests the single forwarded port"
-                        } else if invalid_labels {
+                        if invalid_labels {
                             "A forwarding target has a missing or invalid target-port label"
+                        } else if clients.values().any(|client| {
+                            client.port_forward_target && !client.compliant
+                        }) {
+                            "One or more forwarding targets are ineligible because of a duplicate target port, duplicate usage ID, lease cap, or routing compliance"
+                        } else if target_count == 0 {
+                            "No forwarding target is currently eligible"
                         } else {
-                            "Forwarding target labels are unambiguous"
+                            "Forwarding target labels are valid and within the configured lease limit"
                         },
                         None,
                         None,
@@ -1117,7 +1112,12 @@ async fn supervise_history(
 async fn record_history(history: SharedHistory, publisher: StatePublisher) {
     let mut events = publisher.subscribe_events();
     let mut snapshots = publisher.subscribe();
-    let mut last_port_sequence = snapshots.borrow().port_forward.change_sequence;
+    let mut last_port_sequences = snapshots
+        .borrow()
+        .port_forwards
+        .iter()
+        .map(|(usage_id, status)| (usage_id.clone(), status.change_sequence))
+        .collect::<BTreeMap<_, _>>();
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -1132,18 +1132,21 @@ async fn record_history(history: SharedHistory, publisher: StatePublisher) {
                     return;
                 }
                 let snapshot = snapshots.borrow().clone();
-                if snapshot.port_forward.change_sequence != 0
-                    && snapshot.port_forward.change_sequence != last_port_sequence
-                {
-                    last_port_sequence = snapshot.port_forward.change_sequence;
-                    if let Some(store) = history.read().await.clone() {
+                if let Some(store) = history.read().await.clone() {
+                    for (usage_id, status) in &snapshot.port_forwards {
+                        if status.change_sequence == 0
+                            || last_port_sequences.get(usage_id) == Some(&status.change_sequence)
+                        {
+                            continue;
+                        }
+                        last_port_sequences.insert(usage_id.clone(), status.change_sequence);
                         store.record_port_forward(PortForwardObservation {
-                            timestamp_unix_ms: snapshot
-                                .port_forward
+                            timestamp_unix_ms: status
                                 .changed_at_unix_ms
                                 .unwrap_or(snapshot.generated_at_unix_ms),
-                            phase: snapshot.port_forward.phase,
-                            external_port: snapshot.port_forward.external_port,
+                            usage_id: usage_id.clone(),
+                            phase: status.phase,
+                            external_port: status.external_port,
                         });
                     }
                 }
@@ -1454,6 +1457,14 @@ fn dnat_install_required(
     active_forward != Some(desired) || !applied
 }
 
+#[derive(Clone, Debug)]
+struct LeaseSlot {
+    target_name: String,
+    target: DnatTarget,
+    assigned_external: Option<u16>,
+    active_forward: Option<(u16, Ipv4Addr, u16)>,
+}
+
 async fn maintain_port_forward(
     config: Config,
     state: SharedState,
@@ -1466,51 +1477,26 @@ async fn maintain_port_forward(
         return Ok(());
     }
     let client = NatPmpClient::new(config.port_forwarding.gateway);
-    let mut assigned_port = 0_u16;
-    let mut active_forward = None;
+    let mut leases = BTreeMap::<String, LeaseSlot>::new();
 
     loop {
         if !state.read().await.tunnel.up {
-            deactivate_forward(
+            deactivate_all_forwards(
+                &config,
                 &state,
                 &publisher,
                 &enforcement,
-                &mut active_forward,
+                &mut leases,
                 PortForwardPhase::Unavailable,
-                "port_forward.tunnel_unavailable",
             )
             .await?;
             wait_for_port_change(&mut port_change_rx, Duration::from_secs(2)).await;
             continue;
         }
 
-        let target = select_port_target(&state).await;
-        let Some((target_name, dnat_target)) = target else {
-            let targets = state
-                .read()
-                .await
-                .clients
-                .values()
-                .filter(|client| client.port_forward_target)
-                .count();
-            let phase = if targets > 1 {
-                PortForwardPhase::TargetAmbiguous
-            } else {
-                PortForwardPhase::WaitingForTarget
-            };
-            deactivate_forward(
-                &state,
-                &publisher,
-                &enforcement,
-                &mut active_forward,
-                phase,
-                if targets > 1 {
-                    "port_forward.target_ambiguous"
-                } else {
-                    "port_forward.target_missing"
-                },
-            )
-            .await?;
+        reconcile_lease_targets(&config, &state, &publisher, &enforcement, &mut leases).await?;
+        if leases.is_empty() {
+            publish_primary_forward(&config, &state, &publisher).await;
             wait_for_port_change(
                 &mut port_change_rx,
                 Duration::from_secs(config.port_forwarding.refresh_seconds),
@@ -1518,114 +1504,144 @@ async fn maintain_port_forward(
             .await;
             continue;
         };
-        let target_ip = dnat_target.address;
-        let target_port = dnat_target.port;
+        let public_ip = match client.external_address().await {
+            Ok(public_ip) => public_ip,
+            Err(error) => {
+                record_port_error(&state, None, error.to_string()).await;
+                deactivate_all_forwards(
+                    &config,
+                    &state,
+                    &publisher,
+                    &enforcement,
+                    &mut leases,
+                    PortForwardPhase::LeaseLost,
+                )
+                .await?;
+                wait_for_port_change(
+                    &mut port_change_rx,
+                    Duration::from_secs(config.port_forwarding.refresh_seconds),
+                )
+                .await;
+                continue;
+            }
+        };
+        let requests = leases
+            .iter()
+            .map(|(usage_id, slot)| {
+                let client = client.clone();
+                let usage_id = usage_id.clone();
+                let internal_port = slot.target.port;
+                let requested_external = slot.assigned_external.unwrap_or(internal_port);
+                let lifetime = config.port_forwarding.lifetime_seconds;
+                async move {
+                    (
+                        usage_id,
+                        natpmp::request_symmetric_mapping(
+                            &client,
+                            internal_port,
+                            requested_external,
+                            lifetime,
+                        )
+                        .await,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
 
-        match client.external_address().await {
-            Ok(public_ip) => match natpmp::request_symmetric_mapping(
-                &client,
-                assigned_port,
-                if assigned_port == 0 { 1 } else { assigned_port },
-                config.port_forwarding.lifetime_seconds,
-            )
-            .await
-            {
+        for (usage_id, result) in futures_util::future::join_all(requests).await {
+            match result {
                 Ok(mapping) => {
-                    let desired_forward = (mapping.external_port, target_ip, target_port);
-                    let port_changed = assigned_port != 0 && assigned_port != mapping.external_port;
-                    let mapping_changed = active_forward != Some(desired_forward);
-                    let mapping_applied = enforcement.dnat_is_applied(desired_forward).await;
-                    let install_required =
-                        dnat_install_required(active_forward, desired_forward, mapping_applied);
+                    let slot = leases
+                        .get_mut(&usage_id)
+                        .expect("lease target still exists");
+                    let desired_forward =
+                        (mapping.external_port, slot.target.address, slot.target.port);
+                    let port_changed = slot
+                        .assigned_external
+                        .is_some_and(|port| port != mapping.external_port);
+                    let mapping_changed = slot.active_forward != Some(desired_forward);
+                    let mapping_applied = enforcement
+                        .dnat_is_applied(&usage_id, desired_forward)
+                        .await;
+                    let install_required = dnat_install_required(
+                        slot.active_forward,
+                        desired_forward,
+                        mapping_applied,
+                    );
                     let now = unix_ms();
                     if install_required {
                         if !enforcement
-                            .set_dnat_for_target(desired_forward, &dnat_target)
+                            .set_dnat_for_target(&usage_id, desired_forward, &slot.target)
                             .await?
                         {
-                            wait_for_port_change(&mut port_change_rx, Duration::from_secs(2)).await;
                             continue;
                         }
-                        active_forward = Some(desired_forward);
+                        slot.active_forward = Some(desired_forward);
                     }
-                    assigned_port = mapping.external_port;
-                    let mut state = state.write().await;
-                    state.port_forward.active = true;
-                    state.port_forward.public_ip = Some(public_ip);
-                    state.port_forward.port = Some(mapping.external_port);
-                    state.port_forward.target = Some(target_name.clone());
-                    state.port_forward.target_port = Some(target_port);
-                    state.port_forward.expires_in_seconds = Some(mapping.lifetime_seconds);
-                    state.port_forward.lease_acquired_at_unix_ms = Some(now);
-                    drop(state);
+                    slot.assigned_external = Some(mapping.external_port);
+                    state.write().await.port_forwards.insert(
+                        usage_id.clone(),
+                        crate::state::PortForwardState {
+                            active: true,
+                            public_ip: Some(public_ip),
+                            port: Some(mapping.external_port),
+                            target: Some(slot.target_name.clone()),
+                            target_port: Some(slot.target.port),
+                            expires_in_seconds: Some(mapping.lifetime_seconds),
+                            lease_acquired_at_unix_ms: Some(now),
+                        },
+                    );
                     publisher
                         .mutate(|snapshot| {
+                            let status =
+                                snapshot.port_forwards.entry(usage_id.clone()).or_default();
                             if mapping_changed {
                                 snapshot.sequence += 1;
-                                snapshot.port_forward.change_sequence = snapshot.sequence;
-                                snapshot.port_forward.changed_at_unix_ms = Some(now);
+                                status.change_sequence = snapshot.sequence;
+                                status.changed_at_unix_ms = Some(now);
                             }
-                            snapshot.port_forward.phase = PortForwardPhase::Installed;
-                            snapshot.port_forward.requested_target = Some(target_name.clone());
-                            snapshot.port_forward.internal_port = Some(target_port);
-                            snapshot.port_forward.external_port = Some(mapping.external_port);
-                            snapshot.port_forward.tcp_udp_agree = Some(true);
-                            snapshot.port_forward.lease_acquired_at_unix_ms = Some(now);
-                            snapshot.port_forward.lease_expires_at_unix_ms =
+                            status.phase = PortForwardPhase::Installed;
+                            status.requested_target = Some(slot.target_name.clone());
+                            status.internal_port = Some(slot.target.port);
+                            status.external_port = Some(mapping.external_port);
+                            status.tcp_udp_agree = Some(true);
+                            status.lease_acquired_at_unix_ms = Some(now);
+                            status.lease_expires_at_unix_ms =
                                 Some(now + u64::from(mapping.lifetime_seconds) * 1000);
-                            snapshot.port_forward.dnat_installed = true;
-                            snapshot.port_forward.externally_verified = None;
+                            status.dnat_installed = true;
+                            status.externally_verified = None;
                         })
-                        .await;
-                    publisher
-                        .observe(
-                            "port_forward.verification",
-                            CheckStatus::Unknown,
-                            Impact::Optional,
-                            "port_forward.verification_unknown",
-                            "The renewed lease has no matching external reachability evidence yet",
-                            None,
-                            None,
-                        )
                         .await;
                     if port_changed {
                         publisher
                             .emit(
-                                "port_forward",
+                                &format!("port_forward.{usage_id}"),
                                 "port_forward.port_changed",
                                 "The provider assigned a different forwarded port",
                             )
                             .await;
                     }
-                    observe_installed_forward(&publisher).await;
-                    info!("Proton forwarded port active");
+                    info!(%usage_id, "Proton forwarded port active");
                 }
                 Err(error) => {
-                    record_port_error(&state, error.to_string()).await;
-                    deactivate_forward(
+                    record_port_error(&state, Some(&usage_id), error.to_string()).await;
+                    deactivate_forward_for_usage(
+                        &config,
                         &state,
                         &publisher,
                         &enforcement,
-                        &mut active_forward,
+                        &usage_id,
                         PortForwardPhase::LeaseLost,
-                        "port_forward.lease_lost",
                     )
                     .await?;
+                    if let Some(slot) = leases.get_mut(&usage_id) {
+                        slot.active_forward = None;
+                    }
                 }
-            },
-            Err(error) => {
-                record_port_error(&state, error.to_string()).await;
-                deactivate_forward(
-                    &state,
-                    &publisher,
-                    &enforcement,
-                    &mut active_forward,
-                    PortForwardPhase::LeaseLost,
-                    "port_forward.lease_lost",
-                )
-                .await?;
             }
         }
+        publish_primary_forward(&config, &state, &publisher).await;
+        observe_installed_forwards(&publisher, &state).await;
         wait_for_port_change(
             &mut port_change_rx,
             Duration::from_secs(config.port_forwarding.refresh_seconds),
@@ -1674,7 +1690,14 @@ async fn wait_for_port_change(receiver: &mut watch::Receiver<u64>, duration: Dur
     }
 }
 
-async fn observe_installed_forward(publisher: &StatePublisher) {
+async fn observe_installed_forwards(publisher: &StatePublisher, state: &SharedState) {
+    let active = state
+        .read()
+        .await
+        .port_forwards
+        .values()
+        .filter(|status| status.active)
+        .count();
     for (component, reason) in [
         ("port_forward.dnat", "port_forward.dnat_installed"),
         ("port_forward.lifecycle", "port_forward.lease_installed"),
@@ -1685,7 +1708,7 @@ async fn observe_installed_forward(publisher: &StatePublisher) {
                 CheckStatus::Healthy,
                 Impact::Optional,
                 reason,
-                "The current symmetric lease is installed in the owned firewall",
+                format!("{active} symmetric lease(s) are installed in the owned firewall"),
                 None,
                 None,
             )
@@ -1699,135 +1722,231 @@ async fn invalidate_published_forward(
     phase: PortForwardPhase,
 ) {
     let mut legacy = state.write().await;
-    legacy.port_forward.active = false;
-    legacy.port_forward.lease_acquired_at_unix_ms = None;
+    for status in legacy.port_forwards.values_mut() {
+        status.active = false;
+        status.lease_acquired_at_unix_ms = None;
+    }
+    legacy.port_forward = Default::default();
     drop(legacy);
-    let now = unix_ms();
     publisher
         .mutate(|snapshot| {
-            if snapshot.port_forward.dnat_installed || snapshot.port_forward.phase != phase {
-                snapshot.sequence += 1;
-                snapshot.port_forward.change_sequence = snapshot.sequence;
-                snapshot.port_forward.changed_at_unix_ms = Some(now);
+            for status in snapshot.port_forwards.values_mut() {
+                status.phase = phase;
+                status.dnat_installed = false;
+                status.external_port = None;
+                status.lease_acquired_at_unix_ms = None;
+                status.lease_expires_at_unix_ms = None;
+                status.externally_verified = None;
             }
-            snapshot.port_forward.phase = phase;
-            snapshot.port_forward.dnat_installed = false;
-            snapshot.port_forward.external_port = None;
-            snapshot.port_forward.lease_acquired_at_unix_ms = None;
-            snapshot.port_forward.lease_expires_at_unix_ms = None;
-            snapshot.port_forward.externally_verified = None;
+            snapshot.port_forward = crate::domain::PortForwardStatus {
+                phase,
+                ..Default::default()
+            };
         })
         .await;
 }
 
-async fn deactivate_forward(
+async fn deactivate_forward_for_usage(
+    config: &Config,
     state: &SharedState,
     publisher: &StatePublisher,
     enforcement: &EnforcementCoordinator,
-    active_forward: &mut Option<(u16, Ipv4Addr, u16)>,
+    usage_id: &str,
     phase: PortForwardPhase,
-    reason: &str,
 ) -> anyhow::Result<()> {
-    if active_forward.is_some() {
-        if let Err(error) = enforcement.clear_dnat().await {
-            publisher
-                .observe(
-                    "gateway.firewall",
-                    CheckStatus::Failed,
-                    Impact::Critical,
-                    "firewall.dnat_removal_failed",
-                    "Optional DNAT could not be removed; forwarding state remains unresolved",
-                    None,
-                    None,
-                )
-                .await;
-            return Err(error);
-        }
+    if let Err(error) = enforcement.clear_dnat_for_usage(usage_id).await {
+        publisher
+            .observe(
+                "gateway.firewall",
+                CheckStatus::Failed,
+                Impact::Critical,
+                "firewall.dnat_removal_failed",
+                "Optional DNAT could not be removed; forwarding state remains unresolved",
+                None,
+                None,
+            )
+            .await;
+        return Err(error);
     }
-    *active_forward = None;
     let mut legacy = state.write().await;
-    legacy.port_forward.active = false;
-    legacy.port_forward.lease_acquired_at_unix_ms = None;
+    let status = legacy.port_forwards.entry(usage_id.to_owned()).or_default();
+    status.active = false;
+    status.port = None;
+    status.lease_acquired_at_unix_ms = None;
     drop(legacy);
     let now = unix_ms();
     publisher
         .mutate(|snapshot| {
-            let changed =
-                snapshot.port_forward.phase != phase || snapshot.port_forward.dnat_installed;
+            let status = snapshot
+                .port_forwards
+                .entry(usage_id.to_owned())
+                .or_default();
+            let changed = status.phase != phase || status.dnat_installed;
             if changed {
                 snapshot.sequence += 1;
-                snapshot.port_forward.change_sequence = snapshot.sequence;
-                snapshot.port_forward.changed_at_unix_ms = Some(now);
+                status.change_sequence = snapshot.sequence;
+                status.changed_at_unix_ms = Some(now);
             }
-            snapshot.port_forward.phase = phase;
-            snapshot.port_forward.dnat_installed = false;
-            snapshot.port_forward.external_port = None;
-            snapshot.port_forward.lease_acquired_at_unix_ms = None;
-            snapshot.port_forward.lease_expires_at_unix_ms = None;
-            snapshot.port_forward.externally_verified = None;
+            status.phase = phase;
+            status.dnat_installed = false;
+            status.external_port = None;
+            status.lease_acquired_at_unix_ms = None;
+            status.lease_expires_at_unix_ms = None;
+            status.externally_verified = None;
         })
         .await;
-    publisher
-        .observe(
-            "port_forward.lifecycle",
-            if matches!(
-                phase,
-                PortForwardPhase::TargetAmbiguous
-                    | PortForwardPhase::LeaseLost
-                    | PortForwardPhase::InstallFailed
-                    | PortForwardPhase::VerificationFailed
-                    | PortForwardPhase::Unavailable
-            ) {
-                CheckStatus::Degraded
-            } else {
-                CheckStatus::Healthy
-            },
-            Impact::Optional,
-            reason,
-            "The forwarded-port lifecycle changed",
-            None,
-            None,
-        )
-        .await;
-    publisher
-        .observe(
-            "port_forward.dnat",
-            CheckStatus::Healthy,
-            Impact::Optional,
-            reason,
-            "No optional DNAT rule is installed",
-            None,
-            None,
-        )
-        .await;
+    publish_primary_forward(config, state, publisher).await;
     Ok(())
 }
 
-async fn select_port_target(state: &SharedState) -> Option<(String, DnatTarget)> {
-    let state = state.read().await;
-    let mut targets = state
-        .clients
-        .values()
-        .filter(|client| client.port_forward_target && client.compliant);
-    let target = targets.next()?;
-    if targets.next().is_some() {
-        return None;
+async fn deactivate_all_forwards(
+    config: &Config,
+    state: &SharedState,
+    publisher: &StatePublisher,
+    enforcement: &EnforcementCoordinator,
+    leases: &mut BTreeMap<String, LeaseSlot>,
+    phase: PortForwardPhase,
+) -> anyhow::Result<()> {
+    for usage_id in leases.keys().cloned().collect::<Vec<_>>() {
+        deactivate_forward_for_usage(config, state, publisher, enforcement, &usage_id, phase)
+            .await?;
+        if let Some(slot) = leases.get_mut(&usage_id) {
+            slot.active_forward = None;
+        }
     }
-    Some((
-        target.name.clone(),
-        DnatTarget {
-            container_id: target.container_id.clone(),
-            address: target.ipv4_address,
-            port: target.target_port?,
-        },
-    ))
+    Ok(())
 }
 
-async fn record_port_error(state: &SharedState, error: String) {
-    warn!(%error, "port forwarding failed");
+async fn reconcile_lease_targets(
+    config: &Config,
+    state: &SharedState,
+    publisher: &StatePublisher,
+    enforcement: &EnforcementCoordinator,
+    leases: &mut BTreeMap<String, LeaseSlot>,
+) -> anyhow::Result<()> {
+    let targets = select_port_targets(state).await;
+    let removed = leases
+        .keys()
+        .filter(|usage_id| !targets.contains_key(*usage_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for usage_id in removed {
+        deactivate_forward_for_usage(
+            config,
+            state,
+            publisher,
+            enforcement,
+            &usage_id,
+            PortForwardPhase::WaitingForTarget,
+        )
+        .await?;
+        leases.remove(&usage_id);
+        state.write().await.port_forwards.remove(&usage_id);
+        publisher
+            .mutate(|snapshot| {
+                snapshot.port_forwards.remove(&usage_id);
+            })
+            .await;
+    }
+    for (usage_id, (target_name, target)) in targets {
+        let replace = leases
+            .get(&usage_id)
+            .is_some_and(|slot| slot.target != target);
+        if replace {
+            deactivate_forward_for_usage(
+                config,
+                state,
+                publisher,
+                enforcement,
+                &usage_id,
+                PortForwardPhase::WaitingForTarget,
+            )
+            .await?;
+            leases.remove(&usage_id);
+        }
+        leases.entry(usage_id).or_insert(LeaseSlot {
+            target_name,
+            target,
+            assigned_external: None,
+            active_forward: None,
+        });
+    }
+    Ok(())
+}
+
+async fn select_port_targets(state: &SharedState) -> BTreeMap<String, (String, DnatTarget)> {
+    let state = state.read().await;
+    state
+        .clients
+        .values()
+        .filter(|client| client.port_forward_target && client.compliant)
+        .filter_map(|client| {
+            Some((
+                client.usage_id.clone(),
+                (
+                    client.name.clone(),
+                    DnatTarget {
+                        container_id: client.container_id.clone(),
+                        address: client.ipv4_address,
+                        port: client.target_port?,
+                    },
+                ),
+            ))
+        })
+        .collect()
+}
+
+async fn publish_primary_forward(config: &Config, state: &SharedState, publisher: &StatePublisher) {
+    let (legacy_primary, primary_usage_id) = {
+        let state = state.read().await;
+        let usage_id = select_primary_usage_id(
+            config.port_forwarding.primary_usage_id.as_deref(),
+            &state.port_forwards,
+        );
+        (
+            usage_id.and_then(|id| state.port_forwards.get(id).cloned()),
+            usage_id.map(str::to_owned),
+        )
+    };
+    state.write().await.port_forward = legacy_primary.unwrap_or_default();
+    publisher
+        .mutate(|snapshot| {
+            snapshot.port_forward = primary_usage_id
+                .as_deref()
+                .and_then(|id| snapshot.port_forwards.get(id))
+                .cloned()
+                .unwrap_or_default();
+        })
+        .await;
+}
+
+fn select_primary_usage_id<'a, T>(
+    configured: Option<&'a str>,
+    leases: &'a BTreeMap<String, T>,
+) -> Option<&'a str> {
+    configured
+        .filter(|usage_id| leases.contains_key(*usage_id))
+        .or_else(|| {
+            (leases.len() == 1)
+                .then(|| leases.keys().next().map(String::as_str))
+                .flatten()
+        })
+}
+
+async fn record_port_error(state: &SharedState, usage_id: Option<&str>, error: String) {
+    warn!(usage_id = usage_id.unwrap_or("gateway"), %error, "port forwarding failed");
     let mut state = state.write().await;
-    state.port_forward.active = false;
-    state.last_error = Some(format!("port forwarding failed: {error}"));
+    if let Some(usage_id) = usage_id {
+        state
+            .port_forwards
+            .entry(usage_id.to_owned())
+            .or_default()
+            .active = false;
+    }
+    state.last_error = Some(format!(
+        "port forwarding failed for {}: {error}",
+        usage_id.unwrap_or("gateway")
+    ));
 }
 
 pub(crate) async fn wireguard_up(
@@ -2266,7 +2385,8 @@ mod tests {
                 None,
             )
             .await;
-        observe_installed_forward(&publisher).await;
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        observe_installed_forwards(&publisher, &state).await;
         let snapshot = publisher.subscribe().borrow().clone();
         assert_eq!(
             snapshot.checks["port_forward.lifecycle"].status,
@@ -2278,19 +2398,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn primary_forward_selection_is_explicit_then_single_lease_compatible() {
+        let leases = [
+            ("personal-arr/qbittorrent".to_owned(), 1_u8),
+            ("prod-indexarr/indexarr".to_owned(), 2_u8),
+        ]
+        .into();
+        assert_eq!(
+            select_primary_usage_id(Some("personal-arr/qbittorrent"), &leases),
+            Some("personal-arr/qbittorrent")
+        );
+        assert_eq!(select_primary_usage_id(None, &leases), None);
+        let single = [("only/client".to_owned(), 1_u8)].into();
+        assert_eq!(select_primary_usage_id(None, &single), Some("only/client"));
+    }
+
+    #[test]
+    fn per_lease_failure_state_does_not_mutate_healthy_sibling() {
+        let healthy = crate::domain::PortForwardStatus {
+            phase: PortForwardPhase::Installed,
+            external_port: Some(45_678),
+            dnat_installed: true,
+            change_sequence: 7,
+            ..Default::default()
+        };
+        let mut statuses: BTreeMap<String, crate::domain::PortForwardStatus> = [
+            ("healthy".to_owned(), healthy.clone()),
+            (
+                "failed".to_owned(),
+                crate::domain::PortForwardStatus::default(),
+            ),
+        ]
+        .into();
+        let failed = statuses.get_mut("failed").unwrap();
+        failed.phase = PortForwardPhase::LeaseLost;
+        failed.dnat_installed = false;
+        assert_eq!(statuses["healthy"], healthy);
+    }
+
     #[tokio::test]
     async fn enforcement_invalidation_clears_published_dnat_state() {
         let state: SharedState = Arc::new(RwLock::new(AppState::default()));
-        state.write().await.port_forward.active = true;
+        state.write().await.port_forwards.insert(
+            "test/client".to_owned(),
+            crate::state::PortForwardState {
+                active: true,
+                ..Default::default()
+            },
+        );
         let mut snapshot = CanonicalSnapshot::default();
-        snapshot.port_forward.phase = PortForwardPhase::Installed;
-        snapshot.port_forward.dnat_installed = true;
-        snapshot.port_forward.external_port = Some(45_678);
+        snapshot.port_forwards.insert(
+            "test/client".to_owned(),
+            crate::domain::PortForwardStatus {
+                phase: PortForwardPhase::Installed,
+                dnat_installed: true,
+                external_port: Some(45_678),
+                ..Default::default()
+            },
+        );
         let publisher = StatePublisher::new(snapshot);
 
         invalidate_published_forward(&state, &publisher, PortForwardPhase::Unavailable).await;
 
-        assert!(!state.read().await.port_forward.active);
+        assert!(!state.read().await.port_forwards["test/client"].active);
         let snapshot = publisher.subscribe().borrow().clone();
         assert_eq!(snapshot.port_forward.phase, PortForwardPhase::Unavailable);
         assert!(!snapshot.port_forward.dnat_installed);

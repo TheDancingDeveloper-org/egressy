@@ -90,9 +90,9 @@ impl ClientCounters {
 #[derive(Default)]
 struct DesiredPolicy {
     dnat_allowed: bool,
-    dnat_target: Option<DnatTarget>,
-    desired_dnat: Option<Dnat>,
-    applied_dnat: Option<Dnat>,
+    dnat_targets: BTreeMap<String, DnatTarget>,
+    desired_dnat: BTreeMap<String, Dnat>,
+    applied_dnat: BTreeMap<String, Dnat>,
     clients: BTreeMap<String, ClientCounters>,
 }
 
@@ -122,46 +122,48 @@ impl EnforcementCoordinator {
     pub async fn disable_dnat(&self) -> anyhow::Result<()> {
         let mut policy = self.policy.lock().await;
         policy.dnat_allowed = false;
-        policy.desired_dnat = None;
+        policy.desired_dnat.clear();
         self.apply_locked(&mut policy).await
     }
 
     pub async fn set_dnat_for_target(
         &self,
+        usage_id: &str,
         dnat: Dnat,
         target: &DnatTarget,
     ) -> anyhow::Result<bool> {
         let mut policy = self.policy.lock().await;
-        if !policy.dnat_allowed || policy.dnat_target.as_ref() != Some(target) {
+        if !policy.dnat_allowed || policy.dnat_targets.get(usage_id) != Some(target) {
             return Ok(false);
         }
-        policy.desired_dnat = Some(dnat);
+        policy.desired_dnat.insert(usage_id.to_owned(), dnat);
         self.apply_locked(&mut policy).await?;
         Ok(true)
     }
 
-    pub async fn clear_dnat(&self) -> anyhow::Result<()> {
+    pub async fn clear_dnat_for_usage(&self, usage_id: &str) -> anyhow::Result<()> {
         let mut policy = self.policy.lock().await;
-        policy.desired_dnat = None;
+        policy.desired_dnat.remove(usage_id);
         self.apply_locked(&mut policy).await
     }
 
-    pub async fn dnat_is_applied(&self, dnat: Dnat) -> bool {
-        self.policy.lock().await.applied_dnat == Some(dnat)
+    pub async fn dnat_is_applied(&self, usage_id: &str, dnat: Dnat) -> bool {
+        self.policy.lock().await.applied_dnat.get(usage_id) == Some(&dnat)
     }
 
     pub async fn reconcile_clients(
         &self,
         clients: &BTreeMap<String, ClientState>,
-        invalidate_dnat: bool,
+        _invalidate_dnat: bool,
     ) -> anyhow::Result<()> {
         let mut policy = self.policy.lock().await;
         self.observe_kernel_locked(&mut policy).await?;
-        let dnat_target = select_dnat_target(clients);
-        if invalidate_dnat || policy.dnat_target != dnat_target {
-            policy.desired_dnat = None;
-        }
-        policy.dnat_target = dnat_target;
+        let dnat_targets = select_dnat_targets(clients);
+        let previous_targets = policy.dnat_targets.clone();
+        policy
+            .desired_dnat
+            .retain(|usage_id, _| previous_targets.get(usage_id) == dnat_targets.get(usage_id));
+        policy.dnat_targets = dnat_targets;
         sync_clients(&mut policy, clients);
         self.apply_locked(&mut policy).await
     }
@@ -198,8 +200,8 @@ impl EnforcementCoordinator {
                 }
             })
             .collect::<Vec<_>>();
-        let rules =
-            host::render_gateway_firewall(&self.config, policy.desired_dnat, &counter_rules);
+        let desired_dnat = policy.desired_dnat.values().copied().collect::<Vec<_>>();
+        let rules = host::render_gateway_firewall(&self.config, &desired_dnat, &counter_rules);
         let exists = table_exists().await?;
         let transaction = if exists {
             format!("delete table inet egressy\n{rules}")
@@ -228,7 +230,7 @@ impl EnforcementCoordinator {
         for counters in policy.clients.values_mut() {
             counters.seeded();
         }
-        policy.applied_dnat = policy.desired_dnat;
+        policy.applied_dnat = policy.desired_dnat.clone();
         Ok(())
     }
 
@@ -266,19 +268,21 @@ impl EnforcementCoordinator {
     }
 }
 
-fn select_dnat_target(clients: &BTreeMap<String, ClientState>) -> Option<DnatTarget> {
-    let mut targets = clients
+fn select_dnat_targets(clients: &BTreeMap<String, ClientState>) -> BTreeMap<String, DnatTarget> {
+    clients
         .values()
         .filter(|client| client.port_forward_target && client.compliant)
         .filter_map(|client| {
-            Some(DnatTarget {
-                container_id: client.container_id.clone(),
-                address: client.ipv4_address,
-                port: client.target_port?,
-            })
-        });
-    let target = targets.next()?;
-    targets.next().is_none().then_some(target)
+            Some((
+                client.usage_id.clone(),
+                DnatTarget {
+                    container_id: client.container_id.clone(),
+                    address: client.ipv4_address,
+                    port: client.target_port?,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn sync_clients(policy: &mut DesiredPolicy, clients: &BTreeMap<String, ClientState>) {
@@ -419,10 +423,10 @@ mod tests {
     fn desired_and_applied_dnat_are_distinct_until_successful_apply() {
         let mut policy = DesiredPolicy::default();
         let mapping = (45678, "172.30.0.10".parse().unwrap(), 6881);
-        policy.desired_dnat = Some(mapping);
-        assert_eq!(policy.applied_dnat, None);
-        policy.applied_dnat = policy.desired_dnat;
-        assert_eq!(policy.applied_dnat, Some(mapping));
+        policy.desired_dnat.insert("test:a".to_owned(), mapping);
+        assert!(policy.applied_dnat.is_empty());
+        policy.applied_dnat = policy.desired_dnat.clone();
+        assert_eq!(policy.applied_dnat["test:a"], mapping);
     }
 
     #[test]
@@ -430,8 +434,10 @@ mod tests {
         let mut policy = DesiredPolicy::default();
         let mapping = (45678, "172.30.0.10".parse().unwrap(), 6881);
         assert!(!policy.dnat_allowed);
-        policy.desired_dnat = policy.dnat_allowed.then_some(mapping);
-        assert_eq!(policy.desired_dnat, None);
+        if policy.dnat_allowed {
+            policy.desired_dnat.insert("test:a".to_owned(), mapping);
+        }
+        assert!(policy.desired_dnat.is_empty());
     }
 
     #[test]
@@ -444,6 +450,21 @@ mod tests {
         replacement_client.target_port = Some(6881);
         let old = [("old".into(), old_client)].into();
         let replacement = [("new".into(), replacement_client)].into();
-        assert_ne!(select_dnat_target(&old), select_dnat_target(&replacement));
+        assert_ne!(select_dnat_targets(&old), select_dnat_targets(&replacement));
+    }
+
+    #[test]
+    fn multiple_compliant_targets_are_selected_independently() {
+        let mut first = client("first", "172.30.0.10");
+        first.port_forward_target = true;
+        first.target_port = Some(6881);
+        let mut second = client("second", "172.30.0.11");
+        second.port_forward_target = true;
+        second.target_port = Some(6882);
+        let targets =
+            select_dnat_targets(&[("first".into(), first), ("second".into(), second)].into());
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets["test:first"].port, 6881);
+        assert_eq!(targets["test:second"].port, 6882);
     }
 }

@@ -25,8 +25,8 @@ filesystem or firewall identifiers.
    reconfigure application containers.
 7. Labels describe desired policy and monitoring intent; they do not prove or
    change a running container's effective route.
-8. A tunnel supplies one forwarded port. At most one compliant container may
-   opt into forwarding.
+8. Forwarding leases are keyed by stable usage ID and unique internal target
+   port. One lease failure must never remove or delay a healthy sibling lease.
 9. Never log, return, commit, or bake credentials, WireGuard private keys, or
    complete WireGuard profiles into an image.
 10. Keep decoded WireGuard profiles on tmpfs with mode `0600`.
@@ -55,8 +55,8 @@ filesystem or firewall identifiers.
 - Never infer compliance from a label alone. A labelled container without a
   valid egress-network address is non-compliant.
 - Preserve NAT-PMP byte-order and response tests, bounded retries, matching
-  TCP/UDP ports, early refresh, and immediate DNAT removal when no unique
-  compliant target exists.
+  TCP/UDP ports, early refresh, and immediate per-client DNAT removal when its
+  compliant target disappears.
 - Treat `src/state.rs` and `openapi/v2.json` as external contracts. Test
   serialization and handlers when semantics change. Escape all
   container-controlled HTML strings.

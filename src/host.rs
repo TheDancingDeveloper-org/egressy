@@ -46,16 +46,17 @@ NFT
 
 pub fn render_gateway_firewall(
     config: &Config,
-    port_forward: Option<(u16, Ipv4Addr, u16)>,
+    port_forwards: &[(u16, Ipv4Addr, u16)],
     client_counters: &[ClientCounterRule],
 ) -> String {
     let network = &config.network;
     let tunnel = &config.wireguard.interface;
-    let dnat = port_forward.map_or_else(String::new, |(public_port, target, target_port)| {
-        format!(
+    let dnat = port_forwards
+        .iter()
+        .map(|(public_port, target, target_port)| format!(
             "    iifname \"{tunnel}\" tcp dport {public_port} dnat ip to {target}:{target_port}\n    iifname \"{tunnel}\" udp dport {public_port} dnat ip to {target}:{target_port}\n"
-        )
-    });
+        ))
+        .collect::<String>();
     let counter_objects = client_counters
         .iter()
         .flat_map(|client| {
@@ -171,7 +172,7 @@ mod tests {
         let config: Config = serde_yaml::from_str("{}").unwrap();
         let rules = render_gateway_firewall(
             &config,
-            Some((45678, Ipv4Addr::new(172, 30, 0, 10), 6881)),
+            &[(45678, Ipv4Addr::new(172, 30, 0, 10), 6881)],
             &[],
         );
         assert!(rules.contains("tcp dport 45678 dnat ip to 172.30.0.10:6881"));
@@ -181,7 +182,7 @@ mod tests {
     #[test]
     fn unauthorized_plain_dns_is_rejected_for_both_transports() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
-        let rules = render_gateway_firewall(&config, None, &[]);
+        let rules = render_gateway_firewall(&config, &[], &[]);
         assert!(rules.contains("udp dport 53 ip daddr != 172.30.0.2 reject"));
         assert!(rules.contains("tcp dport 53 ip daddr != 172.30.0.2 reject"));
     }
@@ -189,11 +190,11 @@ mod tests {
     #[test]
     fn natpmp_input_exists_only_when_the_backend_is_enabled() {
         let disabled: Config = serde_yaml::from_str("{}").unwrap();
-        assert!(!render_gateway_firewall(&disabled, None, &[]).contains("udp dport 5351"));
+        assert!(!render_gateway_firewall(&disabled, &[], &[]).contains("udp dport 5351"));
         let enabled: Config =
             serde_yaml::from_str("port_forwarding:\n  backend: nat_pmp\n  gateway: 10.2.0.1\n")
                 .unwrap();
-        assert!(render_gateway_firewall(&enabled, None, &[]).contains("udp dport 5351"));
+        assert!(render_gateway_firewall(&enabled, &[], &[]).contains("udp dport 5351"));
     }
 
     #[test]
@@ -201,7 +202,7 @@ mod tests {
         let config: Config = serde_yaml::from_str("{}").unwrap();
         let rules = render_gateway_firewall(
             &config,
-            None,
+            &[],
             &[ClientCounterRule {
                 container_id: "abc123".to_owned(),
                 address: "172.30.0.10".parse().unwrap(),
@@ -217,5 +218,26 @@ mod tests {
         assert!(
             rules.contains("ip saddr 172.30.0.10 oifname \"wg0\" counter name client_up_abc123")
         );
+    }
+
+    #[test]
+    fn multiple_forwarded_ports_are_rendered_for_both_protocols() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        let rules = render_gateway_firewall(
+            &config,
+            &[
+                (45678, Ipv4Addr::new(172, 30, 0, 10), 6881),
+                (45679, Ipv4Addr::new(172, 30, 0, 11), 6882),
+            ],
+            &[],
+        );
+        for rule in [
+            "tcp dport 45678 dnat ip to 172.30.0.10:6881",
+            "udp dport 45678 dnat ip to 172.30.0.10:6881",
+            "tcp dport 45679 dnat ip to 172.30.0.11:6882",
+            "udp dport 45679 dnat ip to 172.30.0.11:6882",
+        ] {
+            assert!(rules.contains(rule));
+        }
     }
 }

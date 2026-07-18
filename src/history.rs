@@ -19,7 +19,7 @@ use crate::{
     state::UsageIdentitySource,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_SAFE_TEXT: usize = 512;
 pub const MAX_USAGE_QUERY_RANGE_MS: u64 = 366 * 86_400_000;
 
@@ -56,6 +56,7 @@ pub struct UsageObservation {
 #[derive(Clone, Debug)]
 pub struct PortForwardObservation {
     pub timestamp_unix_ms: u64,
+    pub usage_id: String,
     pub phase: PortForwardPhase,
     pub external_port: Option<u16>,
 }
@@ -131,6 +132,7 @@ pub struct HistoricalEvent {
     pub safe_message: String,
     pub external_port: Option<u16>,
     pub port_forward_phase: Option<String>,
+    pub usage_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -453,7 +455,8 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<()> {
                 reason_code TEXT NOT NULL,
                 safe_message TEXT NOT NULL,
                 external_port INTEGER,
-                port_forward_phase TEXT
+                port_forward_phase TEXT,
+                usage_id TEXT
              );
              CREATE INDEX events_time ON events (timestamp_ms, id);
              CREATE TABLE vpn_server_samples (
@@ -481,7 +484,7 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<()> {
                 alert_diagnostic_failed INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
              );
-             PRAGMA user_version = 3;",
+             PRAGMA user_version = 4;",
         )?;
         transaction.commit()?;
     } else if version == 1 {
@@ -521,6 +524,15 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<()> {
                 updated_at_ms INTEGER NOT NULL
              );
              PRAGMA user_version = 3;",
+        )?;
+        transaction.commit()?;
+    }
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 3 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE events ADD COLUMN usage_id TEXT;
+             PRAGMA user_version = 4;",
         )?;
         transaction.commit()?;
     }
@@ -788,13 +800,14 @@ fn write_port_forward(
     connection.execute(
         "INSERT INTO events (
             timestamp_ms, kind, component, reason_code, safe_message,
-            external_port, port_forward_phase
-         ) VALUES (?1, 'port_forward', 'port_forward', 'port_forward.lifecycle_changed', ?2, ?3, ?4)",
+            external_port, port_forward_phase, usage_id
+         ) VALUES (?1, 'port_forward', 'port_forward', 'port_forward.lifecycle_changed', ?2, ?3, ?4, ?5)",
         params![
             to_i64(observation.timestamp_unix_ms),
             message,
             observation.external_port,
             phase,
+            bounded(&observation.usage_id),
         ],
     )?;
     Ok(())
@@ -961,7 +974,7 @@ fn query_events(path: &Path, query: EventHistoryQuery) -> anyhow::Result<EventHi
     let connection = open_connection(path)?;
     let mut statement = connection.prepare(
         "SELECT id, timestamp_ms, kind, component, from_status, to_status,
-                reason_code, safe_message, external_port, port_forward_phase
+                reason_code, safe_message, external_port, port_forward_phase, usage_id
          FROM events
          WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2 AND id < ?3
          ORDER BY id DESC
@@ -986,6 +999,7 @@ fn query_events(path: &Path, query: EventHistoryQuery) -> anyhow::Result<EventHi
             safe_message: row.get(7)?,
             external_port: row.get(8)?,
             port_forward_phase: row.get(9)?,
+            usage_id: row.get(10)?,
         });
     }
     let has_more = events.len() > limit;
@@ -1202,6 +1216,7 @@ mod tests {
         }));
         assert!(store.record_port_forward(PortForwardObservation {
             timestamp_unix_ms: 101_000,
+            usage_id: "personal-arr/qbittorrent".to_owned(),
             phase: PortForwardPhase::Installed,
             external_port: Some(45_678),
         }));
@@ -1319,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_schema_one_to_three_without_losing_events() {
+    fn migrates_schema_one_to_four_without_losing_events() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("v1.sqlite3");
         let connection = Connection::open(&path).unwrap();
@@ -1359,7 +1374,7 @@ mod tests {
         let events: i64 = connection
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(events, 1);
     }
 

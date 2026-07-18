@@ -246,7 +246,7 @@
       },
       "CanonicalSnapshot": {
         "type": "object",
-        "required": ["schema_version", "sequence", "generated_at_unix_ms", "protection", "availability", "checks", "transitions", "port_forward", "recovery", "external_probe", "vpn_server", "isolation_policy", "topology", "clients", "traffic", "profile_management"],
+        "required": ["schema_version", "sequence", "generated_at_unix_ms", "protection", "availability", "checks", "transitions", "port_forward", "port_forwards", "recovery", "external_probe", "vpn_server", "isolation_policy", "topology", "clients", "traffic", "profile_management"],
         "properties": {
           "schema_version": { "type": "integer", "const": 2 },
           "sequence": { "type": "integer" },
@@ -256,6 +256,7 @@
           "checks": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/SubsystemCheck" } },
           "transitions": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/Transition" } },
           "port_forward": { "$ref": "#/components/schemas/PortForwardStatus" },
+          "port_forwards": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/PortForwardStatus" } },
           "recovery": { "type": "object" },
           "external_probe": { "$ref": "#/components/schemas/ExternalProbeResult" },
           "vpn_server": { "$ref": "#/components/schemas/VpnServerStatus" },
@@ -425,7 +426,7 @@
       },
       "HistoricalEvent": {
         "type": "object",
-        "required": ["id", "timestamp_unix_ms", "kind", "component", "from_status", "to_status", "reason_code", "safe_message", "external_port", "port_forward_phase"],
+        "required": ["id", "timestamp_unix_ms", "kind", "component", "from_status", "to_status", "reason_code", "safe_message", "external_port", "port_forward_phase", "usage_id"],
         "properties": {
           "id": { "type": "integer" },
           "timestamp_unix_ms": { "type": "integer" },
@@ -436,7 +437,8 @@
           "reason_code": { "type": "string" },
           "safe_message": { "type": "string" },
           "external_port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
-          "port_forward_phase": { "type": ["string", "null"] }
+          "port_forward_phase": { "type": ["string", "null"] },
+          "usage_id": { "type": ["string", "null"] }
         }
       },
       "VpnServerHistoryResponse": {

@@ -924,6 +924,9 @@ export interface components {
             };
             transitions: components["schemas"]["Transition"][];
             port_forward: components["schemas"]["PortForwardStatus"];
+            port_forwards: {
+                [key: string]: components["schemas"]["PortForwardStatus"];
+            };
             recovery: Record<string, never>;
             external_probe: components["schemas"]["ExternalProbeResult"];
             vpn_server: components["schemas"]["VpnServerStatus"];
@@ -1069,6 +1072,7 @@ export interface components {
             safe_message: string;
             external_port: number | null;
             port_forward_phase: string | null;
+            usage_id: string | null;
         };
         VpnServerHistoryResponse: {
             from_unix_ms: number;

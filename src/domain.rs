@@ -231,6 +231,7 @@ pub struct CanonicalSnapshot {
     pub checks: BTreeMap<String, SubsystemCheck>,
     pub transitions: VecDeque<Transition>,
     pub port_forward: PortForwardStatus,
+    pub port_forwards: BTreeMap<String, PortForwardStatus>,
     pub recovery: RecoveryStatus,
     pub external_probe: ExternalProbeResult,
     pub vpn_server: VpnServerStatus,

@@ -25,6 +25,8 @@ port_forwarding:
   gateway: 10.2.0.1
   refresh_seconds: 45
   lifetime_seconds: 60
+  max_leases: 5
+  primary_usage_id: null
 
 dns:
   enabled: true

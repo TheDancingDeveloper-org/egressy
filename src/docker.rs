@@ -21,6 +21,7 @@ pub struct DockerObserver {
     docker: Docker,
     network_name: String,
     subnet: Ipv4Net,
+    max_port_forward_leases: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -32,7 +33,12 @@ pub struct NetworkObservation {
 }
 
 impl DockerObserver {
-    pub fn connect(socket: &str, network_name: String, subnet: Ipv4Net) -> anyhow::Result<Self> {
+    pub fn connect(
+        socket: &str,
+        network_name: String,
+        subnet: Ipv4Net,
+        max_port_forward_leases: usize,
+    ) -> anyhow::Result<Self> {
         let docker = if socket.starts_with("http://") || socket.starts_with("tcp://") {
             Docker::connect_with_http(socket, 120, bollard::API_DEFAULT_VERSION)
         } else if socket == "/var/run/docker.sock" {
@@ -45,6 +51,7 @@ impl DockerObserver {
             docker,
             network_name,
             subnet,
+            max_port_forward_leases,
         })
     }
 
@@ -143,6 +150,7 @@ impl DockerObserver {
                 },
             );
         }
+        apply_port_forward_constraints(&mut clients, self.max_port_forward_leases);
         Ok(clients)
     }
 
@@ -215,6 +223,57 @@ impl DockerObserver {
             gateway_attached,
             ipv6_enabled: network.enable_ipv6.unwrap_or(false),
         })
+    }
+}
+
+fn apply_port_forward_constraints(clients: &mut BTreeMap<String, ClientState>, max_leases: usize) {
+    let mut ports = BTreeMap::<u16, Vec<String>>::new();
+    let mut usage_ids = BTreeMap::<String, Vec<String>>::new();
+    for (container_id, client) in clients.iter() {
+        if client.port_forward_target && client.compliant {
+            if let Some(port) = client.target_port {
+                ports.entry(port).or_default().push(container_id.clone());
+            }
+            usage_ids
+                .entry(client.usage_id.clone())
+                .or_default()
+                .push(container_id.clone());
+        }
+    }
+    for (port, container_ids) in ports.iter().filter(|(_, ids)| ids.len() > 1) {
+        for container_id in container_ids {
+            if let Some(client) = clients.get_mut(container_id) {
+                client.compliant = false;
+                client.compliance_message = format!(
+                    "egressy.target-port {port} collides with another forwarding client; target ports must be unique"
+                );
+            }
+        }
+    }
+    for (usage_id, container_ids) in usage_ids.iter().filter(|(_, ids)| ids.len() > 1) {
+        for container_id in container_ids {
+            if let Some(client) = clients.get_mut(container_id) {
+                client.compliant = false;
+                client.compliance_message = format!(
+                    "egressy.usage-id {usage_id} collides with another forwarding client; usage IDs must be unique"
+                );
+            }
+        }
+    }
+
+    let mut eligible = clients
+        .iter()
+        .filter(|(_, client)| client.port_forward_target && client.compliant)
+        .map(|(container_id, client)| (client.usage_id.clone(), container_id.clone()))
+        .collect::<Vec<_>>();
+    eligible.sort();
+    for (_, container_id) in eligible.into_iter().skip(max_leases) {
+        if let Some(client) = clients.get_mut(&container_id) {
+            client.compliant = false;
+            client.compliance_message = format!(
+                "port-forward lease limit of {max_leases} reached; lower usage IDs take precedence"
+            );
+        }
     }
 }
 
@@ -448,8 +507,58 @@ mod tests {
             "http://docker-api-proxy:2375",
             "vpn-egress".to_owned(),
             "172.30.0.0/24".parse().unwrap(),
+            5,
         )
         .is_ok());
+    }
+
+    fn forwarding_client(usage_id: &str, target_port: u16) -> ClientState {
+        ClientState {
+            container_id: usage_id.replace('/', ""),
+            usage_id: usage_id.to_owned(),
+            usage_id_source: UsageIdentitySource::ExplicitLabel,
+            name: usage_id.to_owned(),
+            ipv4_address: "172.30.0.10".parse().unwrap(),
+            port_forward_target: true,
+            target_port: Some(target_port),
+            compliant: true,
+            compliance_message: "eligible".to_owned(),
+            running: true,
+            ipv6_address: None,
+            networks: vec!["vpn-egress".to_owned()],
+            port_forward_label_valid: true,
+            route_intent: RouteIntentState::default(),
+            traffic: crate::state::ClientTrafficState::default(),
+        }
+    }
+
+    #[test]
+    fn duplicate_target_ports_make_only_colliding_clients_non_compliant() {
+        let mut clients = [
+            ("a".to_owned(), forwarding_client("usage/a", 6881)),
+            ("b".to_owned(), forwarding_client("usage/b", 6881)),
+            ("c".to_owned(), forwarding_client("usage/c", 6882)),
+        ]
+        .into();
+        apply_port_forward_constraints(&mut clients, 5);
+        assert!(!clients["a"].compliant);
+        assert!(!clients["b"].compliant);
+        assert!(clients["c"].compliant);
+    }
+
+    #[test]
+    fn lease_cap_is_applied_in_stable_usage_id_order() {
+        let mut clients = [
+            ("z".to_owned(), forwarding_client("usage/z", 6883)),
+            ("a".to_owned(), forwarding_client("usage/a", 6881)),
+            ("m".to_owned(), forwarding_client("usage/m", 6882)),
+        ]
+        .into();
+        apply_port_forward_constraints(&mut clients, 2);
+        assert!(clients["a"].compliant);
+        assert!(clients["m"].compliant);
+        assert!(!clients["z"].compliant);
+        assert!(clients["z"].compliance_message.contains("lease limit"));
     }
 
     #[test]

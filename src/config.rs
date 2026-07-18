@@ -245,6 +245,8 @@ pub struct PortForwardingConfig {
     pub gateway: Ipv4Addr,
     pub refresh_seconds: u64,
     pub lifetime_seconds: u32,
+    pub max_leases: usize,
+    pub primary_usage_id: Option<String>,
 }
 
 impl Default for PortForwardingConfig {
@@ -254,6 +256,8 @@ impl Default for PortForwardingConfig {
             gateway: default_port_forward_gateway(),
             refresh_seconds: default_refresh_seconds(),
             lifetime_seconds: default_lifetime_seconds(),
+            max_leases: 5,
+            primary_usage_id: None,
         }
     }
 }
@@ -549,6 +553,17 @@ impl Config {
                 >= u64::from(self.port_forwarding.lifetime_seconds)
         {
             bail!("port_forwarding.refresh_seconds must be shorter than port_forwarding.lifetime_seconds");
+        }
+        if self.port_forwarding.max_leases == 0 || self.port_forwarding.max_leases > 5 {
+            bail!("port_forwarding.max_leases must be between 1 and 5");
+        }
+        if self
+            .port_forwarding
+            .primary_usage_id
+            .as_deref()
+            .is_some_and(|usage_id| usage_id.trim().is_empty())
+        {
+            bail!("port_forwarding.primary_usage_id must not be empty");
         }
         if self.reconcile.interval_seconds == 0 {
             bail!("reconcile.interval_seconds must be greater than zero");
@@ -850,6 +865,26 @@ mod tests {
         assert_eq!(config.persistence.path, "/var/lib/egressy/egressy.sqlite3");
         assert_eq!(config.persistence.retention_days, 365);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn port_forwarding_defaults_bound_concurrent_leases() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.port_forwarding.max_leases, 5);
+        assert_eq!(config.port_forwarding.primary_usage_id, None);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_port_forwarding_lease_limits_and_primary() {
+        for yaml in [
+            "port_forwarding:\n  max_leases: 0\n",
+            "port_forwarding:\n  max_leases: 6\n",
+            "port_forwarding:\n  primary_usage_id: ''\n",
+        ] {
+            let config: Config = serde_yaml::from_str(yaml).unwrap();
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

@@ -29,8 +29,8 @@ The refactor does not change Egressy's fundamental model:
   application container to apply a profile.
 - Client enrollment and leak protection remain IPv4-only. IPv6 fields may be
   preserved in a profile, but their presence does not imply IPv6 protection.
-- A tunnel may supply at most one forwarded port to one unique compliant
-  target.
+- A tunnel may supply bounded concurrent forwarded ports to unique compliant
+  targets; leases and DNAT state are isolated by usage ID.
 
 ## Intended operator experience
 

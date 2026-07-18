@@ -288,6 +288,10 @@ async fn observe_external_probe(
 
     publisher
         .mutate(|snapshot| {
+            let primary_identity = (
+                snapshot.port_forward.external_port,
+                snapshot.port_forward.lease_acquired_at_unix_ms,
+            );
             snapshot.external_probe.status = status;
             snapshot.external_probe.observed_at_unix_ms = Some(external_probe.observed_at_unix_ms);
             snapshot.external_probe.source_public_non_tailscale = (!normalized_unavailable)
@@ -326,6 +330,14 @@ async fn observe_external_probe(
                         snapshot.port_forward.phase = PortForwardPhase::Installed;
                     }
                 }
+            }
+            let primary = snapshot.port_forward.clone();
+            if let Some((_, status)) = snapshot.port_forwards.iter_mut().find(|(_, status)| {
+                (status.external_port, status.lease_acquired_at_unix_ms) == primary_identity
+                    && status.dnat_installed
+            }) {
+                status.phase = primary.phase;
+                status.externally_verified = primary.externally_verified;
             }
         })
         .await;
@@ -383,6 +395,10 @@ async fn observe_external_probe_unavailable(
 ) {
     publisher
         .mutate(|snapshot| {
+            let primary_identity = (
+                snapshot.port_forward.external_port,
+                snapshot.port_forward.lease_acquired_at_unix_ms,
+            );
             snapshot.external_probe.status = ExternalProbeStatus::Unavailable;
             snapshot.external_probe.observed_at_unix_ms = Some(crate::runtime::unix_ms());
             snapshot.external_probe.source_public_non_tailscale = None;
@@ -396,6 +412,14 @@ async fn observe_external_probe_unavailable(
             snapshot.port_forward.externally_verified = None;
             if snapshot.port_forward.dnat_installed {
                 snapshot.port_forward.phase = PortForwardPhase::Installed;
+            }
+            let primary = snapshot.port_forward.clone();
+            if let Some((_, status)) = snapshot.port_forwards.iter_mut().find(|(_, status)| {
+                (status.external_port, status.lease_acquired_at_unix_ms) == primary_identity
+                    && status.dnat_installed
+            }) {
+                status.phase = primary.phase;
+                status.externally_verified = None;
             }
         })
         .await;

@@ -13,7 +13,9 @@ not downloadable.
 ## Compatibility endpoints
 
 `GET /api/v1/status` retains the original `AppState` fields and meanings:
-`tunnel`, `traffic`, `port_forward`, `clients`, and `last_error`. Client objects
+`tunnel`, `traffic`, `port_forward`, `port_forwards`, `clients`, and `last_error`.
+`port_forwards` is keyed by stable usage ID; `port_forward` remains the
+configured primary lease for existing consumers. Client objects
 now add running state, discovered networks, IPv6 diagnostics, forwarding label
 validity, and a `route_intent` object. The additive route-intent field remains
 advisory and does not change v1 compliance semantics. Consumers must continue
@@ -37,6 +39,8 @@ recovery framework. Its main fields are:
 - `transitions`: the newest 200 in-memory status transitions;
 - `port_forward`: requested target, lease timing, TCP/UDP agreement, installed
   DNAT state, verification state, and change sequence;
+- `port_forwards`: the complete per-usage-ID lease map. External verification
+  remains scoped to the primary lease;
 - `recovery`: active attempt, reason, and next-attempt time;
 - `topology`: configured network, subnet, gateway, bridge, table, IPv6 support,
   route-verification limitation, and client-isolation posture;

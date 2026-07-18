@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::RenderGatewayFirewall => {
-            print!("{}", host::render_gateway_firewall(&config, None, &[]));
+            print!("{}", host::render_gateway_firewall(&config, &[], &[]));
             Ok(())
         }
     }

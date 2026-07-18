@@ -12,6 +12,7 @@ pub struct AppState {
     pub tunnel: TunnelState,
     pub traffic: TrafficState,
     pub port_forward: PortForwardState,
+    pub port_forwards: BTreeMap<String, PortForwardState>,
     pub clients: BTreeMap<String, ClientState>,
     pub last_error: Option<String>,
 }
