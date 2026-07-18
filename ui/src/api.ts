@@ -70,6 +70,7 @@ export interface Snapshot {
     reason_code: string | null
     safe_message: string | null
   }
+  external_probes: Record<string, Snapshot['external_probe']>
   vpn_server: VpnServer
   isolation_policy: IsolationPolicy
   topology: { network: string; subnet: string; gateway_address: string; host_bridge: string; policy_table: number; client_ipv6_supported: boolean; default_route_verifiable: boolean; client_isolation: string }

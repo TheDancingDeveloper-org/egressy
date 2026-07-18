@@ -63,7 +63,11 @@ const WarnGlyph = () =>
   <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden="true"><path d="M7 1.5 L13 12 H1 Z" strokeLinejoin="round" /><path d="M7 5.5 v3 M7 10.4 v.4" /></svg>
 
 const StatusPill = ({ status }: { status?: string }) =>
-  <span className={`pill ${tone(status)}`}>{status ?? 'unknown'}</span>
+  <span className={`pill ${tone(status)}`}>{({
+    healthy: 'working', enforced: 'protected', verified: 'reachable', installed: 'set up',
+    verification_failed: 'not reachable', unavailable: 'unavailable', degraded: 'needs attention',
+    mismatch: 'incorrect route', failed: 'failed', unknown: 'not checked', pending: 'checking',
+  } as Record<string, string>)[status ?? ''] ?? status?.replaceAll('_', ' ') ?? 'not checked'}</span>
 
 const triState = (value: boolean | null | undefined, yes: string, no: string) =>
   value == null ? <span className="pill mut">not tested</span>
@@ -129,6 +133,7 @@ export function App() {
   const checks = Object.values(snapshot.checks)
   const transitions = [...snapshot.transitions].reverse()
   const probe = snapshot.external_probe
+  const probes = snapshot.external_probes ?? {}
   const forward = snapshot.port_forward
   const forwards = Object.entries(snapshot.port_forwards ?? {})
   const vpnServer = snapshot.vpn_server
@@ -190,12 +195,12 @@ export function App() {
 
     <div>
       <div className="top">
-        <span className="fact">net <span className="id-val">{snapshot.topology.network}</span></span><span className="sep">|</span>
+        <span className="fact">VPN network <span className="id-val">{snapshot.topology.network}</span></span><span className="sep">|</span>
         <span className="fact">{snapshot.topology.subnet}</span>
-        {snapshot.topology.gateway_address && <><span className="sep">|</span><span className="fact">gw <span className="id-val">{snapshot.topology.gateway_address}</span></span></>}
+        {snapshot.topology.gateway_address && <><span className="sep">|</span><span className="fact">gateway <span className="id-val">{snapshot.topology.gateway_address}</span></span></>}
         {snapshot.topology.host_bridge && <><span className="sep">|</span><span className="fact">{snapshot.topology.host_bridge}</span></>}
         <span className="sep">|</span>
-        <span className="fact">seq #{snapshot.sequence}</span>
+        <span className="fact">status update #{snapshot.sequence}</span>
         <div className="live">
           <span className="clock">updated {snapshotAge}</span>
           <span className={`live-pill ${link[0]}`} role="status"><span className="live-dot" />{link[1]}</span>
@@ -226,15 +231,15 @@ export function App() {
             <div className="card">
               <h3>Protection</h3>
               <StatusPill status={snapshot.protection} />
-              <p className="sub">{snapshot.protection === 'enforced' ? 'Fail-closed policy is observed.' : 'Protection could not be confirmed.'}</p>
+              <p className="sub">{snapshot.protection === 'enforced' ? 'Apps cannot bypass the VPN if the tunnel stops.' : 'The no-leak safety rules could not be confirmed.'}</p>
             </div>
             <div className="card">
-              <h3>Availability</h3>
+              <h3>VPN connection</h3>
               <StatusPill status={snapshot.availability} />
-              <p className="sub">Availability is tracked separately from leak protection.</p>
+              <p className="sub">Shows whether the VPN and its supporting services are working now.</p>
             </div>
             <div className="card">
-              <h3>External probe</h3>
+              <h3>Internet reachability test</h3>
               <StatusPill status={probe?.status} />
               <p className="sub">{probe?.safe_message ?? 'No external probe result yet.'}</p>
             </div>
@@ -253,14 +258,14 @@ export function App() {
           </div>
           <div className="tbl" style={{ marginTop: 12 }}>
             <table>
-              <thead><tr><th>Usage ID</th><th>Phase</th><th>Target</th><th>Internal</th><th>External</th><th>DNAT</th></tr></thead>
+              <thead><tr><th>App identity</th><th>Internet test</th><th>App</th><th>App port</th><th>Public port</th><th>Incoming rule</th></tr></thead>
               <tbody>
                 {forwards.length === 0 && <tr><td colSpan={6} className="empty">No forwarding leases observed</td></tr>}
                 {forwards.map(([usageId, lease]) => <tr key={usageId}>
-                  <td className="mono">{usageId}</td><td><StatusPill status={lease.phase} /></td>
+                  <td className="mono">{usageId}</td><td>{triState(lease.externally_verified, 'reachable', 'not reachable')}</td>
                   <td>{lease.requested_target ?? 'none'}</td><td className="mono">{lease.internal_port ?? '—'}</td>
                   <td className="mono">{lease.external_port ?? '—'}</td>
-                  <td><span className={`pill ${lease.dnat_installed ? 'ok' : 'mut'}`}>{lease.dnat_installed ? 'installed' : 'not installed'}</span></td>
+                  <td><span className={`pill ${lease.dnat_installed ? 'ok' : 'mut'}`}>{lease.dnat_installed ? 'ready' : 'not ready'}</span></td>
                 </tr>)}
               </tbody>
             </table>
@@ -281,7 +286,7 @@ export function App() {
 
           <div className="card chart-card" style={{ marginTop: 12 }}>
             <div className="chart-head"><h3 style={{ margin: 0 }}>Throughput · connected containers</h3>
-              <span className="sub">Per-container rates derived from enrolled nftables samples</span></div>
+              <span className="sub">Current download and upload speed for each app using the VPN</span></div>
             <ClientThroughputChart clients={clients.map(client => ({ name: client.name, history: client.traffic.history }))} />
           </div>
 
@@ -305,15 +310,15 @@ export function App() {
           <div className="view-head"><h1 id="h-path">Data path</h1><span className="count">{PATH_CHECKS.length} checks</span><span className="updated">snapshot {snapshotAge}</span></div>
           <div className="card">{pipeline(true)}</div>
           <div className="notice"><InfoGlyph />
-            Checks are ordered by dependency: an upstream failure leaves downstream checks pending rather than failed.
-            Protection state is derived from enforcement checks only — probe results never relax it.</div>
+            These checks follow traffic from an app to the internet. If an early step fails, later steps wait instead of reporting a misleading failure.
+            Internet tests never turn off the no-leak safety rules.</div>
         </section>
 
         <section className={view === 'clients' ? 'view on' : 'view'} aria-labelledby="h-clients">
           <div className="view-head"><h1 id="h-clients">Clients</h1><span className="count">{clients.length}</span><span className="updated">observed from Docker {snapshotAge}</span></div>
           <div className="tbl">
             <table>
-              <thead><tr><th>Name</th><th>State</th><th>Address</th><th>Networks</th><th>Declared IPv4 default</th><th>Traffic</th><th>Compliance</th></tr></thead>
+              <thead><tr><th>App</th><th>State</th><th>VPN address</th><th>Networks</th><th>Expected internet route</th><th>Traffic</th><th>Setup</th></tr></thead>
               <tbody>
                 {clients.length === 0 && <tr><td colSpan={7} className="empty">No enrolled clients observed</td></tr>}
                 {clients.map(client => <tr key={client.container_id}>
@@ -332,24 +337,24 @@ export function App() {
                         <div key={sample.sampled_at_unix_ms}>{clock(sample.sampled_at_unix_ms)} ↓{formatBytes(sample.downloaded_bytes)} ↑{formatBytes(sample.uploaded_bytes)}</div>
                       )}</div>
                     </details></td>
-                  <td><span className={`pill ${client.compliant ? 'ok' : 'crit'}`}>{client.compliant ? 'compliant' : 'non-compliant'}</span>
+                  <td><span className={`pill ${client.compliant ? 'ok' : 'crit'}`}>{client.compliant ? 'correctly configured' : 'configuration problem'}</span>
                     {!client.compliant && <div className="reason">{client.compliance_message}</div>}</td>
                 </tr>)}
               </tbody>
             </table>
           </div>
           <div className="notice warn"><WarnGlyph />
-            Docker gateway metadata reports declared route intent only. It cannot prove an effective in-container default route,
-            and IPv6 client leak protection is unsupported.</div>
+            Docker tells Egressy which network an app is expected to use for internet traffic, but cannot prove the route inside the app.
+            Only IPv4 traffic is protected; IPv6 is not supported.</div>
           <div className={`notice ${snapshot.isolation_policy?.eligible_for_enforcement ? '' : 'warn'}`}><InfoGlyph />
-            Bridge isolation policy: {snapshot.isolation_policy?.safe_message ?? 'not observed'}.
+            App-to-app blocking: {snapshot.isolation_policy?.eligible_for_enforcement ? 'configured correctly' : snapshot.isolation_policy?.safe_message ?? 'not checked'}.
             {snapshot.isolation_policy?.issues?.length ? ` Issues: ${snapshot.isolation_policy.issues.join('; ')}` : ''}</div>
         </section>
 
         <section className={view === 'forwarding' ? 'view on' : 'view'} aria-labelledby="h-forwarding">
           <div className="view-head"><h1 id="h-forwarding">Port forwarding</h1><span className="updated">snapshot {snapshotAge}</span></div>
           <div className="grid tiles">
-            <div className="card"><h3>Lifecycle</h3><div className="big mono">{forward.phase}</div>
+            <div className="card"><h3>Primary forwarded port</h3><StatusPill status={forward.phase} />
               {forward.lease_expires_at_unix_ms && <p className="sub">Lease expires {ago(now, forward.lease_expires_at_unix_ms).replace(' ago', '')}.</p>}</div>
             <div className="card"><h3>External port</h3>
               <div className={forward.external_port ? 'big' : 'big dim'} style={forward.external_port ? { color: 'var(--id)' } : undefined}>{forward.external_port ?? 'not assigned'}</div>
@@ -357,14 +362,14 @@ export function App() {
             <div className="card"><h3>Target</h3>
               <div className={forward.requested_target ? 'big' : 'big dim'}>{forward.requested_target ?? 'none'}</div>
               <p className="sub">Selected by container label.</p></div>
-            <div className="card"><h3>DNAT</h3>
-              <span className={`pill ${forward.dnat_installed ? 'ok' : 'mut'}`}>{forward.dnat_installed ? 'installed' : 'not installed'}</span>
-              <p className="sub">An installed rule does not prove public reachability.</p></div>
-            <div className="card"><h3>External verification</h3>{triState(forward.externally_verified, 'verified', 'failed')}
-              <p className="sub">Fresh evidence must match the active port and lease acquisition.</p></div>
+            <div className="card"><h3>Incoming traffic rule</h3>
+              <span className={`pill ${forward.dnat_installed ? 'ok' : 'mut'}`}>{forward.dnat_installed ? 'ready' : 'not ready'}</span>
+              <p className="sub">Routes incoming connections from the VPN provider to the selected app.</p></div>
+            <div className="card"><h3>Reachable from the internet</h3>{triState(forward.externally_verified, 'yes', 'no')}
+              <p className="sub">A server outside your network tries the current public port.</p></div>
           </div>
           <div className="notice"><InfoGlyph />
-            Public reachability is only demonstrated by the <a href="#probe" onClick={nav('probe')}>external probe</a>, which is advisory.</div>
+            “Reachable” means an independent server connected to that app’s current public port. A failed test is reported but never weakens VPN protection.</div>
         </section>
 
         <section className={view === 'server' ? 'view on' : 'view'} aria-labelledby="h-server">
@@ -387,17 +392,25 @@ export function App() {
         </section>
 
         <section className={view === 'probe' ? 'view on' : 'view'} id="external-probe" aria-labelledby="h-probe">
-          <div className="view-head"><h1 id="h-probe">External probe</h1><span className="updated">observed {ago(now, probe?.observed_at_unix_ms)}</span></div>
+          <div className="view-head"><h1 id="h-probe">Internet reachability tests</h1><span className="updated">observed {ago(now, probe?.observed_at_unix_ms)}</span></div>
           <div className="grid tiles">
-            <div className="card"><h3>Status</h3><StatusPill status={probe?.status} /><p className="sub">Advisory only; never changes tunnel health.</p></div>
-            <div className="card"><h3>Public non-Tailscale path</h3>{triState(probe?.source_public_non_tailscale, 'confirmed', 'failed')}
-              <p className="sub">The probe reached the gateway from a public source address.</p></div>
-            <div className="card"><h3>Source matches claimed IP</h3>{triState(probe?.source_matches_claimed_ip, 'match', 'mismatch')}
-              <p className="sub">Compares the probe source with the claimed egress identity.</p></div>
-            <div className="card"><h3>Forwarded port reachability</h3>{triState(probe?.tcp_port_reachable, 'reachable', 'unreachable')}
-              <p className="sub">TCP reachability of the forwarded port from outside.</p></div>
+            <div className="card"><h3>Overall test service</h3><StatusPill status={probe?.status} /><p className="sub">This test reports problems but never changes VPN routing or safety rules.</p></div>
+            <div className="card"><h3>Test used the public internet</h3>{triState(probe?.source_public_non_tailscale, 'yes', 'no')}
+              <p className="sub">Confirms the test came from outside your private and Tailscale networks.</p></div>
+            <div className="card"><h3>VPN public address matched</h3>{triState(probe?.source_matches_claimed_ip, 'yes', 'no')}
+              <p className="sub">Confirms the address seen by the test is the VPN’s current public address.</p></div>
+            <div className="card"><h3>Primary public port</h3>{triState(probe?.tcp_port_reachable, 'reachable', 'not reachable')}
+              <p className="sub">Shows the compatibility result for the primary forwarded port.</p></div>
           </div>
           <div className="notice"><InfoGlyph />{probe?.safe_message ?? 'No external probe result yet.'}</div>
+          <div className="tbl" style={{ marginTop: 12 }}><table>
+            <thead><tr><th>App identity</th><th>Public port</th><th>Result</th><th>Last tested</th></tr></thead>
+            <tbody>{Object.entries(probes).map(([usageId, result]) => <tr key={usageId}>
+              <td className="mono">{usageId}</td><td className="mono">{result.forwarded_port ?? '—'}</td>
+              <td>{triState(result.tcp_port_reachable, 'reachable', 'not reachable')}</td>
+              <td>{ago(now, result.observed_at_unix_ms)}</td>
+            </tr>)}</tbody>
+          </table></div>
         </section>
 
         <section className={view === 'history' ? 'view on' : 'view'} aria-labelledby="h-history">

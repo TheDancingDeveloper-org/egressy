@@ -32,6 +32,7 @@ const snapshot = (): Snapshot => ({
     dnat_installed: true, lease_acquired_at_unix_ms: now() - 15_000,
     lease_expires_at_unix_ms: now() + 45_000, externally_verified: true,
   },
+  port_forwards: {},
   recovery: { active: false, attempt: 0 },
   external_probe: {
     status: 'healthy', observed_at_unix_ms: now() - 10_000,
@@ -40,6 +41,7 @@ const snapshot = (): Snapshot => ({
     lease_acquired_at_unix_ms: now() - 15_000, request_started_at_unix_ms: now() - 10_400,
     reason_code: 'external_probe.healthy', safe_message: 'Independent internet-path validation succeeded',
   },
+  external_probes: {},
   vpn_server: {
     configured_endpoint_host: 'vpn.example.net', configured_endpoint_port: 51820,
     configured_address_family: 'hostname', allowed_ips_posture: 'ipv4_default',

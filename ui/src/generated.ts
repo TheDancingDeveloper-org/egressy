@@ -929,6 +929,9 @@ export interface components {
             };
             recovery: Record<string, never>;
             external_probe: components["schemas"]["ExternalProbeResult"];
+            external_probes: {
+                [key: string]: components["schemas"]["ExternalProbeResult"];
+            };
             vpn_server: components["schemas"]["VpnServerStatus"];
             isolation_policy: components["schemas"]["IsolationPolicy"];
             topology: Record<string, never>;

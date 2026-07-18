@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -29,6 +30,8 @@ struct ProbeStatus {
     safe_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     external_probe: Option<ExternalProbeStatus>,
+    #[serde(default)]
+    external_probes: BTreeMap<String, ExternalProbeStatus>,
 }
 
 #[derive(Clone)]
@@ -87,6 +90,8 @@ struct ExternalProbeResponse {
 #[derive(Debug, Deserialize)]
 struct GatewayStatus {
     port_forward: GatewayPortForward,
+    #[serde(default)]
+    port_forwards: BTreeMap<String, GatewayPortForward>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,9 +460,7 @@ async fn run_external_checks(result: SharedResult, config: ExternalProbeConfig) 
             Ok(client) => client,
             Err(error) => {
                 warn!(%error, url = %config.url, "external probe endpoint resolution rejected");
-                update_external_probe(
-                    &result,
-                    ExternalProbeStatus {
+                let unavailable = ExternalProbeStatus {
                         status: "unavailable".to_owned(),
                         observed_at_unix_ms: unix_ms(),
                         source_public_non_tailscale: None,
@@ -470,89 +473,98 @@ async fn run_external_checks(result: SharedResult, config: ExternalProbeConfig) 
                         safe_message:
                             "The external probe endpoint did not resolve to a public non-Tailscale address"
                                 .to_owned(),
-                    },
-                )
-                .await;
+                    };
+                update_external_probes(&result, BTreeMap::new(), Some(unavailable)).await;
                 continue;
             }
         };
 
-        let claim = match fetch_gateway_port_forward(&state_client, &config).await {
-            Ok(claim) => claim,
+        let claims = match fetch_gateway_port_forwards(&state_client, &config).await {
+            Ok(claims) => claims,
             Err(error) => {
                 warn!(%error, "external probe could not read gateway port-forward state");
-                PortForwardClaim::default()
+                GatewayClaims::default()
             }
         };
-
-        let request_started_at_unix_ms = unix_ms();
-        let request_id = format!("external-probe-{}", unix_ms());
-        let body = ExternalProbeRequest {
-            instance_id: config.instance_id.clone(),
-            request_id: request_id.clone(),
-            timestamp_unix_ms: request_started_at_unix_ms,
-            claimed_public_ip: claim.public_ip,
-            forwarded_port: claim.forwarded_port,
-        };
-
-        let mut request = public_client.post(config.url.clone()).json(&body);
-        if let Some(token) = &config.token {
-            request = request.bearer_auth(token);
-        }
-
-        let observed = match request.send().await {
-            Ok(response) if redirect_is_rejected(response.status()) => {
-                warn!(request_id, "external probe redirect rejected");
-                unavailable_external_probe(
-                    "external_probe.redirect_rejected",
-                    "The external probe endpoint attempted a redirect",
+        let observations =
+            futures_util::future::join_all(claims.leases.iter().map(|(usage_id, claim)| {
+                probe_external_claim(
+                    public_client.clone(),
+                    config.clone(),
+                    usage_id.clone(),
+                    *claim,
                 )
-            }
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => match response.json::<ExternalProbeResponse>().await {
-                    Ok(response) => {
-                        map_external_response(response, claim, request_started_at_unix_ms)
-                    }
-                    Err(error) => {
-                        warn!(%error, request_id, "external probe response decode failed");
-                        unavailable_external_probe(
-                            "external_probe.invalid_response",
-                            "The external probe returned an invalid response",
-                        )
-                    }
-                },
+            }))
+            .await
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let primary = observations
+            .values()
+            .find(|observation| {
+                observation.forwarded_port == claims.primary.forwarded_port
+                    && observation.lease_acquired_at_unix_ms
+                        == claims.primary.lease_acquired_at_unix_ms
+            })
+            .cloned();
+        update_external_probes(&result, observations, primary).await;
+    }
+}
+
+async fn probe_external_claim(
+    client: reqwest::Client,
+    config: ExternalProbeConfig,
+    usage_id: String,
+    claim: PortForwardClaim,
+) -> (String, ExternalProbeStatus) {
+    let request_started_at_unix_ms = unix_ms();
+    let request_id = format!("external-probe-{usage_id}-{request_started_at_unix_ms}");
+    let body = ExternalProbeRequest {
+        instance_id: format!("{}:{usage_id}", config.instance_id),
+        request_id: request_id.clone(),
+        timestamp_unix_ms: request_started_at_unix_ms,
+        claimed_public_ip: claim.public_ip,
+        forwarded_port: claim.forwarded_port,
+    };
+    let mut request = client.post(config.url).json(&body);
+    if let Some(token) = &config.token {
+        request = request.bearer_auth(token);
+    }
+    let observed = match request.send().await {
+        Ok(response) if redirect_is_rejected(response.status()) => unavailable_external_probe(
+            "external_probe.redirect_rejected",
+            "The external probe endpoint attempted a redirect",
+        ),
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => match response.json::<ExternalProbeResponse>().await {
+                Ok(response) => map_external_response(response, claim, request_started_at_unix_ms),
                 Err(error) => {
-                    let reason_code = if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
-                        "external_probe.auth_failed"
-                    } else {
-                        "external_probe.http_failed"
-                    };
-                    warn!(%error, request_id, "external probe HTTP request failed");
-                    unavailable_external_probe(reason_code, "The external probe request failed")
+                    warn!(%error, %usage_id, "external probe response decode failed");
+                    unavailable_external_probe(
+                        "external_probe.invalid_response",
+                        "The external probe returned an invalid response",
+                    )
                 }
             },
             Err(error) => {
-                let reason_code = if error.is_timeout() {
-                    "external_probe.timeout"
+                let reason = if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
+                    "external_probe.auth_failed"
                 } else {
-                    "external_probe.unavailable"
+                    "external_probe.http_failed"
                 };
-                warn!(%error, request_id, "external probe request failed");
-                unavailable_external_probe(
-                    reason_code,
-                    "The external probe is unavailable; tunnel protection is unchanged",
-                )
+                unavailable_external_probe(reason, "The external probe request failed")
             }
-        };
-
-        info!(
-            status = observed.status,
-            reason = observed.reason_code,
-            request_id,
-            "external probe result"
-        );
-        update_external_probe(&result, observed).await;
-    }
+        },
+        Err(error) => unavailable_external_probe(
+            if error.is_timeout() {
+                "external_probe.timeout"
+            } else {
+                "external_probe.unavailable"
+            },
+            "The external probe is unavailable; tunnel protection is unchanged",
+        ),
+    };
+    info!(%usage_id, status = observed.status, reason = observed.reason_code, "external probe result");
+    (usage_id, observed)
 }
 
 async fn build_pinned_external_client(
@@ -612,8 +624,14 @@ fn redirect_is_rejected(status: reqwest::StatusCode) -> bool {
     status.is_redirection()
 }
 
-async fn update_external_probe(result: &SharedResult, external_probe: ExternalProbeStatus) {
-    result.write().await.external_probe = Some(external_probe);
+async fn update_external_probes(
+    result: &SharedResult,
+    external_probes: BTreeMap<String, ExternalProbeStatus>,
+    primary: Option<ExternalProbeStatus>,
+) {
+    let mut result = result.write().await;
+    result.external_probes = external_probes;
+    result.external_probe = primary;
 }
 
 fn map_external_response(
@@ -665,10 +683,16 @@ fn unavailable_external_probe(reason_code: &str, safe_message: &str) -> External
     }
 }
 
-async fn fetch_gateway_port_forward(
+#[derive(Default)]
+struct GatewayClaims {
+    primary: PortForwardClaim,
+    leases: BTreeMap<String, PortForwardClaim>,
+}
+
+async fn fetch_gateway_port_forwards(
     client: &reqwest::Client,
     config: &ExternalProbeConfig,
-) -> anyhow::Result<PortForwardClaim> {
+) -> anyhow::Result<GatewayClaims> {
     let status = client
         .get(&config.state_url)
         .send()
@@ -676,23 +700,33 @@ async fn fetch_gateway_port_forward(
         .error_for_status()?
         .json::<GatewayStatus>()
         .await?;
-    Ok(extract_port_forward_claim(&status))
+    Ok(extract_port_forward_claims(&status))
 }
 
-fn extract_port_forward_claim(status: &GatewayStatus) -> PortForwardClaim {
+fn extract_port_forward_claims(status: &GatewayStatus) -> GatewayClaims {
+    GatewayClaims {
+        primary: extract_port_forward_claim(&status.port_forward),
+        leases: status
+            .port_forwards
+            .iter()
+            .filter_map(|(usage_id, lease)| {
+                let claim = extract_port_forward_claim(lease);
+                claim.forwarded_port.map(|_| (usage_id.clone(), claim))
+            })
+            .collect(),
+    }
+}
+
+fn extract_port_forward_claim(status: &GatewayPortForward) -> PortForwardClaim {
     // An inactive lease can retain the previous tunnel's exit address, and
     // claiming a stale address produces a false claimed_ip_mismatch result.
-    if !status.port_forward.active {
+    if !status.active {
         return PortForwardClaim::default();
     }
     let public_ip = status
-        .port_forward
         .public_ip
         .filter(|ip| !is_disallowed_probe_ip(IpAddr::V4(*ip)));
-    let complete_mapping = status
-        .port_forward
-        .port
-        .zip(status.port_forward.lease_acquired_at_unix_ms);
+    let complete_mapping = status.port.zip(status.lease_acquired_at_unix_ms);
     PortForwardClaim {
         public_ip,
         forwarded_port: complete_mapping.map(|(port, _)| port),
@@ -1020,26 +1054,22 @@ mod tests {
 
     #[test]
     fn inactive_lease_claims_no_public_ip_or_port() {
-        let claim = extract_port_forward_claim(&GatewayStatus {
-            port_forward: GatewayPortForward {
-                active: false,
-                public_ip: Some("203.0.113.10".parse().unwrap()),
-                port: Some(45678),
-                lease_acquired_at_unix_ms: Some(100),
-            },
+        let claim = extract_port_forward_claim(&GatewayPortForward {
+            active: false,
+            public_ip: Some("203.0.113.10".parse().unwrap()),
+            port: Some(45678),
+            lease_acquired_at_unix_ms: Some(100),
         });
         assert_eq!(claim, PortForwardClaim::default());
     }
 
     #[test]
     fn active_lease_claims_public_ip_and_port() {
-        let claim = extract_port_forward_claim(&GatewayStatus {
-            port_forward: GatewayPortForward {
-                active: true,
-                public_ip: Some("203.0.113.10".parse().unwrap()),
-                port: Some(45678),
-                lease_acquired_at_unix_ms: Some(100),
-            },
+        let claim = extract_port_forward_claim(&GatewayPortForward {
+            active: true,
+            public_ip: Some("203.0.113.10".parse().unwrap()),
+            port: Some(45678),
+            lease_acquired_at_unix_ms: Some(100),
         });
         assert_eq!(claim.public_ip, Some("203.0.113.10".parse().unwrap()));
         assert_eq!(claim.forwarded_port, Some(45678));
@@ -1047,14 +1077,48 @@ mod tests {
     }
 
     #[test]
-    fn active_lease_with_non_public_ip_claims_port_only() {
-        let claim = extract_port_forward_claim(&GatewayStatus {
+    fn gateway_claims_include_every_complete_active_lease() {
+        let status = GatewayStatus {
             port_forward: GatewayPortForward {
                 active: true,
-                public_ip: Some("10.2.0.2".parse().unwrap()),
-                port: Some(45678),
+                public_ip: Some("203.0.113.10".parse().unwrap()),
+                port: Some(45_678),
                 lease_acquired_at_unix_ms: Some(100),
             },
+            port_forwards: BTreeMap::from([
+                (
+                    "qbit".to_owned(),
+                    GatewayPortForward {
+                        active: true,
+                        public_ip: Some("203.0.113.10".parse().unwrap()),
+                        port: Some(45_678),
+                        lease_acquired_at_unix_ms: Some(100),
+                    },
+                ),
+                (
+                    "indexarr".to_owned(),
+                    GatewayPortForward {
+                        active: true,
+                        public_ip: Some("203.0.113.10".parse().unwrap()),
+                        port: Some(39_021),
+                        lease_acquired_at_unix_ms: Some(101),
+                    },
+                ),
+            ]),
+        };
+        let claims = extract_port_forward_claims(&status);
+        assert_eq!(claims.primary.forwarded_port, Some(45_678));
+        assert_eq!(claims.leases["qbit"].forwarded_port, Some(45_678));
+        assert_eq!(claims.leases["indexarr"].forwarded_port, Some(39_021));
+    }
+
+    #[test]
+    fn active_lease_with_non_public_ip_claims_port_only() {
+        let claim = extract_port_forward_claim(&GatewayPortForward {
+            active: true,
+            public_ip: Some("10.2.0.2".parse().unwrap()),
+            port: Some(45678),
+            lease_acquired_at_unix_ms: Some(100),
         });
         assert_eq!(claim.public_ip, None);
         assert_eq!(claim.forwarded_port, Some(45678));
@@ -1062,13 +1126,11 @@ mod tests {
 
     #[test]
     fn incomplete_active_lease_omits_forwarding_claim() {
-        let claim = extract_port_forward_claim(&GatewayStatus {
-            port_forward: GatewayPortForward {
-                active: true,
-                public_ip: Some("203.0.113.10".parse().unwrap()),
-                port: Some(45678),
-                lease_acquired_at_unix_ms: None,
-            },
+        let claim = extract_port_forward_claim(&GatewayPortForward {
+            active: true,
+            public_ip: Some("203.0.113.10".parse().unwrap()),
+            port: Some(45678),
+            lease_acquired_at_unix_ms: None,
         });
         assert_eq!(claim.public_ip, Some("203.0.113.10".parse().unwrap()));
         assert_eq!(claim.forwarded_port, None);

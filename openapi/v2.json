@@ -246,7 +246,7 @@
       },
       "CanonicalSnapshot": {
         "type": "object",
-        "required": ["schema_version", "sequence", "generated_at_unix_ms", "protection", "availability", "checks", "transitions", "port_forward", "port_forwards", "recovery", "external_probe", "vpn_server", "isolation_policy", "topology", "clients", "traffic", "profile_management"],
+        "required": ["schema_version", "sequence", "generated_at_unix_ms", "protection", "availability", "checks", "transitions", "port_forward", "port_forwards", "recovery", "external_probe", "external_probes", "vpn_server", "isolation_policy", "topology", "clients", "traffic", "profile_management"],
         "properties": {
           "schema_version": { "type": "integer", "const": 2 },
           "sequence": { "type": "integer" },
@@ -259,6 +259,7 @@
           "port_forwards": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/PortForwardStatus" } },
           "recovery": { "type": "object" },
           "external_probe": { "$ref": "#/components/schemas/ExternalProbeResult" },
+          "external_probes": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/ExternalProbeResult" } },
           "vpn_server": { "$ref": "#/components/schemas/VpnServerStatus" },
           "isolation_policy": { "$ref": "#/components/schemas/IsolationPolicy" },
           "topology": { "type": "object" }

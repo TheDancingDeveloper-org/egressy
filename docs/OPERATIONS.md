@@ -56,8 +56,10 @@ longer appears in firewall counters or forwarding state.
 ## Port-forward operations
 
 The dashboard and v2 API expose the requested target, external port, lease
-times, phase, installed-DNAT state, and optional external verification. Treat
-`dnat_installed=true` as kernel policy evidence, not internet reachability.
+times, phase, installed-DNAT state, and per-lease external verification. When
+the external validator is enabled, every active forwarded port is tested
+independently. Treat `dnat_installed=true` as kernel policy evidence, not
+internet reachability.
 
 If forwarding becomes unavailable:
 

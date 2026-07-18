@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -20,6 +21,7 @@ struct ProbeResult {
     reason_code: String,
     safe_message: String,
     external_probe: Option<ReportedExternalProbe>,
+    external_probes: Option<BTreeMap<String, ReportedExternalProbe>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,7 +123,14 @@ pub async fn monitor(config: Config, publisher: StatePublisher) -> anyhow::Resul
                                 .await;
                         }
                         if config.external_probe.enabled {
-                            if let Some(external_probe) = result.external_probe {
+                            if let Some(external_probes) = result.external_probes {
+                                observe_external_probes(
+                                    &publisher,
+                                    external_probes,
+                                    external_probe_freshness_ms(&config),
+                                )
+                                .await;
+                            } else if let Some(external_probe) = result.external_probe {
                                 observe_external_probe(
                                     &publisher,
                                     external_probe,
@@ -208,22 +217,20 @@ enum PortVerification {
 }
 
 fn correlate_port_verification(
-    snapshot: &crate::domain::CanonicalSnapshot,
+    lease: &crate::domain::PortForwardStatus,
     external_probe: &ReportedExternalProbe,
     now: u64,
     freshness_ms: u64,
 ) -> PortVerification {
-    if !snapshot.port_forward.dnat_installed {
+    if !lease.dnat_installed {
         return PortVerification::Unknown;
     }
     let Some(request_started_at) = external_probe.request_started_at_unix_ms else {
         return PortVerification::Unknown;
     };
-    let matching_mapping = external_probe.forwarded_port == snapshot.port_forward.external_port
-        && external_probe.lease_acquired_at_unix_ms
-            == snapshot.port_forward.lease_acquired_at_unix_ms
-        && snapshot
-            .port_forward
+    let matching_mapping = external_probe.forwarded_port == lease.external_port
+        && external_probe.lease_acquired_at_unix_ms == lease.lease_acquired_at_unix_ms
+        && lease
             .lease_acquired_at_unix_ms
             .is_some_and(|acquired_at| request_started_at >= acquired_at);
     let fresh = now.abs_diff(request_started_at) <= freshness_ms
@@ -246,6 +253,164 @@ fn correlate_port_verification(
         }
         _ => PortVerification::Unknown,
     }
+}
+
+fn apply_verification(
+    lease: &mut crate::domain::PortForwardStatus,
+    external_probe: &ReportedExternalProbe,
+    now: u64,
+    freshness_ms: u64,
+) {
+    match correlate_port_verification(lease, external_probe, now, freshness_ms) {
+        PortVerification::Verified => {
+            lease.externally_verified = Some(true);
+            lease.phase = PortForwardPhase::Verified;
+        }
+        PortVerification::Failed => {
+            lease.externally_verified = Some(false);
+            lease.phase = PortForwardPhase::VerificationFailed;
+        }
+        PortVerification::Unknown => {
+            lease.externally_verified = None;
+            if lease.dnat_installed {
+                lease.phase = PortForwardPhase::Installed;
+            }
+        }
+    }
+}
+
+fn canonical_probe_result(
+    external_probe: &ReportedExternalProbe,
+    now: u64,
+    freshness_ms: u64,
+) -> crate::domain::ExternalProbeResult {
+    let reported_status = match external_probe.status.as_str() {
+        "healthy" => Some(ExternalProbeStatus::Healthy),
+        "degraded" => Some(ExternalProbeStatus::Degraded),
+        "unavailable" => Some(ExternalProbeStatus::Unavailable),
+        _ => None,
+    };
+    let stale = now.abs_diff(external_probe.observed_at_unix_ms) > freshness_ms
+        || external_probe
+            .request_started_at_unix_ms
+            .is_some_and(|started_at| now.abs_diff(started_at) > freshness_ms);
+    let unavailable = stale || reported_status.is_none();
+    crate::domain::ExternalProbeResult {
+        status: if unavailable {
+            ExternalProbeStatus::Unavailable
+        } else {
+            reported_status.unwrap_or_default()
+        },
+        observed_at_unix_ms: Some(external_probe.observed_at_unix_ms),
+        source_public_non_tailscale: (!unavailable)
+            .then_some(external_probe.source_public_non_tailscale)
+            .flatten(),
+        source_matches_claimed_ip: (!unavailable)
+            .then_some(external_probe.source_matches_claimed_ip)
+            .flatten(),
+        tcp_port_reachable: (!unavailable)
+            .then_some(external_probe.tcp_port_reachable)
+            .flatten(),
+        forwarded_port: (!unavailable)
+            .then_some(external_probe.forwarded_port)
+            .flatten(),
+        lease_acquired_at_unix_ms: (!unavailable)
+            .then_some(external_probe.lease_acquired_at_unix_ms)
+            .flatten(),
+        request_started_at_unix_ms: (!unavailable)
+            .then_some(external_probe.request_started_at_unix_ms)
+            .flatten(),
+        reason_code: Some(if stale {
+            "external_probe.unavailable".to_owned()
+        } else if reported_status.is_none() {
+            "external_probe.invalid_response".to_owned()
+        } else {
+            external_probe.reason_code.clone()
+        }),
+        safe_message: Some(if stale {
+            "The external probe evidence is stale; tunnel protection is unchanged".to_owned()
+        } else if reported_status.is_none() {
+            "The external probe returned an invalid status".to_owned()
+        } else {
+            external_probe.safe_message.clone()
+        }),
+    }
+}
+
+async fn observe_external_probes(
+    publisher: &StatePublisher,
+    external_probes: BTreeMap<String, ReportedExternalProbe>,
+    freshness_ms: u64,
+) {
+    let now = crate::runtime::unix_ms();
+    publisher
+        .mutate(|snapshot| {
+            snapshot.external_probes.clear();
+            for lease in snapshot.port_forwards.values_mut() {
+                lease.externally_verified = None;
+                if lease.dnat_installed {
+                    lease.phase = PortForwardPhase::Installed;
+                }
+            }
+            for (usage_id, observation) in &external_probes {
+                snapshot.external_probes.insert(
+                    usage_id.clone(),
+                    canonical_probe_result(observation, now, freshness_ms),
+                );
+                if let Some(lease) = snapshot.port_forwards.get_mut(usage_id) {
+                    apply_verification(lease, observation, now, freshness_ms);
+                }
+            }
+            let primary_identity = (
+                snapshot.port_forward.external_port,
+                snapshot.port_forward.lease_acquired_at_unix_ms,
+            );
+            if let Some((usage_id, lease)) = snapshot.port_forwards.iter().find(|(_, lease)| {
+                (lease.external_port, lease.lease_acquired_at_unix_ms) == primary_identity
+            }) {
+                snapshot.port_forward = lease.clone();
+                if let Some(probe) = snapshot.external_probes.get(usage_id) {
+                    snapshot.external_probe = probe.clone();
+                }
+            }
+        })
+        .await;
+
+    let snapshot = publisher.subscribe().borrow().clone();
+    let verified = snapshot
+        .port_forwards
+        .values()
+        .filter(|lease| lease.externally_verified == Some(true))
+        .count();
+    let failed = snapshot
+        .port_forwards
+        .values()
+        .filter(|lease| lease.externally_verified == Some(false))
+        .count();
+    let total = snapshot.port_forwards.len();
+    publisher
+        .observe(
+            "port_forward.verification",
+            if failed > 0 {
+                CheckStatus::Degraded
+            } else if total > 0 && verified == total {
+                CheckStatus::Healthy
+            } else {
+                CheckStatus::Unknown
+            },
+            Impact::Optional,
+            if failed > 0 {
+                "port_forward.verification_failed"
+            } else if total > 0 && verified == total {
+                "port_forward.externally_verified"
+            } else {
+                "port_forward.verification_unknown"
+            },
+            &format!("{verified} of {total} forwarded ports are reachable from the internet"),
+            None,
+            None,
+        )
+        .await;
 }
 
 async fn observe_external_probe(
@@ -315,22 +480,12 @@ async fn observe_external_probe(
             snapshot.external_probe.reason_code = Some(effective_reason_code.to_owned());
             snapshot.external_probe.safe_message = Some(effective_safe_message.to_owned());
 
-            match correlate_port_verification(snapshot, &external_probe, now, freshness_ms) {
-                PortVerification::Verified => {
-                    snapshot.port_forward.externally_verified = Some(true);
-                    snapshot.port_forward.phase = PortForwardPhase::Verified;
-                }
-                PortVerification::Failed => {
-                    snapshot.port_forward.externally_verified = Some(false);
-                    snapshot.port_forward.phase = PortForwardPhase::VerificationFailed;
-                }
-                PortVerification::Unknown => {
-                    snapshot.port_forward.externally_verified = None;
-                    if snapshot.port_forward.dnat_installed {
-                        snapshot.port_forward.phase = PortForwardPhase::Installed;
-                    }
-                }
-            }
+            apply_verification(
+                &mut snapshot.port_forward,
+                &external_probe,
+                now,
+                freshness_ms,
+            );
             let primary = snapshot.port_forward.clone();
             if let Some((_, status)) = snapshot.port_forwards.iter_mut().find(|(_, status)| {
                 (status.external_port, status.lease_acquired_at_unix_ms) == primary_identity
@@ -471,6 +626,31 @@ mod tests {
         })
     }
 
+    fn publisher_with_two_leases() -> StatePublisher {
+        let primary = PortForwardStatus {
+            phase: PortForwardPhase::Installed,
+            external_port: Some(PORT),
+            lease_acquired_at_unix_ms: Some(LEASE_ACQUIRED_AT),
+            dnat_installed: true,
+            ..PortForwardStatus::default()
+        };
+        let secondary = PortForwardStatus {
+            phase: PortForwardPhase::Installed,
+            external_port: Some(PORT + 1),
+            lease_acquired_at_unix_ms: Some(LEASE_ACQUIRED_AT + 1),
+            dnat_installed: true,
+            ..PortForwardStatus::default()
+        };
+        StatePublisher::new(CanonicalSnapshot {
+            port_forward: primary.clone(),
+            port_forwards: BTreeMap::from([
+                ("primary".to_owned(), primary),
+                ("indexarr".to_owned(), secondary),
+            ]),
+            ..CanonicalSnapshot::default()
+        })
+    }
+
     fn reported_result(
         status: &str,
         reachable: Option<bool>,
@@ -516,6 +696,74 @@ mod tests {
         assert_eq!(
             snapshot.checks["port_forward.verification"].impact,
             Impact::Optional
+        );
+    }
+
+    #[tokio::test]
+    async fn per_lease_results_verify_all_matching_forwarded_ports() {
+        let publisher = publisher_with_two_leases();
+        let primary = reported_result("healthy", Some(true), "external_probe.healthy");
+        let mut indexarr = reported_result("healthy", Some(true), "external_probe.healthy");
+        indexarr.forwarded_port = Some(PORT + 1);
+        indexarr.lease_acquired_at_unix_ms = Some(LEASE_ACQUIRED_AT + 1);
+
+        observe_external_probes(
+            &publisher,
+            BTreeMap::from([
+                ("primary".to_owned(), primary),
+                ("indexarr".to_owned(), indexarr),
+            ]),
+            FRESHNESS_MS,
+        )
+        .await;
+
+        let snapshot = publisher.subscribe().borrow().clone();
+        assert_eq!(
+            snapshot.port_forwards["primary"].phase,
+            PortForwardPhase::Verified
+        );
+        assert_eq!(
+            snapshot.port_forwards["indexarr"].phase,
+            PortForwardPhase::Verified
+        );
+        assert_eq!(snapshot.port_forward.phase, PortForwardPhase::Verified);
+        assert_eq!(snapshot.external_probes.len(), 2);
+        assert_eq!(
+            snapshot.checks["port_forward.verification"].status,
+            CheckStatus::Healthy
+        );
+        assert_eq!(
+            snapshot.checks["port_forward.verification"].safe_message,
+            "2 of 2 forwarded ports are reachable from the internet"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_per_lease_evidence_clears_only_that_lease_verification() {
+        let publisher = publisher_with_two_leases();
+        observe_external_probes(
+            &publisher,
+            BTreeMap::from([(
+                "primary".to_owned(),
+                reported_result("healthy", Some(true), "external_probe.healthy"),
+            )]),
+            FRESHNESS_MS,
+        )
+        .await;
+
+        let snapshot = publisher.subscribe().borrow().clone();
+        assert_eq!(
+            snapshot.port_forwards["primary"].externally_verified,
+            Some(true)
+        );
+        assert_eq!(snapshot.port_forwards["indexarr"].externally_verified, None);
+        assert_eq!(
+            snapshot.port_forwards["indexarr"].phase,
+            PortForwardPhase::Installed
+        );
+        assert_eq!(
+            snapshot.checks["port_forward.verification"].status,
+            CheckStatus::Unknown
         );
     }
 
