@@ -53,8 +53,8 @@ pub fn render_gateway_firewall(
     let tunnel = &config.wireguard.interface;
     let dnat = port_forwards
         .iter()
-        .map(|(public_port, target, target_port)| format!(
-            "    iifname \"{tunnel}\" tcp dport {public_port} dnat ip to {target}:{target_port}\n    iifname \"{tunnel}\" udp dport {public_port} dnat ip to {target}:{target_port}\n"
+        .map(|(tunnel_port, target, target_port)| format!(
+            "    iifname \"{tunnel}\" tcp dport {tunnel_port} dnat ip to {target}:{target_port}\n    iifname \"{tunnel}\" udp dport {tunnel_port} dnat ip to {target}:{target_port}\n"
         ))
         .collect::<String>();
     let counter_objects = client_counters

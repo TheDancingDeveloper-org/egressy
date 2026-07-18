@@ -1457,6 +1457,10 @@ fn dnat_install_required(
     active_forward != Some(desired) || !applied
 }
 
+fn tunnel_dnat(mapping: natpmp::Mapping, target: &DnatTarget) -> (u16, Ipv4Addr, u16) {
+    (mapping.internal_port, target.address, target.port)
+}
+
 #[derive(Clone, Debug)]
 struct LeaseSlot {
     target_name: String,
@@ -1554,12 +1558,16 @@ async fn maintain_port_forward(
                     let slot = leases
                         .get_mut(&usage_id)
                         .expect("lease target still exists");
-                    let desired_forward =
-                        (mapping.external_port, slot.target.address, slot.target.port);
+                    // The provider's NAT-PMP gateway translates the public
+                    // external port to our requested internal lease key before
+                    // the packet arrives on wg0. Match that tunnel-side port;
+                    // the public external port remains the advertised status.
+                    let desired_forward = tunnel_dnat(mapping, &slot.target);
                     let port_changed = slot
                         .assigned_external
                         .is_some_and(|port| port != mapping.external_port);
-                    let mapping_changed = slot.active_forward != Some(desired_forward);
+                    let mapping_changed =
+                        slot.active_forward != Some(desired_forward) || port_changed;
                     let mapping_applied = enforcement
                         .dnat_is_applied(&usage_id, desired_forward)
                         .await;
@@ -2315,6 +2323,24 @@ mod tests {
         let mapping = (45_678, "172.30.0.10".parse().unwrap(), 6881);
         assert!(dnat_install_required(Some(mapping), mapping, false));
         assert!(!dnat_install_required(Some(mapping), mapping, true));
+    }
+
+    #[test]
+    fn inbound_dnat_matches_provider_translated_internal_lease_port() {
+        let target = DnatTarget {
+            container_id: "indexarr".to_owned(),
+            address: "172.30.0.11".parse().unwrap(),
+            port: 6882,
+        };
+        let mapping = crate::natpmp::Mapping {
+            internal_port: 6882,
+            external_port: 39_021,
+            lifetime_seconds: 60,
+        };
+        assert_eq!(
+            tunnel_dnat(mapping, &target),
+            (6882, "172.30.0.11".parse().unwrap(), 6882)
+        );
     }
 
     #[test]
