@@ -1657,6 +1657,7 @@ fn notify_port_change(sender: &watch::Sender<u64>) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PortForwardTargetInput {
     container_id: String,
+    usage_id: String,
     address: Ipv4Addr,
     target_port: Option<u16>,
     compliant: bool,
@@ -1671,6 +1672,7 @@ fn port_forward_target_inputs(
         .filter(|client| client.port_forward_target)
         .map(|client| PortForwardTargetInput {
             container_id: client.container_id.clone(),
+            usage_id: client.usage_id.clone(),
             address: client.ipv4_address,
             target_port: client.target_port,
             compliant: client.compliant,
