@@ -256,21 +256,6 @@ export function App() {
                 : <><div className="big dim">inactive</div><p className="sub">No recovery cycle running.</p></>}
             </div>
           </div>
-          <div className="tbl" style={{ marginTop: 12 }}>
-            <table>
-              <thead><tr><th>App identity</th><th>Internet test</th><th>App</th><th>App port</th><th>Public port</th><th>Incoming rule</th></tr></thead>
-              <tbody>
-                {forwards.length === 0 && <tr><td colSpan={6} className="empty">No forwarding leases observed</td></tr>}
-                {forwards.map(([usageId, lease]) => <tr key={usageId}>
-                  <td className="mono">{usageId}</td><td>{triState(lease.externally_verified, 'reachable', 'not reachable')}</td>
-                  <td>{lease.requested_target ?? 'none'}</td><td className="mono">{lease.internal_port ?? '—'}</td>
-                  <td className="mono">{lease.external_port ?? '—'}</td>
-                  <td><span className={`pill ${lease.dnat_installed ? 'ok' : 'mut'}`}>{lease.dnat_installed ? 'ready' : 'not ready'}</span></td>
-                </tr>)}
-              </tbody>
-            </table>
-          </div>
-
           <div className="card chart-card">
             <div className="chart-head">
               <h3 style={{ margin: 0 }}>Throughput · WireGuard</h3>
@@ -370,6 +355,20 @@ export function App() {
           </div>
           <div className="notice"><InfoGlyph />
             “Reachable” means an independent server connected to that app’s current public port. A failed test is reported but never weakens VPN protection.</div>
+          <div className="tbl" style={{ marginTop: 12 }}>
+            <table>
+              <thead><tr><th>App identity</th><th>Internet test</th><th>App</th><th>App port</th><th>Public port</th><th>Incoming rule</th></tr></thead>
+              <tbody>
+                {forwards.length === 0 && <tr><td colSpan={6} className="empty">No forwarding leases observed</td></tr>}
+                {forwards.map(([usageId, lease]) => <tr key={usageId}>
+                  <td className="mono">{usageId}</td><td>{triState(lease.externally_verified, 'reachable', 'not reachable')}</td>
+                  <td>{lease.requested_target ?? 'none'}</td><td className="mono">{lease.internal_port ?? '—'}</td>
+                  <td className="mono">{lease.external_port ?? '—'}</td>
+                  <td><span className={`pill ${lease.dnat_installed ? 'ok' : 'mut'}`}>{lease.dnat_installed ? 'ready' : 'not ready'}</span></td>
+                </tr>)}
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <section className={view === 'server' ? 'view on' : 'view'} aria-labelledby="h-server">

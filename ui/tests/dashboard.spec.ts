@@ -7,6 +7,10 @@ const snapshot = {
   },
   traffic: { download_bytes_per_second: 1024, upload_bytes_per_second: 512, downloaded_bytes: 0, uploaded_bytes: 0 },
   port_forward: { phase: 'verified', dnat_installed: true, externally_verified: true },
+  port_forwards: {
+    'personal-arr/qbittorrent': { phase: 'verified', requested_target: 'qbittorrent', internal_port: 6881, external_port: 36448, dnat_installed: true, externally_verified: true },
+    'prod-indexarr/indexarr': { phase: 'verified', requested_target: 'indexarr', internal_port: 6882, external_port: 39021, dnat_installed: true, externally_verified: true },
+  },
   recovery: { active: true, attempt: 2, next_attempt_at_unix_ms: Date.now() + 5000 },
   external_probe: { status: 'healthy', source_public_non_tailscale: true, tcp_port_reachable: true, safe_message: 'Public HTTPS path succeeded and the source was public and non-Tailscale.' },
   topology: { network: 'vpn-egress', subnet: '172.30.0.0/24', gateway_address: '172.30.0.2', host_bridge: 'br-vpn-egress', policy_table: 200, client_ipv6_supported: false, default_route_verifiable: false, client_isolation: 'shared_bridge_not_enforced' }
@@ -23,6 +27,8 @@ test('renders protected-but-unavailable and operational diagnostics', async ({ p
   await page.getByRole('link', { name: 'Port forwarding' }).click()
   await expect(page.getByRole('heading', { name: 'Primary forwarded port' }).locator('..')).toContainText('reachable')
   await expect(page.getByRole('heading', { name: 'Reachable from the internet' }).locator('..')).toContainText('yes')
+  await expect(page.getByRole('region', { name: 'Port forwarding' })).toContainText('prod-indexarr/indexarr')
+  await expect(page.getByRole('region', { name: 'Port forwarding' })).toContainText('39021')
 
   await page.getByRole('link', { name: 'Clients' }).click()
   await expect(page.getByText(/cannot prove the route inside/)).toBeVisible()
