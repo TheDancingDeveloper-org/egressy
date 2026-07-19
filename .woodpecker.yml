@@ -4,6 +4,8 @@ when:
   - event: pull_request
   - event: manual
 
+platform: linux/amd64
+
 steps:
   - name: ui
     image: mcr.microsoft.com/playwright:v1.61.1-noble
