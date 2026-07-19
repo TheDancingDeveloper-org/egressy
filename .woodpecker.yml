@@ -4,7 +4,8 @@ when:
   - event: pull_request
   - event: manual
 
-platform: linux/amd64
+labels:
+  platform: linux/amd64
 
 steps:
   - name: ui
