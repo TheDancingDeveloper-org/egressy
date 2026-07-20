@@ -69,7 +69,7 @@ tunnels, and hostile multi-tenant isolation are not currently supported.
 ### 1. Clone and configure
 
 ```sh
-git clone https://github.com/AusAgentSmith-org/egressy.git
+git clone https://github.com/TheDancingDeveloper-org/egressy.git
 cd egressy
 cp config/config.example.yaml config/config.yaml
 ```
