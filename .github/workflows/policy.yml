@@ -17,4 +17,4 @@ jobs:
           fetch-depth: 0
       - name: Verify migration policies
         shell: bash
-        run: ci/migration-policy.sh
+        run: bash ci/migration-policy.sh

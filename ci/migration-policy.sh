@@ -37,7 +37,7 @@ if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
     commits="$(git rev-list --reverse HEAD~1..HEAD 2>/dev/null || git rev-list --reverse HEAD)"
   fi
 elif [[ -n "${GITHUB_EVENT_NAME:-}" && "${GITHUB_EVENT_NAME}" == push && "${GITHUB_BEFORE:-}" != 0000000000000000000000000000000000000000 ]]; then
-  commits="$(git rev-list --reverse "${GITHUB_BEFORE}..HEAD" 2>/dev/null || git rev-list --reverse HEAD~1..HEAD 2>/dev/null || git rev-list --reverse HEAD)"
+  commits="$(git rev-list --reverse "${GITHUB_BEFORE:-}..HEAD" 2>/dev/null || git rev-list --reverse HEAD~1..HEAD 2>/dev/null || git rev-list --reverse HEAD)"
 else
   commits="$(git rev-list --reverse HEAD~1..HEAD 2>/dev/null || git rev-list --reverse HEAD)"
 fi

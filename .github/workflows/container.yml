@@ -50,12 +50,12 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.gateway.outputs.tags }}
           labels: ${{ steps.gateway.outputs.labels }}
-          cache-from: type=gha,scope=gateway
-          cache-to: type=gha,mode=max,scope=gateway
+          cache-from: ${{ github.event_name != 'pull_request' && 'type=gha,scope=gateway' || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=gateway' || '' }}
       - name: External validator image metadata
         id: validator
         uses: docker/metadata-action@v6
@@ -70,9 +70,9 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: external-probe
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.validator.outputs.tags }}
           labels: ${{ steps.validator.outputs.labels }}
-          cache-from: type=gha,scope=external-probe
-          cache-to: type=gha,mode=max,scope=external-probe
+          cache-from: ${{ github.event_name != 'pull_request' && 'type=gha,scope=external-probe' || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=external-probe' || '' }}
