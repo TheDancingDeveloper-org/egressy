@@ -54,8 +54,9 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.gateway.outputs.tags }}
           labels: ${{ steps.gateway.outputs.labels }}
-          cache-from: ${{ github.event_name != 'pull_request' && 'type=gha,scope=gateway' || '' }}
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=gateway' || '' }}
+          # GHA cache export is disabled: the self-hosted BuildKit path can wedge during cache finalization.
+          cache-from: ''
+          cache-to: ''
       - name: External validator image metadata
         id: validator
         uses: docker/metadata-action@v6
@@ -74,5 +75,5 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.validator.outputs.tags }}
           labels: ${{ steps.validator.outputs.labels }}
-          cache-from: ${{ github.event_name != 'pull_request' && 'type=gha,scope=external-probe' || '' }}
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=external-probe' || '' }}
+          cache-from: ''
+          cache-to: ''
