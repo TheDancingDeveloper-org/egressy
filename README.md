@@ -93,7 +93,7 @@ networks before running it.
 Build the image, validate configuration, and inspect the generated host script:
 
 ```sh
-docker build -t egressy:local -t ghcr.io/ausagentsmith-org/egressy:0.1.0 .
+docker build -t egressy:local -t ghcr.io/thedancingdeveloper-org/egressy:0.1.0 .
 docker run --rm \
   -v "$PWD/config/config.yaml:/etc/egressy/config.yaml:ro" \
   egressy:local check
@@ -223,10 +223,9 @@ external validator for that advisory check.
 ## Images and supported architectures
 
 The Dockerfile builds all three Rust binaries. The included GitHub workflow
-publishes multi-platform `linux/amd64` and `linux/arm64` images to GHCR. The
-generic Woodpecker pipeline supports the same platforms when its registry
-variables and secrets are configured. See [installation](docs/INSTALLATION.md)
-for image tags, source builds, upgrades, and rollback.
+publishes multi-platform `linux/amd64` and `linux/arm64` images to GHCR. See
+[installation](docs/INSTALLATION.md) for image tags, source builds, upgrades,
+and rollback.
 
 ## Dashboard demo
 
