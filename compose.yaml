@@ -74,6 +74,10 @@ services:
       EGRESSY_PROBE_IDENTITY_MATCHER_FIELDS: asn_org,as_name,org
       EGRESSY_PROBE_IDENTITY_MATCHER_VALUE: Datacamp
     labels:
+      # The probe validates the enrolled path, so it has to be on it. Without
+      # this it egresses by the host's default route and its claimed-IP check
+      # is meaningless -- it reads the same whether or not clients are leaking.
+      egressy.enabled: "true"
       egressy.isolation-id: egressy-probe
       egressy.isolation-allow: gateway:53/udp,gateway:53/tcp,gateway:8080/tcp
     dns:

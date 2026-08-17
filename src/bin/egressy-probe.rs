@@ -28,6 +28,11 @@ struct ProbeStatus {
     duration_ms: u64,
     reason_code: String,
     safe_message: String,
+    /// The probe's *own* public address, as reported by the identity endpoint.
+    /// Used to tell "the clients are leaking" apart from "this probe is not on
+    /// the enrolled path", which produce an identical claimed-IP mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_public_ip: Option<Ipv4Addr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     external_probe: Option<ExternalProbeStatus>,
     #[serde(default)]
@@ -287,11 +292,15 @@ async fn observe_identity(
     matcher: &IdentityMatcher,
 ) {
     let started = Instant::now();
-    let (https_egress_ok, vpn_identity_ok) = check_identity(client, identity_url, matcher).await;
+    let (https_egress_ok, vpn_identity_ok, observed_public_ip) =
+        check_identity(client, identity_url, matcher).await;
     let mut snapshot = result.write().await;
     snapshot.observed_at_unix_ms = unix_ms();
     snapshot.https_egress_ok = https_egress_ok;
     snapshot.vpn_identity_ok = vpn_identity_ok;
+    if observed_public_ip.is_some() {
+        snapshot.observed_public_ip = observed_public_ip;
+    }
     snapshot.expected_identity = expected_identity.to_owned();
     snapshot.duration_ms = started.elapsed().as_millis() as u64;
     update_path_summary(&mut snapshot);
@@ -301,18 +310,18 @@ async fn check_identity(
     client: &reqwest::Client,
     identity_url: &str,
     matcher: &IdentityMatcher,
-) -> (bool, bool) {
+) -> (bool, bool, Option<Ipv4Addr>) {
     let mut response = match client.get(identity_url).send().await {
         Ok(response) => match response.error_for_status() {
             Ok(response) => response,
             Err(error) => {
                 warn!(%error, "probe identity check failed");
-                return (false, false);
+                return (false, false, None);
             }
         },
         Err(error) => {
             warn!(%error, "probe identity check failed");
-            return (false, false);
+            return (false, false, None);
         }
     };
 
@@ -321,7 +330,7 @@ async fn check_identity(
         .is_some_and(|length| length > MAX_IDENTITY_RESPONSE_BYTES as u64)
     {
         warn!("probe identity response exceeded the safe size limit");
-        return (true, false);
+        return (true, false, None);
     }
     let mut body = Vec::new();
     loop {
@@ -331,23 +340,34 @@ async fn check_identity(
             }
             Ok(Some(_)) => {
                 warn!("probe identity response exceeded the safe size limit");
-                return (true, false);
+                return (true, false, None);
             }
             Ok(None) => break,
             Err(error) => {
                 warn!(%error, "probe identity response could not be read");
-                return (true, false);
+                return (true, false, None);
             }
         }
     }
 
+    let observed_public_ip = identity_observed_ip(&body);
     match identity_body_matches(&body, matcher) {
-        Ok(matches) => (true, matches),
+        Ok(matches) => (true, matches, observed_public_ip),
         Err(error) => {
             warn!(%error, "probe identity response could not be interpreted");
-            (true, false)
+            (true, false, observed_public_ip)
         }
     }
+}
+
+/// Pull the probe's own public address out of a JSON identity response.
+///
+/// Absent for plain-text identity endpoints, which is fine: the not-enrolled
+/// reclassification simply does not engage without it.
+fn identity_observed_ip(body: &[u8]) -> Option<Ipv4Addr> {
+    let text = std::str::from_utf8(body).ok()?.trim();
+    let document: serde_json::Value = serde_json::from_str(text).ok()?;
+    document.get("ip")?.as_str()?.parse().ok()
 }
 
 fn identity_body_matches(body: &[u8], matcher: &IdentityMatcher) -> anyhow::Result<bool> {
@@ -479,6 +499,7 @@ async fn run_external_checks(result: SharedResult, config: ExternalProbeConfig) 
             }
         };
 
+        let probe_public_ip = result.read().await.observed_public_ip;
         let claims = match fetch_gateway_port_forwards(&state_client, &config).await {
             Ok(claims) => claims,
             Err(error) => {
@@ -493,6 +514,7 @@ async fn run_external_checks(result: SharedResult, config: ExternalProbeConfig) 
                     config.clone(),
                     usage_id.clone(),
                     *claim,
+                    probe_public_ip,
                 )
             }))
             .await
@@ -515,6 +537,7 @@ async fn probe_external_claim(
     config: ExternalProbeConfig,
     usage_id: String,
     claim: PortForwardClaim,
+    probe_public_ip: Option<Ipv4Addr>,
 ) -> (String, ExternalProbeStatus) {
     let request_started_at_unix_ms = unix_ms();
     let request_id = format!("external-probe-{usage_id}-{request_started_at_unix_ms}");
@@ -563,6 +586,7 @@ async fn probe_external_claim(
             "The external probe is unavailable; tunnel protection is unchanged",
         ),
     };
+    let observed = reclassify_unenrolled_probe(observed, claim.public_ip, probe_public_ip);
     info!(%usage_id, status = observed.status, reason = observed.reason_code, "external probe result");
     (usage_id, observed)
 }
@@ -665,6 +689,35 @@ fn map_external_response(
         request_started_at_unix_ms: Some(request_started_at_unix_ms),
         reason_code: response.reason_code,
         safe_message: response.safe_message,
+    }
+}
+
+/// A claimed-IP mismatch means the address the endpoint saw is not the address
+/// the gateway claims. That is a leak *if the probe is on the enrolled path*.
+/// If the probe's own public address also differs from the claimed address then
+/// the probe is simply not enrolled, and the mismatch says nothing about the
+/// clients — it reads identically on a perfectly healthy tunnel.
+///
+/// Report that as its own reason so the signal keeps a single meaning.
+fn reclassify_unenrolled_probe(
+    observed: ExternalProbeStatus,
+    claimed_public_ip: Option<Ipv4Addr>,
+    probe_public_ip: Option<Ipv4Addr>,
+) -> ExternalProbeStatus {
+    if observed.reason_code != "external_probe.claimed_ip_mismatch" {
+        return observed;
+    }
+    let (Some(claimed), Some(probe)) = (claimed_public_ip, probe_public_ip) else {
+        return observed;
+    };
+    if probe == claimed {
+        return observed;
+    }
+    ExternalProbeStatus {
+        reason_code: "external_probe.probe_not_enrolled".to_owned(),
+        safe_message: "The probe is not on the enrolled path, so it cannot validate client egress"
+            .to_owned(),
+        ..observed
     }
 }
 
@@ -1009,6 +1062,89 @@ mod tests {
             110,
         );
         assert_eq!(status.status, "degraded");
+        assert_eq!(status.reason_code, "external_probe.claimed_ip_mismatch");
+    }
+
+    fn mismatch_status() -> ExternalProbeStatus {
+        map_external_response(
+            ExternalProbeResponse {
+                observed_at_unix_ms: 123,
+                source_public_non_tailscale: true,
+                source_matches_claimed_ip: Some(false),
+                tcp_port_reachable: None,
+                reason_code: "external_probe.claimed_ip_mismatch".to_owned(),
+                safe_message: "The claimed public address did not match the source.".to_owned(),
+            },
+            claim(),
+            110,
+        )
+    }
+
+    #[test]
+    fn identity_response_yields_the_probes_own_public_address() {
+        let body = br#"{"ip":"203.0.113.7","asn_org":"Example","city":"Somewhere"}"#;
+        assert_eq!(
+            identity_observed_ip(body),
+            Some("203.0.113.7".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn identity_response_without_an_address_is_tolerated() {
+        assert_eq!(identity_observed_ip(b"not json"), None);
+        assert_eq!(identity_observed_ip(br#"{"asn_org":"Example"}"#), None);
+    }
+
+    #[test]
+    fn a_mismatch_from_an_unenrolled_probe_is_reported_as_such() {
+        // The probe leaves by a different public address than the gateway
+        // claims, so the mismatch describes the probe, not the clients.
+        let status = reclassify_unenrolled_probe(
+            mismatch_status(),
+            Some("198.51.100.4".parse().unwrap()),
+            Some("203.0.113.7".parse().unwrap()),
+        );
+        assert_eq!(status.reason_code, "external_probe.probe_not_enrolled");
+    }
+
+    #[test]
+    fn a_mismatch_seen_by_an_enrolled_probe_still_reports_a_leak() {
+        // The probe itself egresses on the claimed tunnel address, so the
+        // mismatch is real and must not be explained away.
+        let claimed = "198.51.100.4".parse().unwrap();
+        let status = reclassify_unenrolled_probe(mismatch_status(), Some(claimed), Some(claimed));
+        assert_eq!(status.reason_code, "external_probe.claimed_ip_mismatch");
+    }
+
+    #[test]
+    fn reclassification_leaves_every_other_reason_untouched() {
+        let healthy = map_external_response(
+            ExternalProbeResponse {
+                observed_at_unix_ms: 123,
+                source_public_non_tailscale: true,
+                source_matches_claimed_ip: Some(true),
+                tcp_port_reachable: Some(true),
+                reason_code: "external_probe.healthy".to_owned(),
+                safe_message: "Public HTTPS path succeeded.".to_owned(),
+            },
+            claim(),
+            110,
+        );
+        let status = reclassify_unenrolled_probe(
+            healthy,
+            Some("198.51.100.4".parse().unwrap()),
+            Some("203.0.113.7".parse().unwrap()),
+        );
+        assert_eq!(status.reason_code, "external_probe.healthy");
+    }
+
+    #[test]
+    fn without_a_known_probe_address_the_mismatch_is_left_alone() {
+        let status = reclassify_unenrolled_probe(
+            mismatch_status(),
+            Some("198.51.100.4".parse().unwrap()),
+            None,
+        );
         assert_eq!(status.reason_code, "external_probe.claimed_ip_mismatch");
     }
 

@@ -18,6 +18,19 @@ path. `external-probe/external_probe_service.py` is a dependency-free reference
 service. The gateway ingests only safe summarized state from its local
 companion.
 
+**The probe must itself be enrolled**, with the `egressy.enabled` label — not
+merely pointed at the gateway's resolver. An unenrolled probe leaves by the
+host's default route, so the address the endpoint observes is never the address
+the gateway claims, and every result is a permanent `claimed_ip_mismatch`. That
+is not a harmless false positive: it is byte-identical to the report produced by
+a genuine client-egress leak, so the check cannot distinguish a healthy tunnel
+from a broken one.
+
+The probe now detects this itself. When its own public address — taken from the
+identity endpoint — differs from the gateway's claimed address, a mismatch is
+reported as `external_probe.probe_not_enrolled` instead, which describes the
+probe's own path and makes clear that client egress was not validated.
+
 The feature is disabled by default in YAML, environment defaults, and examples.
 
 ## Request safety
