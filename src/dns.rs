@@ -94,6 +94,11 @@ static UDP_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static UDP_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 static TCP_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static TCP_FALLBACK_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+/// Debounced resolution health as a gauge: 1 healthy, 0 degraded, absent until
+/// the first verdict. Exported so a resolver outage is alertable — the
+/// container healthcheck probes `/livez`, which reports process liveness only
+/// and stays green while every query fails.
+static RESOLUTION_HEALTHY: AtomicU64 = AtomicU64::new(u64::MAX);
 static QUERIES_REFUSED_GLOBAL: AtomicU64 = AtomicU64::new(0);
 static QUERIES_REFUSED_PER_CLIENT: AtomicU64 = AtomicU64::new(0);
 
@@ -278,7 +283,7 @@ egressy_dns_cache_misses_total {}\n\
 # HELP egressy_dns_queries_refused_total Queries refused by admission control, by limit.\n\
 # TYPE egressy_dns_queries_refused_total counter\n\
 egressy_dns_queries_refused_total{{limit=\"global\"}} {}\n\
-egressy_dns_queries_refused_total{{limit=\"per_client\"}} {}\n",
+egressy_dns_queries_refused_total{{limit=\"per_client\"}} {}\n{}",
         UDP_QUERIES.load(Ordering::Relaxed),
         UDP_ATTEMPTS.load(Ordering::Relaxed),
         UDP_TIMEOUTS.load(Ordering::Relaxed),
@@ -290,7 +295,21 @@ egressy_dns_queries_refused_total{{limit=\"per_client\"}} {}\n",
         CACHE_MISSES.load(Ordering::Relaxed),
         QUERIES_REFUSED_GLOBAL.load(Ordering::Relaxed),
         QUERIES_REFUSED_PER_CLIENT.load(Ordering::Relaxed),
+        resolution_health_metric(),
     )
+}
+
+/// Emitted only once a debounced verdict exists, so alerts are not armed by a
+/// gateway that has simply not resolved anything yet.
+fn resolution_health_metric() -> String {
+    match RESOLUTION_HEALTHY.load(Ordering::Relaxed) {
+        u64::MAX => String::new(),
+        value => format!(
+            "# HELP egressy_dns_resolution_healthy Debounced in-tunnel resolution health, 1 healthy 0 degraded.\n\
+# TYPE egressy_dns_resolution_healthy gauge\n\
+egressy_dns_resolution_healthy {value}\n"
+        ),
+    }
 }
 
 pub async fn run(settings: Settings) -> anyhow::Result<()> {
@@ -573,6 +592,7 @@ async fn observe_udp_health(
     let observation = health.lock().await.record(success);
     let Some(status) = observation else { return };
     let healthy = status == DebouncedStatus::Healthy;
+    RESOLUTION_HEALTHY.store(u64::from(healthy), Ordering::Relaxed);
     publisher
         .observe(
             "dns.upstream_udp",
@@ -685,6 +705,22 @@ fn is_truncated(message: &[u8]) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_health_is_absent_until_a_verdict_exists() {
+        // A gateway that has not resolved anything yet must not arm an alert.
+        RESOLUTION_HEALTHY.store(u64::MAX, Ordering::Relaxed);
+        assert!(resolution_health_metric().is_empty());
+    }
+
+    #[test]
+    fn resolution_health_reports_both_verdicts() {
+        RESOLUTION_HEALTHY.store(1, Ordering::Relaxed);
+        assert!(resolution_health_metric().contains("egressy_dns_resolution_healthy 1"));
+        RESOLUTION_HEALTHY.store(0, Ordering::Relaxed);
+        assert!(resolution_health_metric().contains("egressy_dns_resolution_healthy 0"));
+        RESOLUTION_HEALTHY.store(u64::MAX, Ordering::Relaxed);
+    }
 
     fn client(last: u8) -> IpAddr {
         IpAddr::from([172, 30, 0, last])

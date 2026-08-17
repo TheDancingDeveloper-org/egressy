@@ -72,7 +72,15 @@ the constraints that keep it from shadowing public names or leaking internal
 ones. `cache` bounds a response cache that expires entries on the answer's own
 shortest TTL, capped at five minutes, and keys them on the exit resolver so a
 tunnel that moves exit server misses rather than serving what the previous one
-said. `udp_attempts` retries transient UDP loss before falling back to TCP to
+said.
+
+Resolution health is exported as `egressy_dns_resolution_healthy`, and is the
+signal to alert on. The container healthcheck probes `/livez`, which reports
+process liveness only and stays green while every query is failing, so it will
+not tell you a resolver has gone away. `/readyz` reflects critical data-plane
+checks and is the stricter choice if you want the container marked unhealthy.
+
+`udp_attempts` retries transient UDP loss before falling back to TCP to
 the same in-tunnel resolver. `failure_threshold` and `success_threshold`
 provide global check hysteresis while individual failures remain logged.
 Enrolled clients should use only the gateway listener; firewall policy rejects
