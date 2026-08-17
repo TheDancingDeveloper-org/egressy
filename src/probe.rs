@@ -337,6 +337,58 @@ fn canonical_probe_result(
     }
 }
 
+/// Roll the per-usage external probe results up into the single
+/// `external_probe` check.
+///
+/// Every other path that touches that check writes it on each observation, so
+/// it always reflects the latest evidence. The per-usage path did not, which
+/// left the check latched on whatever the last single-result path wrote —
+/// in practice the `external_probe.unavailable` published at startup, before
+/// the probe had reported for the first time. It then never moved again while
+/// the per-usage results underneath it refreshed every interval and reported
+/// healthy.
+///
+/// A degraded usage is a stronger signal than an unavailable one — it means
+/// evidence arrived and was bad, rather than that no evidence arrived — so it
+/// wins when both are present, and the check carries that usage's own reason
+/// so the summary and the detail cannot disagree.
+fn aggregate_external_probe_check(
+    results: &BTreeMap<String, crate::domain::ExternalProbeResult>,
+) -> (CheckStatus, String, String) {
+    let worst = results
+        .values()
+        .filter(|result| !matches!(result.status, ExternalProbeStatus::Healthy))
+        .min_by_key(|result| match result.status {
+            ExternalProbeStatus::Degraded => 0,
+            _ => 1,
+        });
+    match worst {
+        Some(result) => (
+            CheckStatus::Degraded,
+            result
+                .reason_code
+                .clone()
+                .unwrap_or_else(|| "external_probe.unavailable".to_owned()),
+            result.safe_message.clone().unwrap_or_else(|| {
+                "External reachability could not be confirmed for every forwarded port".to_owned()
+            }),
+        ),
+        None if results.is_empty() => (
+            CheckStatus::Degraded,
+            "external_probe.unavailable".to_owned(),
+            "The enrolled-path probe reported no external results".to_owned(),
+        ),
+        None => (
+            CheckStatus::Healthy,
+            "external_probe.healthy".to_owned(),
+            format!(
+                "All {} forwarded-port usages were reachable from a public, non-Tailscale source",
+                results.len()
+            ),
+        ),
+    }
+}
+
 async fn observe_external_probes(
     publisher: &StatePublisher,
     external_probes: BTreeMap<String, ReportedExternalProbe>,
@@ -407,6 +459,20 @@ async fn observe_external_probes(
                 "port_forward.verification_unknown"
             },
             &format!("{verified} of {total} forwarded ports are reachable from the internet"),
+            None,
+            None,
+        )
+        .await;
+
+    let (status, reason_code, safe_message) =
+        aggregate_external_probe_check(&snapshot.external_probes);
+    publisher
+        .observe(
+            "external_probe",
+            status,
+            Impact::Advisory,
+            &reason_code,
+            &safe_message,
             None,
             None,
         )
@@ -736,6 +802,120 @@ mod tests {
             snapshot.checks["port_forward.verification"].safe_message,
             "2 of 2 forwarded ports are reachable from the internet"
         );
+        assert_eq!(
+            snapshot.checks["external_probe"].status,
+            CheckStatus::Healthy
+        );
+        assert_eq!(
+            snapshot.checks["external_probe"].reason_code,
+            "external_probe.healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_lease_results_clear_the_startup_unavailable_external_probe_check() {
+        // Reproduces the latch: the check is published as unavailable before any
+        // evidence arrives, and every subsequent observation takes the per-usage
+        // path. Before the fix the check stayed degraded for the process's whole
+        // lifetime while the results underneath it were healthy.
+        let publisher = publisher_with_two_leases();
+        observe_external_probe_unavailable(
+            &publisher,
+            "external_probe.unavailable",
+            "The enrolled-path probe is unavailable; external reachability is unknown",
+        )
+        .await;
+        assert_eq!(
+            publisher.subscribe().borrow().checks["external_probe"].status,
+            CheckStatus::Degraded
+        );
+
+        let primary = reported_result("healthy", Some(true), "external_probe.healthy");
+        let mut indexarr = reported_result("healthy", Some(true), "external_probe.healthy");
+        indexarr.forwarded_port = Some(PORT + 1);
+        indexarr.lease_acquired_at_unix_ms = Some(LEASE_ACQUIRED_AT + 1);
+        observe_external_probes(
+            &publisher,
+            BTreeMap::from([
+                ("primary".to_owned(), primary),
+                ("indexarr".to_owned(), indexarr),
+            ]),
+            FRESHNESS_MS,
+        )
+        .await;
+
+        let snapshot = publisher.subscribe().borrow().clone();
+        assert_eq!(
+            snapshot.checks["external_probe"].status,
+            CheckStatus::Healthy
+        );
+        assert_eq!(
+            snapshot.checks["external_probe"].reason_code,
+            "external_probe.healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_degraded_usage_degrades_the_external_probe_check_with_its_own_reason() {
+        let publisher = publisher_with_two_leases();
+        let primary = reported_result("healthy", Some(true), "external_probe.healthy");
+        let mut indexarr = reported_result(
+            "degraded",
+            Some(false),
+            "external_probe.claimed_ip_mismatch",
+        );
+        indexarr.forwarded_port = Some(PORT + 1);
+        indexarr.lease_acquired_at_unix_ms = Some(LEASE_ACQUIRED_AT + 1);
+
+        observe_external_probes(
+            &publisher,
+            BTreeMap::from([
+                ("primary".to_owned(), primary),
+                ("indexarr".to_owned(), indexarr),
+            ]),
+            FRESHNESS_MS,
+        )
+        .await;
+
+        let snapshot = publisher.subscribe().borrow().clone();
+        assert_eq!(
+            snapshot.checks["external_probe"].status,
+            CheckStatus::Degraded
+        );
+        assert_eq!(
+            snapshot.checks["external_probe"].reason_code,
+            "external_probe.claimed_ip_mismatch"
+        );
+    }
+
+    #[test]
+    fn a_degraded_usage_outranks_an_unavailable_one_in_the_summary() {
+        let degraded = crate::domain::ExternalProbeResult {
+            status: ExternalProbeStatus::Degraded,
+            reason_code: Some("external_probe.claimed_ip_mismatch".to_owned()),
+            safe_message: Some("Observed address did not match the claim".to_owned()),
+            ..crate::domain::ExternalProbeResult::default()
+        };
+        let unavailable = crate::domain::ExternalProbeResult {
+            status: ExternalProbeStatus::Unavailable,
+            reason_code: Some("external_probe.unavailable".to_owned()),
+            safe_message: Some("No evidence".to_owned()),
+            ..crate::domain::ExternalProbeResult::default()
+        };
+        // "a" sorts first, so picking the degraded one proves severity beat order.
+        let (status, reason, _) = aggregate_external_probe_check(&BTreeMap::from([
+            ("a-unavailable".to_owned(), unavailable),
+            ("b-degraded".to_owned(), degraded),
+        ]));
+        assert_eq!(status, CheckStatus::Degraded);
+        assert_eq!(reason, "external_probe.claimed_ip_mismatch");
+    }
+
+    #[test]
+    fn an_empty_result_set_is_not_reported_as_healthy() {
+        let (status, reason, _) = aggregate_external_probe_check(&BTreeMap::new());
+        assert_eq!(status, CheckStatus::Degraded);
+        assert_eq!(reason, "external_probe.unavailable");
     }
 
     #[tokio::test]
