@@ -160,6 +160,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v2/host-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Desired host-side egress policy the host-network agent keeps installed */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicy"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v2/events": {
         parameters: {
             query?: never;
@@ -1095,6 +1130,15 @@ export interface components {
             minimum_rtt_ms: number | null;
             average_rtt_ms: number | null;
             maximum_rtt_ms: number | null;
+        };
+        HostPolicy: {
+            schema_version: number;
+            generated_at_unix_ms: number;
+            subnet: string;
+            bridge: string;
+            gateway_ip: string;
+            route_table: number;
+            rule_priority: number;
         };
         IsolationPolicy: {
             /** @constant */
