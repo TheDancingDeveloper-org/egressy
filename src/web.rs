@@ -192,6 +192,7 @@ pub fn router(
         .route("/api/v1/status", get(v1_status))
         .route("/api/v2/status", get(v2_status))
         .route("/api/v2/isolation-policy", get(isolation_policy))
+        .route("/api/v2/host-policy", get(host_policy))
         .route("/api/v2/events", get(events))
         .route("/api/v2/auth/login", post(login))
         .route("/api/v2/auth/logout", post(logout))
@@ -571,6 +572,13 @@ async fn isolation_policy(
             .isolation_policy
             .clone(),
     )
+}
+
+/// The host-side policy the host-network agent is expected to keep installed.
+///
+/// Derived from configuration, so it is stable for the lifetime of the process.
+async fn host_policy(State(state): State<WebState>) -> Json<crate::host_policy::HostPolicy> {
+    Json(state.publisher.subscribe().borrow().host_policy.clone())
 }
 
 async fn metrics(State(state): State<WebState>) -> Response {

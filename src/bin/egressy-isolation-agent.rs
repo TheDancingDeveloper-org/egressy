@@ -2,6 +2,10 @@ use std::{collections::BTreeMap, process::Stdio, time::Duration};
 
 use anyhow::{bail, Context};
 use clap::Parser;
+use egressy::host_policy::{
+    detect_drift, HostPolicy, HostPolicyDrift, IpRouteEntry, IpRuleEntry, HOST_POLICY_TABLE,
+    SCHEMA_VERSION as HOST_POLICY_SCHEMA_VERSION,
+};
 use egressy::isolation::{render_bridge_policy, CounterValue, IsolationMode, IsolationPolicy};
 use serde::Deserialize;
 use tokio::{process::Command, signal, time::interval};
@@ -23,6 +27,23 @@ struct Cli {
     interval_seconds: u64,
     #[arg(long, env = "EGRESSY_ISOLATION_STALE_SECONDS", default_value_t = 30)]
     stale_seconds: u64,
+    /// Own the host-side egress policy: the routing rule, its table, and the
+    /// fail-closed nftables chain. Without this nothing re-asserts that state
+    /// after anything rebuilds host netfilter, and enrolled traffic silently
+    /// falls back to the host's default route.
+    #[arg(
+        long,
+        env = "EGRESSY_MANAGE_HOST_POLICY",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    manage_host_policy: bool,
+    #[arg(
+        long,
+        env = "EGRESSY_HOST_POLICY_URL",
+        default_value = "http://127.0.0.1:8080/api/v2/host-policy"
+    )]
+    host_policy_url: String,
 }
 
 #[tokio::main]
@@ -47,6 +68,14 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             _ = ticker.tick() => {
+                if cli.manage_host_policy {
+                    if let Err(error) = reconcile_host_policy(&client, &cli).await {
+                        warn!(
+                            %error,
+                            "host egress policy could not be reconciled; enrolled traffic may not be fail-closed"
+                        );
+                    }
+                }
                 if cli.mode == IsolationMode::Disabled {
                     apply_policy(IsolationMode::Disabled, "").await?;
                     last_policy_fingerprint = Some("Disabled:".to_owned());
@@ -80,6 +109,13 @@ fn validate(cli: &Cli) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(&cli.policy_url).context("invalid isolation policy URL")?;
     if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
         bail!("isolation policy URL must use host-loopback HTTP");
+    }
+    let host_policy_url =
+        reqwest::Url::parse(&cli.host_policy_url).context("invalid host policy URL")?;
+    if host_policy_url.scheme() != "http"
+        || !matches!(host_policy_url.host_str(), Some("127.0.0.1" | "localhost"))
+    {
+        bail!("host policy URL must use host-loopback HTTP");
     }
     if cli.interval_seconds == 0 || cli.stale_seconds < cli.interval_seconds {
         bail!("isolation interval must be non-zero and shorter than its stale threshold");
@@ -203,6 +239,141 @@ fn report_violation_changes(changes: &[ViolationChange]) {
             "bridge isolation observed unauthorized lateral traffic"
         );
     }
+}
+
+/// Compare the host's actual egress policy against the published desired policy
+/// and reinstall whatever is missing.
+///
+/// This is the loop that makes the fail-closed guarantee survive a Docker daemon
+/// restart. The bootstrap script installs the same state once; this owns it.
+async fn reconcile_host_policy(client: &reqwest::Client, cli: &Cli) -> anyhow::Result<()> {
+    let policy = fetch_host_policy(client, cli).await?;
+    let rules = read_ip_rules().await?;
+    let routes = read_ip_routes(policy.route_table).await?;
+    let drift = detect_drift(&rules, &routes, host_table_exists().await?, &policy);
+    if drift.is_clean() {
+        return Ok(());
+    }
+    warn!(
+        missing = ?drift.missing(),
+        "host egress policy is not installed; enrolled traffic is not fail-closed, reinstalling"
+    );
+    apply_host_policy(&policy, &drift).await?;
+    info!(restored = ?drift.missing(), "host egress policy reinstalled");
+    Ok(())
+}
+
+/// The published policy is derived from gateway configuration and does not
+/// change while the gateway runs, so unlike the isolation policy it carries no
+/// freshness requirement — only a schema and a sanity check.
+async fn fetch_host_policy(client: &reqwest::Client, cli: &Cli) -> anyhow::Result<HostPolicy> {
+    let response = client
+        .get(&cli.host_policy_url)
+        .send()
+        .await?
+        .error_for_status()?;
+    const MAX_POLICY_BYTES: u64 = 65_536;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_POLICY_BYTES)
+    {
+        bail!("host policy response is too large");
+    }
+    let body = response.bytes().await?;
+    if body.len() as u64 > MAX_POLICY_BYTES {
+        bail!("host policy response is too large");
+    }
+    let policy: HostPolicy = serde_json::from_slice(&body)?;
+    if policy.schema_version != HOST_POLICY_SCHEMA_VERSION {
+        bail!("unsupported host policy schema");
+    }
+    policy
+        .subnet
+        .parse::<ipnet::Ipv4Net>()
+        .context("invalid host policy subnet")?;
+    policy
+        .gateway_ip
+        .parse::<std::net::Ipv4Addr>()
+        .context("invalid host policy gateway address")?;
+    if policy.bridge.is_empty() || policy.route_table == 0 {
+        bail!("host policy is missing its bridge or route table");
+    }
+    Ok(policy)
+}
+
+async fn apply_host_policy(policy: &HostPolicy, drift: &HostPolicyDrift) -> anyhow::Result<()> {
+    if drift.rule_missing {
+        // Clear any partial duplicate before adding, mirroring the bootstrap
+        // script. A failure here just means there was nothing to remove.
+        let _ = run_ip(&[
+            "rule".to_owned(),
+            "del".to_owned(),
+            "priority".to_owned(),
+            policy.rule_priority.to_string(),
+            "from".to_owned(),
+            policy.subnet.clone(),
+            "lookup".to_owned(),
+            policy.route_table.to_string(),
+        ])
+        .await;
+        run_ip(&policy.rule_add_args()).await?;
+    }
+    if drift.subnet_route_missing || drift.default_route_missing {
+        for args in policy.route_replace_args() {
+            run_ip(&args).await?;
+        }
+    }
+    if drift.nft_table_missing {
+        run_nft(&policy.render_nft()).await?;
+    }
+    Ok(())
+}
+
+async fn read_ip_rules() -> anyhow::Result<Vec<IpRuleEntry>> {
+    let output = Command::new("ip")
+        .args(["-j", "rule", "show"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!("ip -j rule show failed");
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// An absent routing table is reported by `ip` as an error, and is exactly the
+/// state we are looking for, so it is read as "no routes" rather than a fault.
+async fn read_ip_routes(table: u32) -> anyhow::Result<Vec<IpRouteEntry>> {
+    let output = Command::new("ip")
+        .args(["-j", "route", "show", "table", &table.to_string()])
+        .output()
+        .await?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+async fn host_table_exists() -> anyhow::Result<bool> {
+    Ok(Command::new("nft")
+        .args(["list", "table", "inet", HOST_POLICY_TABLE])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?
+        .success())
+}
+
+async fn run_ip(args: &[String]) -> anyhow::Result<()> {
+    let output = Command::new("ip")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!("ip {} failed", args.join(" "));
+    }
+    Ok(())
 }
 
 async fn apply_policy(mode: IsolationMode, rules: &str) -> anyhow::Result<()> {
@@ -331,15 +502,38 @@ mod tests {
         )
     }
 
+    fn cli() -> Cli {
+        Cli {
+            policy_url: "http://127.0.0.1:8080/api/v2/isolation-policy".into(),
+            mode: IsolationMode::Audit,
+            interval_seconds: 5,
+            stale_seconds: 30,
+            manage_host_policy: true,
+            host_policy_url: "http://127.0.0.1:8080/api/v2/host-policy".into(),
+        }
+    }
+
     #[test]
     fn rejects_non_loopback_policy_url() {
         assert!(validate(&Cli {
             policy_url: "http://egressy:8080/api/v2/isolation-policy".into(),
-            mode: IsolationMode::Audit,
-            interval_seconds: 5,
-            stale_seconds: 30,
+            ..cli()
         })
         .is_err());
+    }
+
+    #[test]
+    fn rejects_non_loopback_host_policy_url() {
+        assert!(validate(&Cli {
+            host_policy_url: "http://egressy:8080/api/v2/host-policy".into(),
+            ..cli()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_loopback_urls_for_both_policies() {
+        assert!(validate(&cli()).is_ok());
     }
 
     #[test]

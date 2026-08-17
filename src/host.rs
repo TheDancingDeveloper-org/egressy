@@ -1,6 +1,23 @@
 use std::net::Ipv4Addr;
 
+use egressy::host_policy::HostPolicy;
+
 use crate::config::Config;
+
+/// The desired host-side policy for this configuration.
+///
+/// `generated_at_unix_ms` is supplied by the caller so the rendered script and
+/// the published policy document stay byte-identical for the same config.
+pub fn host_policy(config: &Config, generated_at_unix_ms: u64) -> HostPolicy {
+    let network = &config.network;
+    HostPolicy::new(
+        generated_at_unix_ms,
+        network.subnet.to_string(),
+        network.host_bridge.clone(),
+        network.gateway_ip.to_string(),
+        network.route_table,
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientCounterRule {
@@ -13,34 +30,38 @@ pub struct ClientCounterRule {
 }
 
 pub fn render_host_setup(config: &Config) -> String {
-    let network = &config.network;
+    let policy = host_policy(config, 0);
+    let rule = policy.rule_add_args().join(" ");
+    let routes = policy
+        .route_replace_args()
+        .iter()
+        .map(|args| format!("ip {}\n", args.join(" ")))
+        .collect::<String>();
     format!(
         r#"#!/bin/sh
 set -eu
 
 # Run on the Docker host after creating the vpn-egress network with the
 # deterministic bridge name shown in config/docker-network.sh.
+#
+# This script is a bootstrap, not the owner of this state. The host-network
+# agent reconciles the same policy continuously, so anything that clears it --
+# a Docker daemon restart, for instance -- is repaired without rerunning this.
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 ip rule del from {subnet} lookup {table} 2>/dev/null || true
-ip rule add priority 100 from {subnet} lookup {table}
-ip route replace table {table} {subnet} dev {bridge} scope link
-ip route replace table {table} default via {gateway} dev {bridge} onlink
-
-nft delete table inet egressy_host 2>/dev/null || true
+ip {rule}
+{routes}
+nft delete table inet {nft_table} 2>/dev/null || true
 nft -f - <<'NFT'
-table inet egressy_host {{
-  chain forward {{
-    type filter hook forward priority -5; policy accept;
-    ip saddr {subnet} oifname != "{bridge}" counter reject with icmp type admin-prohibited
-  }}
-}}
-NFT
+{nft}NFT
 "#,
-        subnet = network.subnet,
-        table = network.route_table,
-        bridge = network.host_bridge,
-        gateway = network.gateway_ip,
+        subnet = policy.subnet,
+        table = policy.route_table,
+        rule = rule,
+        routes = routes,
+        nft_table = egressy::host_policy::HOST_POLICY_TABLE,
+        nft = policy.render_nft(),
     )
 }
 

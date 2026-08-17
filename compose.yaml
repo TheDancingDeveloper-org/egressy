@@ -105,6 +105,11 @@ services:
       EGRESSY_ISOLATION_MODE: "${EGRESSY_ISOLATION_MODE:-disabled}"
       EGRESSY_ISOLATION_INTERVAL_SECONDS: "5"
       EGRESSY_ISOLATION_STALE_SECONDS: "30"
+      # The agent owns the host-side fail-closed policy. Without this nothing
+      # re-asserts it after a Docker daemon restart and enrolled traffic
+      # silently falls back to the host's default route.
+      EGRESSY_MANAGE_HOST_POLICY: "${EGRESSY_MANAGE_HOST_POLICY:-true}"
+      EGRESSY_HOST_POLICY_URL: http://127.0.0.1:8080/api/v2/host-policy
     depends_on:
       - egressy
 

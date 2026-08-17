@@ -237,6 +237,7 @@ pub struct CanonicalSnapshot {
     pub external_probes: BTreeMap<String, ExternalProbeResult>,
     pub vpn_server: VpnServerStatus,
     pub isolation_policy: crate::isolation::IsolationPolicy,
+    pub host_policy: crate::host_policy::HostPolicy,
     pub topology: TopologyStatus,
     pub clients: BTreeMap<String, ClientState>,
     pub traffic: TrafficState,

@@ -4,7 +4,8 @@
 
 Egressy is intended to preserve these properties for enrolled IPv4 clients:
 
-1. traffic exits through `wg0` or is rejected;
+1. traffic exits through `wg0` or is rejected, and the host-side policy that
+   enforces this is continuously reconciled rather than installed once;
 2. plain DNS goes only to the gateway forwarder and tunnel resolver;
 3. each provider-forwarded port reaches only its unique compliant target, and
    one lease failure cannot remove a healthy sibling lease;

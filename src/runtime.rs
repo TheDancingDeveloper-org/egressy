@@ -115,6 +115,7 @@ pub async fn run(
             .as_ref()
             .map(crate::vpn_server::configured_status)
             .unwrap_or_default(),
+        host_policy: crate::host::host_policy(&config, unix_ms()),
         ..CanonicalSnapshot::default()
     });
     let history: SharedHistory = Arc::new(RwLock::new(None));

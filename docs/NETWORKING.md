@@ -73,6 +73,20 @@ enrolled traffic that would otherwise use Docker's normal uplink/NAT. If the
 gateway container disappears, the source rule and reject policy prevent silent
 fallback.
 
+That protection only holds while the host policy is actually installed, and it
+is ordinary host state that anything rebuilding netfilter — a Docker daemon
+restart, for instance — will remove. `render-host-setup` installs it, but a
+one-shot cannot maintain it: after the state is cleared, enrolled traffic misses
+the source rule, falls through to the main routing table and leaves by the
+host's default route, with nothing rejecting it.
+
+The host-network agent therefore **owns** this policy rather than assuming it.
+It reads the desired policy from `GET /api/v2/host-policy`, compares it against
+`ip rule`, the policy routing table and the `inet egressy_host` table on every
+interval, and reinstalls whatever is absent. Drift is logged at warn level
+naming exactly which parts were missing. Set `EGRESSY_MANAGE_HOST_POLICY=false`
+to opt out and manage the state yourself.
+
 ### Gateway
 
 The gateway table is installed before WireGuard starts. Its forward chain
