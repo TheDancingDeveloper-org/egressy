@@ -113,7 +113,9 @@ services:
       # re-asserts it after a Docker daemon restart and enrolled traffic
       # silently falls back to the host's default route.
       EGRESSY_MANAGE_HOST_POLICY: "${EGRESSY_MANAGE_HOST_POLICY:-true}"
-      EGRESSY_HOST_POLICY_URL: http://127.0.0.1:8080/api/v2/host-policy
+      # EGRESSY_HOST_POLICY_URL is derived from EGRESSY_ISOLATION_POLICY_URL
+      # above, so publishing the gateway API on another port needs only the one
+      # override. Set it here only if the two are genuinely different.
     depends_on:
       - egressy
 
