@@ -6,6 +6,7 @@ mod domain;
 mod enforcement;
 mod history;
 mod host;
+pub use egressy::host_policy;
 pub use egressy::isolation;
 mod natpmp;
 mod notifications;

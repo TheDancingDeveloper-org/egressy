@@ -32,6 +32,16 @@
         }
       }
     },
+    "/api/v2/host-policy": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Desired host-side egress policy the host-network agent keeps installed",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HostPolicy" } } }
+          }
+        }
+      }
+    },
     "/api/v2/events": {
       "get": {
         "responses": {
@@ -467,6 +477,19 @@
           "minimum_rtt_ms": { "type": ["number", "null"] },
           "average_rtt_ms": { "type": ["number", "null"] },
           "maximum_rtt_ms": { "type": ["number", "null"] }
+        }
+      },
+      "HostPolicy": {
+        "type": "object",
+        "required": ["schema_version", "generated_at_unix_ms", "subnet", "bridge", "gateway_ip", "route_table", "rule_priority"],
+        "properties": {
+          "schema_version": { "type": "integer" },
+          "generated_at_unix_ms": { "type": "integer" },
+          "subnet": { "type": "string" },
+          "bridge": { "type": "string" },
+          "gateway_ip": { "type": "string" },
+          "route_table": { "type": "integer" },
+          "rule_priority": { "type": "integer" }
         }
       },
       "IsolationPolicy": {

@@ -53,7 +53,9 @@ docker network inspect $(docker network ls -q)
 ```
 
 Edit `config/docker-network.sh` and `config/config.yaml` together if you change
-the example values. Run the network helper once with root privileges.
+the example values. Run the network helper once with root privileges. It is a
+bootstrap: from then on the host-network agent reconciles the same policy on
+every interval, so the state is restored automatically if anything clears it.
 
 ## Supply WireGuard safely
 
