@@ -70,7 +70,11 @@ fn default_dns_timeout_ms() -> u64 {
 }
 
 fn default_dns_concurrency() -> usize {
-    128
+    512
+}
+
+fn default_dns_concurrency_per_client() -> usize {
+    64
 }
 
 fn default_dns_udp_attempts() -> u32 {
@@ -270,6 +274,9 @@ pub struct DnsConfig {
     pub upstream: DnsUpstreamConfig,
     pub timeout_ms: u64,
     pub max_concurrent_queries: usize,
+    /// Per-client bound, so one client cannot consume the whole global budget
+    /// and deny service to every other enrolled client.
+    pub max_concurrent_queries_per_client: usize,
     pub udp_attempts: u32,
     pub failure_threshold: u32,
     pub success_threshold: u32,
@@ -313,6 +320,7 @@ impl Default for DnsConfig {
             local_zones: LocalZonesConfig::default(),
             cache: DnsCacheConfig::default(),
             max_concurrent_queries: default_dns_concurrency(),
+            max_concurrent_queries_per_client: default_dns_concurrency_per_client(),
             udp_attempts: default_dns_udp_attempts(),
             failure_threshold: default_dns_failure_threshold(),
             success_threshold: default_dns_success_threshold(),
@@ -605,6 +613,7 @@ impl Config {
         }
         if self.dns.timeout_ms == 0
             || self.dns.max_concurrent_queries == 0
+            || self.dns.max_concurrent_queries_per_client == 0
             || self.dns.udp_attempts == 0
             || self.dns.failure_threshold == 0
             || self.dns.success_threshold == 0
