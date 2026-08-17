@@ -273,6 +273,16 @@ pub struct DnsConfig {
     pub udp_attempts: u32,
     pub failure_threshold: u32,
     pub success_threshold: u32,
+    pub local_zones: LocalZonesConfig,
+}
+
+/// Answering enrolled-bridge container names from Docker discovery instead of
+/// forwarding them to the provider resolver. Off by default: it changes what
+/// the forwarder answers, so it is opt-in.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalZonesConfig {
+    pub enabled: bool,
 }
 
 impl Default for DnsConfig {
@@ -282,6 +292,7 @@ impl Default for DnsConfig {
             listen: default_dns_listen(),
             upstream: DnsUpstreamConfig::default(),
             timeout_ms: default_dns_timeout_ms(),
+            local_zones: LocalZonesConfig::default(),
             max_concurrent_queries: default_dns_concurrency(),
             udp_attempts: default_dns_udp_attempts(),
             failure_threshold: default_dns_failure_threshold(),

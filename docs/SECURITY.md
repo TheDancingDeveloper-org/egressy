@@ -6,7 +6,10 @@ Egressy is intended to preserve these properties for enrolled IPv4 clients:
 
 1. traffic exits through `wg0` or is rejected, and the host-side policy that
    enforces this is continuously reconciled rather than installed once;
-2. plain DNS goes only to the gateway forwarder and tunnel resolver;
+2. plain DNS goes only to the gateway forwarder, and from there only to the
+   tunnel resolver — except for enrolled-bridge container names under
+   `dns.local_zones`, which are answered locally and deliberately never
+   forwarded at all;
 3. each provider-forwarded port reaches only its unique compliant target, and
    one lease failure cannot remove a healthy sibling lease;
 4. provider keys and application secrets do not enter API responses or normal

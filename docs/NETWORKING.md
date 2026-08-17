@@ -64,6 +64,26 @@ truncated UDP answer over TCP. Gateway firewall policy rejects enrolled plain
 DNS sent to other destinations. Encrypted DNS inside arbitrary HTTPS traffic is
 not intercepted.
 
+### Local zones
+
+With `dns.local_zones.enabled`, single-label names matching a running container
+on the enrolled bridge are answered from Docker discovery rather than forwarded.
+Without it, enrolled clients can resolve public names only, which makes Egressy
+unusable for any stack whose containers address each other by service name.
+
+Three properties make this safe:
+
+- **Single-label only.** A container named `api` cannot shadow
+  `api.example.com`; anything with a dot is forwarded untouched.
+- **Bridge addresses only.** Answers come from discovery and are always
+  addresses on the enrolled bridge, so this cannot point a client elsewhere.
+- **Nothing leaks.** A name we own is never forwarded. `AAAA` and other types
+  for a known name are answered `NOERROR` with no records rather than sent
+  upstream, so the provider resolver never learns internal names exist.
+
+Answers are served before admission control, since they need no upstream
+capacity, and carry a short TTL because they track container lifecycle.
+
 ## Fail-closed layers
 
 ### Host

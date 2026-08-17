@@ -34,7 +34,27 @@ pub struct Settings {
     pub udp_attempts: u32,
     pub failure_threshold: u32,
     pub success_threshold: u32,
+    pub local_zones_enabled: bool,
+    /// Enrolled-bridge container names, refreshed by Docker discovery.
+    pub local_names: watch::Receiver<Arc<std::collections::BTreeMap<String, std::net::Ipv4Addr>>>,
     pub publisher: Option<StatePublisher>,
+}
+
+static LOCAL_ANSWERS: AtomicU64 = AtomicU64::new(0);
+
+/// Answer from the enrolled-bridge name map, if this query is one we own.
+///
+/// Deliberately attempted before admission control: these answers need no
+/// upstream capacity, so internal name resolution keeps working even while the
+/// forwarder is saturated.
+fn local_answer(settings: &Settings, query: &[u8]) -> Option<Vec<u8>> {
+    if !settings.local_zones_enabled {
+        return None;
+    }
+    let names = Arc::clone(&settings.local_names.borrow());
+    let response = crate::local_zone::answer(query, &names)?;
+    LOCAL_ANSWERS.fetch_add(1, Ordering::Relaxed);
+    Some(response)
 }
 
 static UDP_QUERIES: AtomicU64 = AtomicU64::new(0);
@@ -132,13 +152,17 @@ egressy_dns_upstream_udp_exhausted_total {}\n\
 egressy_dns_upstream_tcp_fallbacks_total {}\n\
 # HELP egressy_dns_upstream_tcp_fallback_successes_total Successful TCP fallbacks.\n\
 # TYPE egressy_dns_upstream_tcp_fallback_successes_total counter\n\
-egressy_dns_upstream_tcp_fallback_successes_total {}\n",
+egressy_dns_upstream_tcp_fallback_successes_total {}\n\
+# HELP egressy_dns_local_answers_total Queries answered from enrolled-bridge names without forwarding.\n\
+# TYPE egressy_dns_local_answers_total counter\n\
+egressy_dns_local_answers_total {}\n",
         UDP_QUERIES.load(Ordering::Relaxed),
         UDP_ATTEMPTS.load(Ordering::Relaxed),
         UDP_TIMEOUTS.load(Ordering::Relaxed),
         UDP_EXHAUSTED.load(Ordering::Relaxed),
         TCP_FALLBACKS.load(Ordering::Relaxed),
         TCP_FALLBACK_SUCCESSES.load(Ordering::Relaxed),
+        LOCAL_ANSWERS.load(Ordering::Relaxed),
     )
 }
 
@@ -217,6 +241,12 @@ async fn serve_udp(
         };
         query.truncate(length);
         UDP_QUERIES.fetch_add(1, Ordering::Relaxed);
+        if let Some(response) = local_answer(&settings, &query) {
+            if let Err(error) = listener.send_to(&response, client).await {
+                warn!(%client, %error, "local DNS answer could not be sent");
+            }
+            continue;
+        }
         let listener = Arc::clone(&listener);
         let settings = settings.clone();
         let health = Arc::clone(&health);
@@ -297,6 +327,9 @@ async fn serve_tcp(
 
 async fn handle_tcp_client(client: &mut TcpStream, settings: &Settings) -> anyhow::Result<()> {
     let query = read_tcp_message(client, settings.timeout).await?;
+    if let Some(response) = local_answer(settings, &query) {
+        return write_tcp_message(client, &response, settings.timeout).await;
+    }
     let upstream = (*settings.upstream.borrow()).context("DNS upstream is not configured")?;
     let response = tcp_exchange(&query, upstream, settings.timeout).await?;
     observe_tcp_success(settings.publisher.as_ref()).await;
