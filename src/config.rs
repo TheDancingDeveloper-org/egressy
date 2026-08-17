@@ -274,6 +274,24 @@ pub struct DnsConfig {
     pub failure_threshold: u32,
     pub success_threshold: u32,
     pub local_zones: LocalZonesConfig,
+    pub cache: DnsCacheConfig,
+}
+
+/// Bounded cache of upstream responses, expiring on the answer's own TTL.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsCacheConfig {
+    pub enabled: bool,
+    pub capacity: usize,
+}
+
+impl Default for DnsCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capacity: 4_096,
+        }
+    }
 }
 
 /// Answering enrolled-bridge container names from Docker discovery instead of
@@ -293,6 +311,7 @@ impl Default for DnsConfig {
             upstream: DnsUpstreamConfig::default(),
             timeout_ms: default_dns_timeout_ms(),
             local_zones: LocalZonesConfig::default(),
+            cache: DnsCacheConfig::default(),
             max_concurrent_queries: default_dns_concurrency(),
             udp_attempts: default_dns_udp_attempts(),
             failure_threshold: default_dns_failure_threshold(),
