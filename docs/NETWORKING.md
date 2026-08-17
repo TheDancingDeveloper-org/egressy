@@ -107,6 +107,19 @@ interval, and reinstalls whatever is absent. Drift is logged at warn level
 naming exactly which parts were missing. Set `EGRESSY_MANAGE_HOST_POLICY=false`
 to opt out and manage the state yourself.
 
+That endpoint is on the same gateway API as the isolation policy, so
+`EGRESSY_HOST_POLICY_URL` defaults to `EGRESSY_ISOLATION_POLICY_URL` with the
+host-policy path: publish the API on a different port and overriding the
+isolation URL alone is enough. Set it explicitly only if the two genuinely
+differ.
+
+If the agent cannot reach that endpoint it warns on each interval and, after a
+sustained run of failures, escalates to an error naming the URL. Take that
+seriously — it means nothing is maintaining the fail-closed state, and it is not
+otherwise visible: bridge isolation keeps working and the gateway keeps
+reporting a healthy tunnel while enrolled traffic is one netfilter rebuild away
+from leaving on the host's default route.
+
 ### Gateway
 
 The gateway table is installed before WireGuard starts. Its forward chain

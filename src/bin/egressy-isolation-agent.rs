@@ -9,7 +9,7 @@ use egressy::host_policy::{
 use egressy::isolation::{render_bridge_policy, CounterValue, IsolationMode, IsolationPolicy};
 use serde::Deserialize;
 use tokio::{process::Command, signal, time::interval};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -38,12 +38,47 @@ struct Cli {
         action = clap::ArgAction::Set
     )]
     manage_host_policy: bool,
-    #[arg(
-        long,
-        env = "EGRESSY_HOST_POLICY_URL",
-        default_value = "http://127.0.0.1:8080/api/v2/host-policy"
-    )]
-    host_policy_url: String,
+    /// Where to fetch the host policy from.
+    ///
+    /// Defaults to the isolation policy URL with the host-policy path, because
+    /// the two are always served by the same gateway. An operator who publishes
+    /// that API on a port other than the default previously had to override
+    /// both URLs and there was nothing to suggest it: overriding only the
+    /// isolation one left this pointing at a port that answers something else,
+    /// and host policy was then never reconciled at all while bridge isolation
+    /// stayed visibly healthy.
+    #[arg(long, env = "EGRESSY_HOST_POLICY_URL")]
+    host_policy_url: Option<String>,
+}
+
+const HOST_POLICY_PATH: &str = "/api/v2/host-policy";
+
+/// Resolve the host-policy URL, deriving it from the isolation policy URL when
+/// it was not set explicitly.
+fn host_policy_url(cli: &Cli) -> anyhow::Result<String> {
+    if let Some(explicit) = &cli.host_policy_url {
+        return Ok(explicit.clone());
+    }
+    let mut derived =
+        reqwest::Url::parse(&cli.policy_url).context("invalid isolation policy URL")?;
+    derived.set_path(HOST_POLICY_PATH);
+    derived.set_query(None);
+    Ok(derived.to_string())
+}
+
+/// How many consecutive failures to reconcile host policy before the log line
+/// escalates from a warning to an error.
+///
+/// One failure is routine — the gateway may be restarting. A run of them means
+/// the fail-closed state is not being maintained and nothing else will say so,
+/// since bridge isolation keeps working and the gateway keeps reporting a
+/// healthy tunnel.
+const HOST_POLICY_ESCALATE_AFTER: u32 = 6;
+
+/// Whether a run of failed host-policy reconciliations has gone on long enough
+/// to stop being routine.
+fn host_policy_failure_is_sustained(consecutive_failures: u32) -> bool {
+    consecutive_failures >= HOST_POLICY_ESCALATE_AFTER
 }
 
 #[tokio::main]
@@ -58,9 +93,14 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
+    let host_policy_url = host_policy_url(&cli)?;
+    if cli.manage_host_policy && cli.host_policy_url.is_none() {
+        info!(url = %host_policy_url, "host policy URL derived from the isolation policy URL");
+    }
     let mut ticker = interval(Duration::from_secs(cli.interval_seconds));
     let mut last_policy_fingerprint = None;
     let mut last_reported_counters = BTreeMap::new();
+    let mut host_policy_failures: u32 = 0;
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
@@ -69,11 +109,26 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = ticker.tick() => {
                 if cli.manage_host_policy {
-                    if let Err(error) = reconcile_host_policy(&client, &cli).await {
-                        warn!(
-                            %error,
-                            "host egress policy could not be reconciled; enrolled traffic may not be fail-closed"
-                        );
+                    match reconcile_host_policy(&client, &host_policy_url).await {
+                        Ok(()) => host_policy_failures = 0,
+                        Err(error) => {
+                            host_policy_failures = host_policy_failures.saturating_add(1);
+                            if host_policy_failure_is_sustained(host_policy_failures) {
+                                error!(
+                                    %error,
+                                    consecutive_failures = host_policy_failures,
+                                    url = %host_policy_url,
+                                    "host egress policy has not been reconciled for several intervals; \
+                                     enrolled traffic is not fail-closed and nothing else will restore it"
+                                );
+                            } else {
+                                warn!(
+                                    %error,
+                                    url = %host_policy_url,
+                                    "host egress policy could not be reconciled; enrolled traffic may not be fail-closed"
+                                );
+                            }
+                        }
                     }
                 }
                 if cli.mode == IsolationMode::Disabled {
@@ -110,11 +165,9 @@ fn validate(cli: &Cli) -> anyhow::Result<()> {
     if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
         bail!("isolation policy URL must use host-loopback HTTP");
     }
-    let host_policy_url =
-        reqwest::Url::parse(&cli.host_policy_url).context("invalid host policy URL")?;
-    if host_policy_url.scheme() != "http"
-        || !matches!(host_policy_url.host_str(), Some("127.0.0.1" | "localhost"))
-    {
+    let resolved = host_policy_url(cli)?;
+    let parsed = reqwest::Url::parse(&resolved).context("invalid host policy URL")?;
+    if parsed.scheme() != "http" || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost")) {
         bail!("host policy URL must use host-loopback HTTP");
     }
     if cli.interval_seconds == 0 || cli.stale_seconds < cli.interval_seconds {
@@ -246,8 +299,8 @@ fn report_violation_changes(changes: &[ViolationChange]) {
 ///
 /// This is the loop that makes the fail-closed guarantee survive a Docker daemon
 /// restart. The bootstrap script installs the same state once; this owns it.
-async fn reconcile_host_policy(client: &reqwest::Client, cli: &Cli) -> anyhow::Result<()> {
-    let policy = fetch_host_policy(client, cli).await?;
+async fn reconcile_host_policy(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
+    let policy = fetch_host_policy(client, url).await?;
     let rules = read_ip_rules().await?;
     let routes = read_ip_routes(policy.route_table).await?;
     let drift = detect_drift(&rules, &routes, host_table_exists().await?, &policy);
@@ -266,12 +319,8 @@ async fn reconcile_host_policy(client: &reqwest::Client, cli: &Cli) -> anyhow::R
 /// The published policy is derived from gateway configuration and does not
 /// change while the gateway runs, so unlike the isolation policy it carries no
 /// freshness requirement — only a schema and a sanity check.
-async fn fetch_host_policy(client: &reqwest::Client, cli: &Cli) -> anyhow::Result<HostPolicy> {
-    let response = client
-        .get(&cli.host_policy_url)
-        .send()
-        .await?
-        .error_for_status()?;
+async fn fetch_host_policy(client: &reqwest::Client, url: &str) -> anyhow::Result<HostPolicy> {
+    let response = client.get(url).send().await?.error_for_status()?;
     const MAX_POLICY_BYTES: u64 = 65_536;
     if response
         .content_length()
@@ -477,6 +526,73 @@ mod tests {
     use super::*;
     use egressy::isolation::{build_policy, IsolationCandidate};
 
+    fn cli_with(policy_url: &str, host_policy_url: Option<&str>) -> Cli {
+        Cli {
+            policy_url: policy_url.to_owned(),
+            mode: IsolationMode::Enforce,
+            interval_seconds: 5,
+            stale_seconds: 30,
+            manage_host_policy: true,
+            host_policy_url: host_policy_url.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn host_policy_url_follows_the_isolation_url_port() {
+        // The bug this prevents: the gateway published on a non-default port,
+        // only the isolation URL overridden, and host policy silently never
+        // reconciled because this defaulted to 8080.
+        let cli = cli_with("http://127.0.0.1:18095/api/v2/isolation-policy", None);
+        assert_eq!(
+            host_policy_url(&cli).unwrap(),
+            "http://127.0.0.1:18095/api/v2/host-policy"
+        );
+    }
+
+    #[test]
+    fn an_explicit_host_policy_url_still_wins() {
+        let cli = cli_with(
+            "http://127.0.0.1:18095/api/v2/isolation-policy",
+            Some("http://localhost:9999/api/v2/host-policy"),
+        );
+        assert_eq!(
+            host_policy_url(&cli).unwrap(),
+            "http://localhost:9999/api/v2/host-policy"
+        );
+    }
+
+    #[test]
+    fn a_derived_host_policy_url_passes_validation() {
+        assert!(validate(&cli_with(
+            "http://127.0.0.1:18095/api/v2/isolation-policy",
+            None
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn a_non_loopback_host_policy_url_is_still_rejected() {
+        assert!(validate(&cli_with(
+            "http://127.0.0.1:18095/api/v2/isolation-policy",
+            Some("http://192.0.2.1:8080/api/v2/host-policy"),
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn a_single_failed_interval_does_not_escalate() {
+        // The gateway restarting is a routine reason for one failure, and an
+        // error on every blip is how a signal gets ignored.
+        assert!(!host_policy_failure_is_sustained(0));
+        assert!(!host_policy_failure_is_sustained(1));
+    }
+
+    #[test]
+    fn a_sustained_run_of_failures_escalates() {
+        assert!(host_policy_failure_is_sustained(HOST_POLICY_ESCALATE_AFTER));
+        assert!(host_policy_failure_is_sustained(u32::MAX));
+    }
+
     fn policy(now: u64) -> IsolationPolicy {
         build_policy(
             "vpn-egress",
@@ -509,7 +625,7 @@ mod tests {
             interval_seconds: 5,
             stale_seconds: 30,
             manage_host_policy: true,
-            host_policy_url: "http://127.0.0.1:8080/api/v2/host-policy".into(),
+            host_policy_url: Some("http://127.0.0.1:8080/api/v2/host-policy".into()),
         }
     }
 
@@ -525,7 +641,7 @@ mod tests {
     #[test]
     fn rejects_non_loopback_host_policy_url() {
         assert!(validate(&Cli {
-            host_policy_url: "http://egressy:8080/api/v2/host-policy".into(),
+            host_policy_url: Some("http://egressy:8080/api/v2/host-policy".into()),
             ..cli()
         })
         .is_err());
