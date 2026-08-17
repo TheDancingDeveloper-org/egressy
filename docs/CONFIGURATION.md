@@ -65,7 +65,10 @@ Use `profile` to derive IPv4 DNS from the profile or `explicit` with
 load. `local_zones.enabled` answers single-label enrolled-bridge container names
 from Docker discovery instead of forwarding them; see `docs/NETWORKING.md` for
 the constraints that keep it from shadowing public names or leaking internal
-ones. `udp_attempts` retries transient UDP loss before falling back to TCP to
+ones. `cache` bounds a response cache that expires entries on the answer's own
+shortest TTL, capped at five minutes, and keys them on the exit resolver so a
+tunnel that moves exit server misses rather than serving what the previous one
+said. `udp_attempts` retries transient UDP loss before falling back to TCP to
 the same in-tunnel resolver. `failure_threshold` and `success_threshold`
 provide global check hysteresis while individual failures remain logged.
 Enrolled clients should use only the gateway listener; firewall policy rejects

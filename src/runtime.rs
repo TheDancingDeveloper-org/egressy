@@ -367,6 +367,11 @@ pub async fn run(
             failure_threshold: config.dns.failure_threshold,
             success_threshold: config.dns.success_threshold,
             local_zones_enabled: config.dns.local_zones.enabled,
+            cache: config
+                .dns
+                .cache
+                .enabled
+                .then(|| Arc::new(crate::dns_cache::DnsCache::new(config.dns.cache.capacity))),
             local_names: local_names_rx,
             publisher: Some(publisher.clone()),
         })))

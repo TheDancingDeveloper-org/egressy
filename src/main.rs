@@ -1,6 +1,7 @@
 mod config;
 mod control;
 mod dns;
+mod dns_cache;
 mod docker;
 mod domain;
 mod enforcement;

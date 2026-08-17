@@ -43,6 +43,11 @@ dns:
   # forwarding them to the provider resolver. Off by default.
   local_zones:
     enabled: false
+  # Bounded cache of upstream responses, expiring on the answer's own TTL and
+  # keyed on the exit resolver so an exit change is a miss, not a stale answer.
+  cache:
+    enabled: true
+    capacity: 4096
 
 probe:
   enabled: true

@@ -35,12 +35,41 @@ pub struct Settings {
     pub failure_threshold: u32,
     pub success_threshold: u32,
     pub local_zones_enabled: bool,
+    /// Shared response cache, when enabled.
+    pub cache: Option<Arc<crate::dns_cache::DnsCache>>,
     /// Enrolled-bridge container names, refreshed by Docker discovery.
     pub local_names: watch::Receiver<Arc<std::collections::BTreeMap<String, std::net::Ipv4Addr>>>,
     pub publisher: Option<StatePublisher>,
 }
 
 static LOCAL_ANSWERS: AtomicU64 = AtomicU64::new(0);
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// A cached response for this query, if one is still live.
+///
+/// Like local answers, this is attempted before admission control: a hit costs
+/// no upstream capacity, so repeated names keep resolving under load.
+fn cached_answer(settings: &Settings, query: &[u8]) -> Option<Vec<u8>> {
+    let cache = settings.cache.as_ref()?;
+    let upstream = (*settings.upstream.borrow())?;
+    match cache.lookup(query, upstream, std::time::Instant::now()) {
+        Some(response) => {
+            CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            Some(response)
+        }
+        None => {
+            CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+fn remember_answer(settings: &Settings, query: &[u8], response: &[u8], upstream: SocketAddr) {
+    if let Some(cache) = settings.cache.as_ref() {
+        cache.store(query, response, upstream, std::time::Instant::now());
+    }
+}
 
 /// Answer from the enrolled-bridge name map, if this query is one we own.
 ///
@@ -155,7 +184,13 @@ egressy_dns_upstream_tcp_fallbacks_total {}\n\
 egressy_dns_upstream_tcp_fallback_successes_total {}\n\
 # HELP egressy_dns_local_answers_total Queries answered from enrolled-bridge names without forwarding.\n\
 # TYPE egressy_dns_local_answers_total counter\n\
-egressy_dns_local_answers_total {}\n",
+egressy_dns_local_answers_total {}\n\
+# HELP egressy_dns_cache_hits_total Queries served from the response cache.\n\
+# TYPE egressy_dns_cache_hits_total counter\n\
+egressy_dns_cache_hits_total {}\n\
+# HELP egressy_dns_cache_misses_total Queries the response cache could not serve.\n\
+# TYPE egressy_dns_cache_misses_total counter\n\
+egressy_dns_cache_misses_total {}\n",
         UDP_QUERIES.load(Ordering::Relaxed),
         UDP_ATTEMPTS.load(Ordering::Relaxed),
         UDP_TIMEOUTS.load(Ordering::Relaxed),
@@ -163,6 +198,8 @@ egressy_dns_local_answers_total {}\n",
         TCP_FALLBACKS.load(Ordering::Relaxed),
         TCP_FALLBACK_SUCCESSES.load(Ordering::Relaxed),
         LOCAL_ANSWERS.load(Ordering::Relaxed),
+        CACHE_HITS.load(Ordering::Relaxed),
+        CACHE_MISSES.load(Ordering::Relaxed),
     )
 }
 
@@ -241,9 +278,11 @@ async fn serve_udp(
         };
         query.truncate(length);
         UDP_QUERIES.fetch_add(1, Ordering::Relaxed);
-        if let Some(response) = local_answer(&settings, &query) {
+        if let Some(response) =
+            local_answer(&settings, &query).or_else(|| cached_answer(&settings, &query))
+        {
             if let Err(error) = listener.send_to(&response, client).await {
-                warn!(%client, %error, "local DNS answer could not be sent");
+                warn!(%client, %error, "DNS answer could not be sent without forwarding");
             }
             continue;
         }
@@ -282,6 +321,7 @@ async fn serve_udp(
                             "DNS UDP query recovered after an in-tunnel upstream retry"
                         );
                     }
+                    remember_answer(&settings, &query, &result.response, upstream);
                     if let Err(error) = listener.send_to(&result.response, client).await {
                         warn!(%client, %error, "sending DNS response failed");
                     }
@@ -327,12 +367,15 @@ async fn serve_tcp(
 
 async fn handle_tcp_client(client: &mut TcpStream, settings: &Settings) -> anyhow::Result<()> {
     let query = read_tcp_message(client, settings.timeout).await?;
-    if let Some(response) = local_answer(settings, &query) {
+    if let Some(response) =
+        local_answer(settings, &query).or_else(|| cached_answer(settings, &query))
+    {
         return write_tcp_message(client, &response, settings.timeout).await;
     }
     let upstream = (*settings.upstream.borrow()).context("DNS upstream is not configured")?;
     let response = tcp_exchange(&query, upstream, settings.timeout).await?;
     observe_tcp_success(settings.publisher.as_ref()).await;
+    remember_answer(settings, &query, &response, upstream);
     write_tcp_message(client, &response, settings.timeout).await?;
     Ok(())
 }
