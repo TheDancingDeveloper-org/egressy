@@ -8,6 +8,7 @@ description = "Egressy, a transparent label-aware Docker VPN egress gateway"
 default-run = "egressy"
 
 [dependencies]
+hickory-proto = { version = "0.26", default-features = false }
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"

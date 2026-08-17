@@ -39,6 +39,10 @@ dns:
   udp_attempts: 2
   failure_threshold: 3
   success_threshold: 2
+  # Answer enrolled-bridge container names from Docker discovery instead of
+  # forwarding them to the provider resolver. Off by default.
+  local_zones:
+    enabled: false
 
 probe:
   enabled: true

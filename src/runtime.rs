@@ -93,6 +93,10 @@ pub async fn run(
         .and_then(configured_peer_from_profile);
     let initial_dns_upstream = dns_upstream(&config, active_profile.as_ref());
     let (dns_upstream_tx, dns_upstream_rx) = watch::channel(initial_dns_upstream);
+    let (local_names_tx, local_names_rx) = watch::channel(Arc::new(std::collections::BTreeMap::<
+        String,
+        std::net::Ipv4Addr,
+    >::new()));
     let state: SharedState = Arc::new(RwLock::new(AppState::default()));
     let profile_manager = crate::profile_manager::ProfileManager::new(
         config.clone(),
@@ -316,6 +320,7 @@ pub async fn run(
         observer,
         enforcement.clone(),
         port_change_tx.clone(),
+        local_names_tx,
     ));
     let mut tunnel_task = tokio::spawn(monitor_tunnel(
         config.clone(),
@@ -361,6 +366,8 @@ pub async fn run(
             udp_attempts: config.dns.udp_attempts,
             failure_threshold: config.dns.failure_threshold,
             success_threshold: config.dns.success_threshold,
+            local_zones_enabled: config.dns.local_zones.enabled,
+            local_names: local_names_rx,
             publisher: Some(publisher.clone()),
         })))
     } else {
@@ -649,6 +656,7 @@ async fn reconcile_docker(
     observer: DockerObserver,
     enforcement: EnforcementCoordinator,
     port_change_tx: watch::Sender<u64>,
+    local_names_tx: watch::Sender<Arc<std::collections::BTreeMap<String, std::net::Ipv4Addr>>>,
 ) -> anyhow::Result<()> {
     let mut ticker = interval(config.reconcile_interval());
     loop {
@@ -754,6 +762,15 @@ async fn reconcile_docker(
                     .values()
                     .any(|client| client.route_intent.status == RouteIntentStatus::Unknown);
                 let client_count = clients.len();
+                // Publish enrolled-bridge names for the DNS forwarder. Only
+                // running clients, so a stopped container stops resolving.
+                let _ = local_names_tx.send(Arc::new(
+                    clients
+                        .values()
+                        .filter(|client| client.running && !client.name.is_empty())
+                        .map(|client| (client.name.to_ascii_lowercase(), client.ipv4_address))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                ));
                 publisher
                     .mutate(|snapshot| snapshot.clients = clients.clone())
                     .await;
