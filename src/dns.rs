@@ -1,9 +1,10 @@
 use std::{
+    collections::HashMap,
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -31,6 +32,7 @@ pub struct Settings {
     pub upstream: watch::Receiver<Option<SocketAddr>>,
     pub timeout: Duration,
     pub max_concurrent_queries: usize,
+    pub max_concurrent_queries_per_client: usize,
     pub udp_attempts: u32,
     pub failure_threshold: u32,
     pub success_threshold: u32,
@@ -92,6 +94,85 @@ static UDP_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static UDP_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 static TCP_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static TCP_FALLBACK_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+/// Debounced resolution health as a gauge: 1 healthy, 0 degraded, absent until
+/// the first verdict. Exported so a resolver outage is alertable — the
+/// container healthcheck probes `/livez`, which reports process liveness only
+/// and stays green while every query fails.
+static RESOLUTION_HEALTHY: AtomicU64 = AtomicU64::new(u64::MAX);
+static QUERIES_REFUSED_GLOBAL: AtomicU64 = AtomicU64::new(0);
+static QUERIES_REFUSED_PER_CLIENT: AtomicU64 = AtomicU64::new(0);
+
+/// Admission control for forwarded queries.
+///
+/// A single global bound is not enough on a shared gateway: one client
+/// recovering from an outage can burst hard enough to consume every permit and
+/// deny service to every other enrolled client, which is what a real incident
+/// produced. Each client therefore also has its own smaller bound, so a noisy
+/// neighbour can exhaust its own share and no one else's.
+pub struct QueryPermits {
+    global: Arc<Semaphore>,
+    per_client: StdMutex<HashMap<IpAddr, Arc<Semaphore>>>,
+    per_client_limit: usize,
+}
+
+/// Held for the lifetime of a forwarded query.
+#[derive(Debug)]
+pub struct QueryPermit {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _client: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Why a query was refused, so the two causes stay distinguishable in logs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Refusal {
+    GlobalLimit,
+    ClientLimit,
+}
+
+impl QueryPermits {
+    pub fn new(global: usize, per_client: usize) -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(global)),
+            per_client: StdMutex::new(HashMap::new()),
+            per_client_limit: per_client.max(1).min(global.max(1)),
+        }
+    }
+
+    pub fn try_acquire(&self, client: IpAddr) -> Result<QueryPermit, Refusal> {
+        let client_permits = self.client_semaphore(client);
+        // Take the client's share first: refusing here is the cheaper outcome
+        // and keeps a burst from briefly holding global permits.
+        let client_permit = client_permits
+            .try_acquire_owned()
+            .map_err(|_| Refusal::ClientLimit)?;
+        let global_permit = Arc::clone(&self.global)
+            .try_acquire_owned()
+            .map_err(|_| Refusal::GlobalLimit)?;
+        Ok(QueryPermit {
+            _global: global_permit,
+            _client: client_permit,
+        })
+    }
+
+    fn client_semaphore(&self, client: IpAddr) -> Arc<Semaphore> {
+        let mut clients = self
+            .per_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Drop idle entries so the map cannot grow without bound on a busy
+        // bridge. An entry is idle when nothing holds one of its permits.
+        if clients.len() > MAX_TRACKED_CLIENTS {
+            clients.retain(|_, semaphore| semaphore.available_permits() < self.per_client_limit);
+        }
+        Arc::clone(
+            clients
+                .entry(client)
+                .or_insert_with(|| Arc::new(Semaphore::new(self.per_client_limit))),
+        )
+    }
+}
+
+const MAX_TRACKED_CLIENTS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DebouncedStatus {
@@ -162,6 +243,14 @@ struct ForwardResult {
     failed_udp_attempts: u32,
 }
 
+fn record_refusal(refusal: Refusal) {
+    match refusal {
+        Refusal::GlobalLimit => &QUERIES_REFUSED_GLOBAL,
+        Refusal::ClientLimit => &QUERIES_REFUSED_PER_CLIENT,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn prometheus_metrics() -> String {
     format!(
         "# HELP egressy_dns_udp_queries_total Client UDP DNS queries received.\n\
@@ -190,7 +279,11 @@ egressy_dns_local_answers_total {}\n\
 egressy_dns_cache_hits_total {}\n\
 # HELP egressy_dns_cache_misses_total Queries the response cache could not serve.\n\
 # TYPE egressy_dns_cache_misses_total counter\n\
-egressy_dns_cache_misses_total {}\n",
+egressy_dns_cache_misses_total {}\n\
+# HELP egressy_dns_queries_refused_total Queries refused by admission control, by limit.\n\
+# TYPE egressy_dns_queries_refused_total counter\n\
+egressy_dns_queries_refused_total{{limit=\"global\"}} {}\n\
+egressy_dns_queries_refused_total{{limit=\"per_client\"}} {}\n{}",
         UDP_QUERIES.load(Ordering::Relaxed),
         UDP_ATTEMPTS.load(Ordering::Relaxed),
         UDP_TIMEOUTS.load(Ordering::Relaxed),
@@ -200,7 +293,23 @@ egressy_dns_cache_misses_total {}\n",
         LOCAL_ANSWERS.load(Ordering::Relaxed),
         CACHE_HITS.load(Ordering::Relaxed),
         CACHE_MISSES.load(Ordering::Relaxed),
+        QUERIES_REFUSED_GLOBAL.load(Ordering::Relaxed),
+        QUERIES_REFUSED_PER_CLIENT.load(Ordering::Relaxed),
+        resolution_health_metric(),
     )
+}
+
+/// Emitted only once a debounced verdict exists, so alerts are not armed by a
+/// gateway that has simply not resolved anything yet.
+fn resolution_health_metric() -> String {
+    match RESOLUTION_HEALTHY.load(Ordering::Relaxed) {
+        u64::MAX => String::new(),
+        value => format!(
+            "# HELP egressy_dns_resolution_healthy Debounced in-tunnel resolution health, 1 healthy 0 degraded.\n\
+# TYPE egressy_dns_resolution_healthy gauge\n\
+egressy_dns_resolution_healthy {value}\n"
+        ),
+    }
 }
 
 pub async fn run(settings: Settings) -> anyhow::Result<()> {
@@ -212,7 +321,10 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     let tcp = TcpListener::bind(settings.listen)
         .await
         .context("binding TCP DNS listener")?;
-    let permits = Arc::new(Semaphore::new(settings.max_concurrent_queries));
+    let permits = Arc::new(QueryPermits::new(
+        settings.max_concurrent_queries,
+        settings.max_concurrent_queries_per_client,
+    ));
     let health = Arc::new(Mutex::new(DnsHealthState::new(
         settings.failure_threshold,
         settings.success_threshold,
@@ -261,7 +373,7 @@ pub async fn supervise(settings: Settings) -> anyhow::Result<()> {
 async fn serve_udp(
     listener: Arc<UdpSocket>,
     settings: Settings,
-    permits: Arc<Semaphore>,
+    permits: Arc<QueryPermits>,
     health: Arc<Mutex<DnsHealthState>>,
 ) -> anyhow::Result<()> {
     let mut workers = JoinSet::new();
@@ -289,9 +401,13 @@ async fn serve_udp(
         let listener = Arc::clone(&listener);
         let settings = settings.clone();
         let health = Arc::clone(&health);
-        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-            warn!(%client, "DNS concurrency limit reached");
-            continue;
+        let permit = match permits.try_acquire(client.ip()) {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                record_refusal(refusal);
+                warn!(%client, ?refusal, "DNS query refused by concurrency limit");
+                continue;
+            }
         };
         workers.spawn(async move {
             let _permit = permit;
@@ -338,7 +454,7 @@ async fn serve_udp(
 async fn serve_tcp(
     listener: TcpListener,
     settings: Settings,
-    permits: Arc<Semaphore>,
+    permits: Arc<QueryPermits>,
 ) -> anyhow::Result<()> {
     let mut workers = JoinSet::new();
     loop {
@@ -352,9 +468,13 @@ async fn serve_tcp(
             }
         };
         let settings = settings.clone();
-        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-            warn!(%address, "DNS concurrency limit reached");
-            continue;
+        let permit = match permits.try_acquire(address.ip()) {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                record_refusal(refusal);
+                warn!(%address, ?refusal, "DNS query refused by concurrency limit");
+                continue;
+            }
         };
         workers.spawn(async move {
             let _permit = permit;
@@ -472,6 +592,7 @@ async fn observe_udp_health(
     let observation = health.lock().await.record(success);
     let Some(status) = observation else { return };
     let healthy = status == DebouncedStatus::Healthy;
+    RESOLUTION_HEALTHY.store(u64::from(healthy), Ordering::Relaxed);
     publisher
         .observe(
             "dns.upstream_udp",
@@ -584,6 +705,89 @@ fn is_truncated(message: &[u8]) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_health_is_absent_until_a_verdict_exists() {
+        // A gateway that has not resolved anything yet must not arm an alert.
+        RESOLUTION_HEALTHY.store(u64::MAX, Ordering::Relaxed);
+        assert!(resolution_health_metric().is_empty());
+    }
+
+    #[test]
+    fn resolution_health_reports_both_verdicts() {
+        RESOLUTION_HEALTHY.store(1, Ordering::Relaxed);
+        assert!(resolution_health_metric().contains("egressy_dns_resolution_healthy 1"));
+        RESOLUTION_HEALTHY.store(0, Ordering::Relaxed);
+        assert!(resolution_health_metric().contains("egressy_dns_resolution_healthy 0"));
+        RESOLUTION_HEALTHY.store(u64::MAX, Ordering::Relaxed);
+    }
+
+    fn client(last: u8) -> IpAddr {
+        IpAddr::from([172, 30, 0, last])
+    }
+
+    #[test]
+    fn one_client_cannot_consume_the_whole_global_budget() {
+        // The observed incident: a single client bursting hard enough to
+        // starve every other enrolled client.
+        let permits = QueryPermits::new(8, 2);
+        let _held: Vec<_> = (0..2)
+            .map(|_| {
+                permits
+                    .try_acquire(client(11))
+                    .expect("within client share")
+            })
+            .collect();
+        assert_eq!(
+            permits.try_acquire(client(11)).unwrap_err(),
+            Refusal::ClientLimit
+        );
+        // A different client is unaffected.
+        assert!(permits.try_acquire(client(12)).is_ok());
+    }
+
+    #[test]
+    fn the_global_limit_still_applies_across_clients() {
+        let permits = QueryPermits::new(2, 2);
+        let _a = permits.try_acquire(client(11)).unwrap();
+        let _b = permits.try_acquire(client(12)).unwrap();
+        assert_eq!(
+            permits.try_acquire(client(13)).unwrap_err(),
+            Refusal::GlobalLimit
+        );
+    }
+
+    #[test]
+    fn permits_are_returned_when_a_query_finishes() {
+        let permits = QueryPermits::new(4, 1);
+        {
+            let _held = permits.try_acquire(client(11)).unwrap();
+            assert!(permits.try_acquire(client(11)).is_err());
+        }
+        assert!(permits.try_acquire(client(11)).is_ok());
+    }
+
+    #[test]
+    fn a_per_client_limit_above_the_global_one_is_clamped() {
+        let permits = QueryPermits::new(2, 99);
+        assert_eq!(permits.per_client_limit, 2);
+        let _a = permits.try_acquire(client(11)).unwrap();
+        let _b = permits.try_acquire(client(11)).unwrap();
+        // Refused either way; a client share declared wider than the global
+        // budget must never let one client exceed the global bound.
+        assert!(permits.try_acquire(client(11)).is_err());
+    }
+
+    #[test]
+    fn idle_client_entries_do_not_accumulate_without_bound() {
+        let permits = QueryPermits::new(4096, 2);
+        for index in 0..(MAX_TRACKED_CLIENTS + 64) {
+            let address = IpAddr::from(((index as u32) + 1).to_be_bytes());
+            drop(permits.try_acquire(address));
+        }
+        let tracked = permits.per_client.lock().unwrap().len();
+        assert!(tracked <= MAX_TRACKED_CLIENTS + 1, "tracked {tracked}");
+    }
 
     fn packet(flags: u16) -> Vec<u8> {
         let mut message = vec![0; 12];
