@@ -70,6 +70,17 @@ protect it exactly like the raw profile.
 
 ## Install host policy
 
+Create the enrolled network with `config/docker-network.sh`, which reserves the
+gateway's address from Docker's dynamic pool. Reserving it matters: with a bare
+`--subnet`, IPAM may hand `172.30.0.2` to whichever container starts first after
+a daemon restart, and the gateway then fails container creation with
+`Address already in use` and stays down — that failure happens before the
+process starts, so the restart policy never applies and nothing self-heals.
+
+The gateway reports `topology.gateway_address_not_reserved` when it detects an
+enrolled network without that reservation. An existing network has to be
+recreated to gain it, since IPAM is fixed at creation.
+
 Run `check` and review `render-host-setup` as shown in the README. The output
 must be installed on every boot before enrolled workloads can safely send
 traffic. Integrate the reviewed script with the host's native service manager

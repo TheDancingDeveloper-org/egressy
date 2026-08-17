@@ -30,6 +30,33 @@ pub struct NetworkObservation {
     pub subnet_matches: bool,
     pub gateway_attached: bool,
     pub ipv6_enabled: bool,
+    /// Whether Docker's dynamic pool is kept away from the gateway's address.
+    /// When it is not, IPAM may hand that address to whichever container starts
+    /// first, and the gateway then cannot start at all.
+    pub gateway_address_reserved: bool,
+}
+
+/// Is the gateway address kept out of Docker's dynamic allocation pool?
+///
+/// Reserved when it is declared as an auxiliary address, or when an explicit
+/// `ip_range` is configured that does not contain it. With neither, the whole
+/// subnet is allocatable and the gateway's own address is fair game.
+pub fn gateway_address_is_reserved(
+    ip_range: Option<&str>,
+    auxiliary_addresses: &[String],
+    gateway: Ipv4Addr,
+) -> bool {
+    if auxiliary_addresses.iter().any(|address| {
+        address
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|parsed| parsed == gateway)
+    }) {
+        return true;
+    }
+    match ip_range.and_then(|range| range.parse::<Ipv4Net>().ok()) {
+        Some(range) => !range.contains(&gateway),
+        None => false,
+    }
 }
 
 impl DockerObserver {
@@ -205,12 +232,25 @@ impl DockerObserver {
             .docker
             .inspect_network(&self.network_name, None)
             .await?;
-        let subnet_matches = network
+        let ipam_configs = network
             .ipam
             .and_then(|ipam| ipam.config)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let subnet = self.subnet.to_string();
+        let subnet_matches = ipam_configs
             .iter()
-            .any(|config| config.subnet.as_deref() == Some(&self.subnet.to_string()));
+            .any(|config| config.subnet.as_deref() == Some(&subnet));
+        let gateway_address_reserved = ipam_configs
+            .iter()
+            .find(|config| config.subnet.as_deref() == Some(&subnet))
+            .is_some_and(|config| {
+                let auxiliary = config
+                    .auxiliary_addresses
+                    .as_ref()
+                    .map(|addresses| addresses.values().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                gateway_address_is_reserved(config.ip_range.as_deref(), &auxiliary, gateway)
+            });
         let gateway_attached = network
             .containers
             .unwrap_or_default()
@@ -222,6 +262,7 @@ impl DockerObserver {
             subnet_matches,
             gateway_attached,
             ipv6_enabled: network.enable_ipv6.unwrap_or(false),
+            gateway_address_reserved,
         })
     }
 }
@@ -431,6 +472,62 @@ fn label_is_true(value: Option<&String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ip_range_excluding_the_gateway_reserves_it() {
+        assert!(gateway_address_is_reserved(
+            Some("172.30.0.128/25"),
+            &[],
+            "172.30.0.2".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn an_aux_address_reserves_the_gateway() {
+        assert!(gateway_address_is_reserved(
+            None,
+            &["172.30.0.2".to_owned()],
+            "172.30.0.2".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_bare_subnet_leaves_the_gateway_allocatable() {
+        // The observed misconfiguration: subnet only, so IPAM may hand the
+        // gateway's address to whichever container starts first.
+        assert!(!gateway_address_is_reserved(
+            None,
+            &[],
+            "172.30.0.2".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn an_ip_range_containing_the_gateway_does_not_reserve_it() {
+        assert!(!gateway_address_is_reserved(
+            Some("172.30.0.0/24"),
+            &[],
+            "172.30.0.2".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn an_aux_address_for_a_different_host_does_not_reserve_the_gateway() {
+        assert!(!gateway_address_is_reserved(
+            None,
+            &["172.30.0.9".to_owned()],
+            "172.30.0.2".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn an_unparseable_ip_range_is_treated_as_no_reservation() {
+        assert!(!gateway_address_is_reserved(
+            Some("not-a-range"),
+            &[],
+            "172.30.0.2".parse().unwrap()
+        ));
+    }
 
     fn endpoint(priority: Option<i64>, ipv4: bool, ipv6: bool) -> EndpointSettings {
         EndpointSettings {

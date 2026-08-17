@@ -665,6 +665,19 @@ async fn reconcile_docker(
                     None,
                     None,
                 ).await;
+                if !network.gateway_address_reserved {
+                    publisher
+                        .observe(
+                            "topology.network_gateway_reservation",
+                            CheckStatus::Degraded,
+                            Impact::Advisory,
+                            "topology.gateway_address_not_reserved",
+                            "The enrolled Docker network can allocate the gateway's own address to another container, which prevents the gateway starting after a restart",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
                 if network.ipv6_enabled {
                     publisher
                         .observe(
