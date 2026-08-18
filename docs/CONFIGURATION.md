@@ -98,7 +98,14 @@ checks and is the stricter choice if you want the container marked unhealthy.
 
 `udp_attempts` retries transient UDP loss before falling back to TCP to
 the same in-tunnel resolver. `failure_threshold` and `success_threshold`
-provide global check hysteresis while individual failures remain logged.
+provide global check hysteresis while individual failures remain logged. They
+are counts of queries, so on a busy gateway they describe a fraction of a
+second; a degraded verdict is therefore held for a minute before a recovery may
+clear it, long enough for a scrape or a status poll to land on it. Queries
+refused by admission control count towards the verdict alongside queries the
+upstream failed to answer — to a client they are the same event — and are
+reported with the `dns.queries_refused` reason code rather than
+`dns.upstream_udp_failures`.
 Enrolled clients should use only the gateway listener; firewall policy rejects
 other plain DNS destinations.
 
