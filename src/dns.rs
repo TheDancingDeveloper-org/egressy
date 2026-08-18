@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
+use hickory_proto::op::{Message, MessageType, ResponseCode};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -406,6 +407,10 @@ async fn serve_udp(
             Err(refusal) => {
                 record_refusal(refusal);
                 warn!(%client, ?refusal, "DNS query refused by concurrency limit");
+                // REFUSED, not silence: the gateway declined to try, which is a
+                // condition the client can act on now rather than in five
+                // seconds' time.
+                answer_with_rcode(&listener, client, &query, ResponseCode::Refused).await;
                 continue;
             }
         };
@@ -414,6 +419,7 @@ async fn serve_udp(
             let Some(upstream) = *settings.upstream.borrow() else {
                 observe_udp_health(settings.publisher.as_ref(), &health, false).await;
                 warn!(%client, "DNS upstream is not configured");
+                answer_with_rcode(&listener, client, &query, ResponseCode::ServFail).await;
                 return;
             };
             match forward_query(&query, upstream, settings.timeout, settings.udp_attempts).await {
@@ -444,7 +450,9 @@ async fn serve_udp(
                 }
                 Err(error) => {
                     observe_udp_health(settings.publisher.as_ref(), &health, false).await;
-                    warn!(%client, %error, "DNS forwarding failed")
+                    warn!(%client, %error, "DNS forwarding failed");
+                    // SERVFAIL: the gateway tried and could not get an answer.
+                    answer_with_rcode(&listener, client, &query, ResponseCode::ServFail).await;
                 }
             }
         });
@@ -473,6 +481,15 @@ async fn serve_tcp(
             Err(refusal) => {
                 record_refusal(refusal);
                 warn!(%address, ?refusal, "DNS query refused by concurrency limit");
+                // Refusing costs a read and a write, not a permit: the point of
+                // saying REFUSED is that the client stops waiting, and a client
+                // that has already opened a connection is waiting.
+                let request_timeout = settings.timeout;
+                workers.spawn(async move {
+                    if let Err(error) = refuse_tcp_client(&mut client, request_timeout).await {
+                        debug!(%address, %error, "refusing a TCP DNS query failed");
+                    }
+                });
                 continue;
             }
         };
@@ -492,12 +509,37 @@ async fn handle_tcp_client(client: &mut TcpStream, settings: &Settings) -> anyho
     {
         return write_tcp_message(client, &response, settings.timeout).await;
     }
+    match forward_over_tcp(&query, settings).await {
+        Ok(response) => write_tcp_message(client, &response, settings.timeout).await,
+        Err(error) => {
+            // Say SERVFAIL before dropping the connection, so the client fails
+            // this query rather than reading the close as a transport problem
+            // and retrying the whole exchange.
+            if let Some(response) = rcode_response(&query, ResponseCode::ServFail) {
+                let _ = write_tcp_message(client, &response, settings.timeout).await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn forward_over_tcp(query: &[u8], settings: &Settings) -> anyhow::Result<Vec<u8>> {
     let upstream = (*settings.upstream.borrow()).context("DNS upstream is not configured")?;
-    let response = tcp_exchange(&query, upstream, settings.timeout).await?;
+    let response = tcp_exchange(query, upstream, settings.timeout).await?;
     observe_tcp_success(settings.publisher.as_ref()).await;
-    remember_answer(settings, &query, &response, upstream);
-    write_tcp_message(client, &response, settings.timeout).await?;
-    Ok(())
+    remember_answer(settings, query, &response, upstream);
+    Ok(response)
+}
+
+/// Read a query only far enough to answer it REFUSED.
+async fn refuse_tcp_client(
+    client: &mut TcpStream,
+    request_timeout: Duration,
+) -> anyhow::Result<()> {
+    let query = read_tcp_message(client, request_timeout).await?;
+    let response =
+        rcode_response(&query, ResponseCode::Refused).context("query could not be refused")?;
+    write_tcp_message(client, &response, request_timeout).await
 }
 
 async fn forward_query(
@@ -702,6 +744,50 @@ fn is_truncated(message: &[u8]) -> anyhow::Result<bool> {
     Ok(message[2] & 0x02 != 0)
 }
 
+/// A response carrying nothing but an rcode, echoing the question asked.
+///
+/// Silence is the one answer a resolver client cannot act on: it cannot tell a
+/// refusal from a gateway that has gone away, so it waits out its own timeout
+/// — 5s with two attempts per nameserver on glibc — and retries. Under load
+/// those retries arrive as a second wave against the capacity that refused the
+/// first, which is how an upstream hiccup became sustained refusal. An rcode
+/// fails the client immediately and lets it apply its own backoff.
+///
+/// `None` for anything unparseable: there is no question to echo and no
+/// transaction to answer, so there is nothing truthful to send.
+fn rcode_response(query: &[u8], code: ResponseCode) -> Option<Vec<u8>> {
+    let request = Message::from_vec(query).ok()?;
+    if request.metadata.message_type != MessageType::Query {
+        return None;
+    }
+    let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+    response.metadata.response_code = code;
+    response.metadata.recursion_desired = request.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.queries = request.queries.clone();
+    // RFC 6891: a responder that was sent an OPT record includes one in reply.
+    if let Some(edns) = request.edns.clone() {
+        response.set_edns(edns);
+    }
+    response.to_vec().ok()
+}
+
+/// Answer a UDP query with an rcode, or say why it could not be answered.
+async fn answer_with_rcode(
+    listener: &UdpSocket,
+    client: SocketAddr,
+    query: &[u8],
+    code: ResponseCode,
+) {
+    let Some(response) = rcode_response(query, code) else {
+        debug!(%client, ?code, "DNS query could not be answered with an rcode");
+        return;
+    };
+    if let Err(error) = listener.send_to(&response, client).await {
+        warn!(%client, %error, ?code, "sending DNS rcode response failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +896,90 @@ mod tests {
         let mut mismatched = packet(0x8100);
         mismatched[1] = 1;
         assert!(validate_response(&query, &mismatched).is_err());
+    }
+
+    use hickory_proto::{
+        op::{OpCode, Query},
+        rr::{Name, RecordType},
+    };
+
+    fn dns_query(name: &str) -> Vec<u8> {
+        let mut message = Message::new(4242, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        message.to_vec().unwrap()
+    }
+
+    #[test]
+    fn an_rcode_response_answers_the_question_it_was_asked() {
+        let query = dns_query("a.test.");
+        let bytes = rcode_response(&query, ResponseCode::Refused).unwrap();
+        let response = Message::from_vec(&bytes).unwrap();
+        assert_eq!(response.metadata.id, 4242);
+        assert_eq!(response.metadata.message_type, MessageType::Response);
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+        assert!(response.metadata.recursion_desired);
+        assert!(response.metadata.recursion_available);
+        assert_eq!(response.queries.len(), 1);
+        assert_eq!(response.queries[0].name().to_ascii(), "a.test.");
+        // Validation the forwarder applies to upstream responses holds here
+        // too: same transaction, response bit set.
+        validate_response(&query, &bytes).unwrap();
+    }
+
+    #[test]
+    fn both_failure_rcodes_are_distinguishable_to_the_client() {
+        let query = dns_query("a.test.");
+        let refused = Message::from_vec(&rcode_response(&query, ResponseCode::Refused).unwrap())
+            .unwrap()
+            .metadata
+            .response_code;
+        let failed = Message::from_vec(&rcode_response(&query, ResponseCode::ServFail).unwrap())
+            .unwrap()
+            .metadata
+            .response_code;
+        // "I declined to try" and "I tried and could not" are different
+        // conditions and the client backs off differently for each.
+        assert_eq!(refused, ResponseCode::Refused);
+        assert_eq!(failed, ResponseCode::ServFail);
+    }
+
+    #[test]
+    fn nothing_is_sent_for_a_message_that_cannot_be_answered() {
+        // No question to echo and no transaction to answer.
+        assert!(rcode_response(b"nonsense", ResponseCode::ServFail).is_none());
+        let mut response = Message::response(1, OpCode::Query);
+        response.add_query(Query::query(
+            Name::from_ascii("a.test.").unwrap(),
+            RecordType::A,
+        ));
+        assert!(rcode_response(&response.to_vec().unwrap(), ResponseCode::ServFail).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_query_is_answered_rather_than_dropped() {
+        // The regression that mattered: a client that gets silence waits out
+        // its own resolver timeout and retries into the capacity that just
+        // refused it.
+        let gateway = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let query = dns_query("a.test.");
+        answer_with_rcode(
+            &gateway,
+            client.local_addr().unwrap(),
+            &query,
+            ResponseCode::Refused,
+        )
+        .await;
+        let mut buffer = vec![0_u8; MAX_DNS_MESSAGE];
+        let length = timeout(Duration::from_secs(5), client.recv(&mut buffer))
+            .await
+            .expect("the gateway answered")
+            .unwrap();
+        buffer.truncate(length);
+        let response = Message::from_vec(&buffer).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+        assert_eq!(response.metadata.id, 4242);
     }
 
     #[test]
