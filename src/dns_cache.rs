@@ -9,6 +9,13 @@
 //! Entries expire on the shortest TTL in the answer, so this never serves a
 //! record for longer than its authority allows, and remaining TTLs are counted
 //! down on the way out so clients see a consistent view.
+//!
+//! Negative answers are cached too, on the terms RFC 2308 sets: NXDOMAIN and
+//! NODATA expire on the SOA in the authority section. Without that the two most
+//! repetitive questions on a container bridge — a name that does not exist, and
+//! the AAAA half of every glibc lookup against an IPv4-only host — were
+//! re-forwarded upstream on every repetition, for as long as the client kept
+//! asking.
 
 use std::{
     collections::HashMap,
@@ -19,7 +26,7 @@ use std::{
 
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
-    rr::{DNSClass, RecordType},
+    rr::{DNSClass, RData, RecordType},
 };
 
 /// Upper bound on how long an entry may be served, whatever the record says.
@@ -83,7 +90,13 @@ impl DnsCache {
         response.metadata.id = request.metadata.id;
         response.metadata.recursion_desired = request.metadata.recursion_desired;
         response.queries = request.queries.clone();
-        for record in response.answers.iter_mut() {
+        // The authority section carries the SOA a negative answer expires on,
+        // so it counts down with the answers rather than being served whole.
+        for record in response
+            .answers
+            .iter_mut()
+            .chain(response.authorities.iter_mut())
+        {
             record.ttl = remaining;
         }
         response.to_vec().ok()
@@ -91,9 +104,10 @@ impl DnsCache {
 
     /// Remember a successful upstream response.
     ///
-    /// Only cacheable answers are kept: a complete `NOERROR` reply to a single
-    /// question, carrying at least one record with a usable TTL. Truncated,
-    /// error and empty responses are left alone rather than guessed at.
+    /// Only cacheable answers are kept: a complete reply to a single question,
+    /// either carrying at least one record with a usable TTL or denying the
+    /// name on an SOA that says how long the denial holds. Truncated responses
+    /// and server errors are left alone rather than guessed at.
     pub fn store(&self, query: &[u8], response: &[u8], upstream: SocketAddr, now: Instant) {
         let Ok(request) = Message::from_vec(query) else {
             return;
@@ -148,17 +162,44 @@ fn key_for(request: &Message, upstream: SocketAddr) -> Option<Key> {
 }
 
 /// How long this response may be served, or `None` if it must not be cached.
+///
+/// A positive answer expires on the shortest TTL it carries. A negative answer
+/// — NXDOMAIN, or NODATA, meaning NOERROR with an empty answer section —
+/// expires on the SOA in its authority section, which is the only thing in the
+/// message that says how long "no" remains true. A negative answer without that
+/// SOA stays uncacheable, as do truncated responses and every other rcode.
 fn cacheable_ttl(response: &Message) -> Option<Duration> {
-    if response.metadata.message_type != MessageType::Response
-        || response.metadata.response_code != ResponseCode::NoError
-        || response.metadata.truncation
-        || response.answers.is_empty()
-    {
+    if response.metadata.message_type != MessageType::Response || response.metadata.truncation {
         return None;
     }
-    let smallest = response.answers.iter().map(|record| record.ttl).min()?;
-    let ttl = Duration::from_secs(u64::from(smallest)).min(MAX_TTL);
+    let seconds = match response.metadata.response_code {
+        ResponseCode::NoError if !response.answers.is_empty() => {
+            response.answers.iter().map(|record| record.ttl).min()?
+        }
+        ResponseCode::NoError | ResponseCode::NXDomain => negative_ttl_seconds(response)?,
+        _ => return None,
+    };
+    let ttl = Duration::from_secs(u64::from(seconds)).min(MAX_TTL);
     (ttl >= MIN_TTL).then_some(ttl)
+}
+
+/// The negative-caching TTL: `min(SOA.MINIMUM, the SOA record's own TTL)`, per
+/// RFC 2308 section 3.
+///
+/// The denial is remembered against the question that was asked, not against
+/// the name as a whole. That is narrower than RFC 2308 permits for NXDOMAIN,
+/// which covers every type at the name, but it is what NODATA requires, and one
+/// rule for both keeps the cache unable to answer a question it was never told
+/// the answer to.
+fn negative_ttl_seconds(response: &Message) -> Option<u32> {
+    response
+        .authorities
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::SOA(soa) => Some(record.ttl.min(soa.minimum)),
+            _ => None,
+        })
+        .min()
 }
 
 /// Drop an expired entry if there is one, otherwise the oldest.
@@ -186,7 +227,10 @@ mod tests {
     use super::*;
     use hickory_proto::{
         op::{OpCode, Query},
-        rr::{rdata::A, Name, RData, Record},
+        rr::{
+            rdata::{A, SOA},
+            Name, RData, Record,
+        },
     };
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -221,6 +265,29 @@ mod tests {
         let mut message = Message::response(7, OpCode::Query);
         message.metadata.response_code = code;
         message.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        message.to_vec().unwrap()
+    }
+
+    /// A negative answer of the shape a real resolver sends: no records, and an
+    /// SOA in the authority section saying how long the denial holds.
+    fn negative_response(name: &str, code: ResponseCode, ttl: u32, minimum: u32) -> Vec<u8> {
+        let zone = Name::from_ascii("test.").unwrap();
+        let mut message = Message::response(7, OpCode::Query);
+        message.metadata.response_code = code;
+        message.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        message.add_authority(Record::from_rdata(
+            zone.clone(),
+            ttl,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns.test.").unwrap(),
+                Name::from_ascii("hostmaster.test.").unwrap(),
+                1,
+                7_200,
+                3_600,
+                1_209_600,
+                minimum,
+            )),
+        ));
         message.to_vec().unwrap()
     }
 
@@ -332,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_truncation_and_empty_answers_are_not_cached() {
+    fn errors_truncation_and_unqualified_denials_are_not_cached() {
         let cache = DnsCache::new(16);
         let now = Instant::now();
         cache.store(
@@ -437,6 +504,133 @@ mod tests {
             .lookup(&query("a.test."), other_upstream(), now)
             .is_none());
         assert!(cache.lookup(&query("a.test."), upstream(), now).is_some());
+    }
+
+    #[test]
+    fn an_nxdomain_is_cached_on_its_soa() {
+        // The load driver behind the incident: every repeat of a name that does
+        // not exist went upstream, because a denial was never remembered.
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        cache.store(
+            &query("gone.test."),
+            &negative_response("gone.test.", ResponseCode::NXDomain, 900, 60),
+            upstream(),
+            now,
+        );
+        let hit = cache
+            .lookup(
+                &query("gone.test."),
+                upstream(),
+                now + Duration::from_secs(30),
+            )
+            .unwrap();
+        let message = Message::from_vec(&hit).unwrap();
+        assert_eq!(message.metadata.response_code, ResponseCode::NXDomain);
+        assert!(message.answers.is_empty());
+        // Bounded by SOA MINIMUM, not by the SOA record's own longer TTL, and
+        // counted down like any other cached answer.
+        assert_eq!(message.authorities[0].ttl, 30);
+        assert!(cache
+            .lookup(
+                &query("gone.test."),
+                upstream(),
+                now + Duration::from_secs(60)
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn a_nodata_answer_is_cached_on_its_soa() {
+        // NOERROR with an empty answer section: every AAAA lookup for an
+        // IPv4-only host, which glibc asks for alongside every A.
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        cache.store(
+            &query("v4only.test."),
+            &negative_response("v4only.test.", ResponseCode::NoError, 30, 300),
+            upstream(),
+            now,
+        );
+        let hit = cache
+            .lookup(&query("v4only.test."), upstream(), now)
+            .unwrap();
+        let message = Message::from_vec(&hit).unwrap();
+        assert_eq!(message.metadata.response_code, ResponseCode::NoError);
+        assert!(message.answers.is_empty());
+        // The SOA's own TTL is the shorter of the two and therefore binds.
+        assert_eq!(message.authorities[0].ttl, 30);
+    }
+
+    #[test]
+    fn a_denial_the_upstream_did_not_qualify_is_not_cached() {
+        // No SOA means nothing said how long the denial holds, so guessing one
+        // would be inventing an answer.
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        cache.store(
+            &query("gone.test."),
+            &empty_response("gone.test.", ResponseCode::NXDomain),
+            upstream(),
+            now,
+        );
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn a_zero_minimum_denial_is_not_cached() {
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        cache.store(
+            &query("gone.test."),
+            &negative_response("gone.test.", ResponseCode::NXDomain, 900, 0),
+            upstream(),
+            now,
+        );
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn a_long_denial_is_capped_like_a_long_answer() {
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        cache.store(
+            &query("gone.test."),
+            &negative_response("gone.test.", ResponseCode::NXDomain, 86_400, 86_400),
+            upstream(),
+            now,
+        );
+        assert!(cache
+            .lookup(
+                &query("gone.test."),
+                upstream(),
+                now + MAX_TTL - Duration::from_secs(1)
+            )
+            .is_some());
+        assert!(cache
+            .lookup(&query("gone.test."), upstream(), now + MAX_TTL)
+            .is_none());
+    }
+
+    #[test]
+    fn a_server_failure_is_still_never_cached() {
+        // SERVFAIL says the resolver could not answer, not that there is no
+        // answer, so it must stay a miss however it is dressed.
+        let cache = DnsCache::new(16);
+        let now = Instant::now();
+        cache.store(
+            &query("a.test."),
+            &negative_response("a.test.", ResponseCode::ServFail, 900, 300),
+            upstream(),
+            now,
+        );
+        cache.store(
+            &query("b.test."),
+            &empty_response("b.test.", ResponseCode::Refused),
+            upstream(),
+            now,
+        );
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
