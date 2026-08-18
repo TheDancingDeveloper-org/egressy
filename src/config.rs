@@ -73,10 +73,6 @@ fn default_dns_concurrency() -> usize {
     512
 }
 
-fn default_dns_concurrency_per_client() -> usize {
-    64
-}
-
 fn default_dns_udp_attempts() -> u32 {
     2
 }
@@ -274,9 +270,15 @@ pub struct DnsConfig {
     pub upstream: DnsUpstreamConfig,
     pub timeout_ms: u64,
     pub max_concurrent_queries: usize,
-    /// Per-client bound, so one client cannot consume the whole global budget
-    /// and deny service to every other enrolled client.
-    pub max_concurrent_queries_per_client: usize,
+    /// A fixed per-client ceiling, so one client cannot consume the whole
+    /// global budget and deny service to every other enrolled client.
+    ///
+    /// Unset by default, in which case each client's bound is derived from the
+    /// global budget and the number of clients using the forwarder. A fixed
+    /// value cannot express a share: set against a global budget it does not
+    /// know, it either caps a single-tenant gateway far below its configured
+    /// capacity or fails to bound anything on a crowded one.
+    pub max_concurrent_queries_per_client: Option<usize>,
     pub udp_attempts: u32,
     pub failure_threshold: u32,
     pub success_threshold: u32,
@@ -320,7 +322,7 @@ impl Default for DnsConfig {
             local_zones: LocalZonesConfig::default(),
             cache: DnsCacheConfig::default(),
             max_concurrent_queries: default_dns_concurrency(),
-            max_concurrent_queries_per_client: default_dns_concurrency_per_client(),
+            max_concurrent_queries_per_client: None,
             udp_attempts: default_dns_udp_attempts(),
             failure_threshold: default_dns_failure_threshold(),
             success_threshold: default_dns_success_threshold(),
@@ -613,7 +615,7 @@ impl Config {
         }
         if self.dns.timeout_ms == 0
             || self.dns.max_concurrent_queries == 0
-            || self.dns.max_concurrent_queries_per_client == 0
+            || matches!(self.dns.max_concurrent_queries_per_client, Some(0))
             || self.dns.udp_attempts == 0
             || self.dns.failure_threshold == 0
             || self.dns.success_threshold == 0

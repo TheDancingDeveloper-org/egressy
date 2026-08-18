@@ -35,7 +35,12 @@ dns:
     source: profile
     addresses: []
   timeout_ms: 2000
-  max_concurrent_queries: 128
+  max_concurrent_queries: 512
+  # Optional fixed ceiling per client. Left unset, each client's bound is the
+  # global budget divided by the clients currently using the forwarder, never
+  # below 64 and never above the global budget, so a gateway with one busy
+  # client can reach the capacity configured above.
+  # max_concurrent_queries_per_client: 64
   udp_attempts: 2
   failure_threshold: 3
   success_threshold: 2

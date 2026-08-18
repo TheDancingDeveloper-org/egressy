@@ -3,10 +3,10 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context};
@@ -33,7 +33,9 @@ pub struct Settings {
     pub upstream: watch::Receiver<Option<SocketAddr>>,
     pub timeout: Duration,
     pub max_concurrent_queries: usize,
-    pub max_concurrent_queries_per_client: usize,
+    /// An operator-set fixed ceiling per client. `None` derives each client's
+    /// bound from the global budget and the number of clients using it.
+    pub max_concurrent_queries_per_client: Option<usize>,
     pub udp_attempts: u32,
     pub failure_threshold: u32,
     pub success_threshold: u32,
@@ -108,19 +110,80 @@ static QUERIES_REFUSED_PER_CLIENT: AtomicU64 = AtomicU64::new(0);
 /// A single global bound is not enough on a shared gateway: one client
 /// recovering from an outage can burst hard enough to consume every permit and
 /// deny service to every other enrolled client, which is what a real incident
-/// produced. Each client therefore also has its own smaller bound, so a noisy
-/// neighbour can exhaust its own share and no one else's.
+/// produced. Each client therefore also has its own bound, so a noisy neighbour
+/// can exhaust its own share and no one else's.
+///
+/// That bound is a *share* of the global budget rather than a constant. A fixed
+/// 64 against a global 512 means the gateway needs eight equally busy clients
+/// before the global bound can ever be the one that binds; below that the
+/// configured capacity is decorative, and a bridge with one busy client refuses
+/// traffic at an eighth of what it was told to allow while 448 permits sit
+/// idle. The share is therefore the global budget divided by the clients
+/// currently using the forwarder — floored, so a bridge full of quiet clients
+/// cannot squeeze a busy one down to nothing, and capped at the global budget,
+/// which remains the only bound on total load.
 pub struct QueryPermits {
     global: Arc<Semaphore>,
-    per_client: StdMutex<HashMap<IpAddr, Arc<Semaphore>>>,
-    per_client_limit: usize,
+    global_limit: usize,
+    clients: StdMutex<ClientTable>,
+    /// An operator-set fixed ceiling, which overrides the derived share.
+    fixed_per_client: Option<usize>,
+}
+
+/// The floor under a derived share. Below this a client has too little
+/// concurrency to resolve at a useful rate, and the global budget is the bound
+/// that should be shedding load.
+const MIN_CLIENT_SHARE: usize = 64;
+
+/// How long a client counts towards the divisor after its last query.
+const CLIENT_IDLE_AFTER: Duration = Duration::from_secs(60);
+
+/// How often idle clients are swept. The divisor changes on the timescale
+/// clients arrive and leave, so a stale count for up to this long is harmless
+/// and keeps the sweep off the per-query path.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+
+const MAX_TRACKED_CLIENTS: usize = 1_024;
+
+struct ClientTable {
+    loads: HashMap<IpAddr, ClientLoad>,
+    pruned_at: Instant,
+}
+
+struct ClientLoad {
+    in_flight: Arc<AtomicUsize>,
+    last_seen: Instant,
 }
 
 /// Held for the lifetime of a forwarded query.
 #[derive(Debug)]
 pub struct QueryPermit {
-    _global: tokio::sync::OwnedSemaphorePermit,
-    _client: tokio::sync::OwnedSemaphorePermit,
+    global: tokio::sync::OwnedSemaphorePermit,
+    client: ClientSlot,
+}
+
+/// One in-flight query against a client's share, returned when dropped.
+#[derive(Debug)]
+pub struct ClientSlot(Arc<AtomicUsize>);
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl QueryPermit {
+    /// Separate admission from the work it admitted.
+    ///
+    /// A client's slot is what refuses traffic, and holding one across the
+    /// whole retry ladder is what converted upstream latency into refusals: two
+    /// UDP attempts and a TCP fallback can occupy a slot for the better part of
+    /// ten seconds, so a slow resolver closed the door in proportion to its own
+    /// latency. Dropping the returned slot gives the share back while the query
+    /// continues; the global permit still bounds total in-flight work.
+    pub fn into_parts(self) -> (tokio::sync::OwnedSemaphorePermit, ClientSlot) {
+        (self.global, self.client)
+    }
 }
 
 /// Why a query was refused, so the two causes stay distinguishable in logs.
@@ -131,49 +194,100 @@ pub enum Refusal {
 }
 
 impl QueryPermits {
-    pub fn new(global: usize, per_client: usize) -> Self {
+    pub fn new(global: usize, per_client: Option<usize>) -> Self {
+        let global_limit = global.max(1);
         Self {
-            global: Arc::new(Semaphore::new(global)),
-            per_client: StdMutex::new(HashMap::new()),
-            per_client_limit: per_client.max(1).min(global.max(1)),
+            global: Arc::new(Semaphore::new(global_limit)),
+            global_limit,
+            clients: StdMutex::new(ClientTable {
+                loads: HashMap::new(),
+                pruned_at: Instant::now(),
+            }),
+            fixed_per_client: per_client.map(|limit| limit.clamp(1, global_limit)),
         }
     }
 
     pub fn try_acquire(&self, client: IpAddr) -> Result<QueryPermit, Refusal> {
-        let client_permits = self.client_semaphore(client);
+        let (in_flight, limit) = self.client_share(client, Instant::now());
         // Take the client's share first: refusing here is the cheaper outcome
         // and keeps a burst from briefly holding global permits.
-        let client_permit = client_permits
-            .try_acquire_owned()
-            .map_err(|_| Refusal::ClientLimit)?;
-        let global_permit = Arc::clone(&self.global)
+        let slot = claim(&in_flight, limit).ok_or(Refusal::ClientLimit)?;
+        let global = Arc::clone(&self.global)
             .try_acquire_owned()
             .map_err(|_| Refusal::GlobalLimit)?;
         Ok(QueryPermit {
-            _global: global_permit,
-            _client: client_permit,
+            global,
+            client: slot,
         })
     }
 
-    fn client_semaphore(&self, client: IpAddr) -> Arc<Semaphore> {
-        let mut clients = self
-            .per_client
+    /// This client's in-flight counter and the bound that currently applies.
+    fn client_share(&self, client: IpAddr, now: Instant) -> (Arc<AtomicUsize>, usize) {
+        let mut table = self
+            .clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Drop idle entries so the map cannot grow without bound on a busy
-        // bridge. An entry is idle when nothing holds one of its permits.
-        if clients.len() > MAX_TRACKED_CLIENTS {
-            clients.retain(|_, semaphore| semaphore.available_permits() < self.per_client_limit);
+        prune(&mut table, now);
+        let load = table.loads.entry(client).or_insert_with(|| ClientLoad {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            last_seen: now,
+        });
+        load.last_seen = now;
+        let in_flight = Arc::clone(&load.in_flight);
+        (in_flight, self.limit_for(table.loads.len()))
+    }
+
+    #[cfg(test)]
+    fn tracked_clients(&self) -> usize {
+        self.clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .loads
+            .len()
+    }
+
+    /// The per-client bound when `active_clients` are using the forwarder.
+    fn limit_for(&self, active_clients: usize) -> usize {
+        if let Some(fixed) = self.fixed_per_client {
+            return fixed;
         }
-        Arc::clone(
-            clients
-                .entry(client)
-                .or_insert_with(|| Arc::new(Semaphore::new(self.per_client_limit))),
-        )
+        let share = self.global_limit / active_clients.max(1);
+        share.clamp(MIN_CLIENT_SHARE.min(self.global_limit), self.global_limit)
     }
 }
 
-const MAX_TRACKED_CLIENTS: usize = 1_024;
+/// Take a slot against a client's share, or `None` if the share is full.
+fn claim(in_flight: &Arc<AtomicUsize>, limit: usize) -> Option<ClientSlot> {
+    let mut current = in_flight.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return None;
+        }
+        match in_flight.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(ClientSlot(Arc::clone(in_flight))),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Forget clients that have stopped asking, so they neither hold memory nor
+/// dilute the share of the clients that are still here.
+fn prune(table: &mut ClientTable, now: Instant) {
+    let over_capacity = table.loads.len() > MAX_TRACKED_CLIENTS;
+    if !over_capacity && now.saturating_duration_since(table.pruned_at) < PRUNE_INTERVAL {
+        return;
+    }
+    table.loads.retain(|_, load| {
+        load.in_flight.load(Ordering::Acquire) > 0
+            || (!over_capacity && now.saturating_duration_since(load.last_seen) < CLIENT_IDLE_AFTER)
+    });
+    table.pruned_at = now;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DebouncedStatus {
@@ -415,14 +529,29 @@ async fn serve_udp(
             }
         };
         workers.spawn(async move {
-            let _permit = permit;
+            let (_global, client_slot) = permit.into_parts();
+            // Given back as soon as the query stops competing for admission,
+            // which is when it leaves UDP for the TCP fallback. Beyond that
+            // point it is waiting on the upstream, and a query waiting on a
+            // slow resolver must not be refusing another client's.
+            let mut client_slot = Some(client_slot);
             let Some(upstream) = *settings.upstream.borrow() else {
                 observe_udp_health(settings.publisher.as_ref(), &health, false).await;
                 warn!(%client, "DNS upstream is not configured");
                 answer_with_rcode(&listener, client, &query, ResponseCode::ServFail).await;
                 return;
             };
-            match forward_query(&query, upstream, settings.timeout, settings.udp_attempts).await {
+            match forward_query(
+                &query,
+                upstream,
+                settings.timeout,
+                settings.udp_attempts,
+                || {
+                    client_slot.take();
+                },
+            )
+            .await
+            {
                 Ok(result) => {
                     observe_udp_health(
                         settings.publisher.as_ref(),
@@ -542,11 +671,17 @@ async fn refuse_tcp_client(
     write_tcp_message(client, &response, request_timeout).await
 }
 
+/// Run the retry ladder for one query.
+///
+/// `leaving_udp` is called when the query gives up on UDP for the TCP fallback,
+/// so the caller can release admission capacity it no longer needs to hold. It
+/// may be called more than once and must be idempotent.
 async fn forward_query(
     query: &[u8],
     upstream: SocketAddr,
     request_timeout: Duration,
     udp_attempts: u32,
+    mut leaving_udp: impl FnMut(),
 ) -> anyhow::Result<ForwardResult> {
     validate_dns_message(query)?;
     let mut last_error = None;
@@ -556,6 +691,7 @@ async fn forward_query(
         match udp_exchange(query, upstream, request_timeout).await {
             Ok(response) if is_truncated(&response)? => {
                 debug!("DNS UDP response truncated; retrying over TCP");
+                leaving_udp();
                 TCP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 let response = tcp_exchange(query, upstream, request_timeout).await?;
                 TCP_FALLBACK_SUCCESSES.fetch_add(1, Ordering::Relaxed);
@@ -585,6 +721,7 @@ async fn forward_query(
         }
     }
     UDP_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+    leaving_udp();
     TCP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     match tcp_exchange(query, upstream, request_timeout).await {
         Ok(response) => {
@@ -816,7 +953,7 @@ mod tests {
     fn one_client_cannot_consume_the_whole_global_budget() {
         // The observed incident: a single client bursting hard enough to
         // starve every other enrolled client.
-        let permits = QueryPermits::new(8, 2);
+        let permits = QueryPermits::new(8, Some(2));
         let _held: Vec<_> = (0..2)
             .map(|_| {
                 permits
@@ -834,7 +971,7 @@ mod tests {
 
     #[test]
     fn the_global_limit_still_applies_across_clients() {
-        let permits = QueryPermits::new(2, 2);
+        let permits = QueryPermits::new(2, Some(2));
         let _a = permits.try_acquire(client(11)).unwrap();
         let _b = permits.try_acquire(client(12)).unwrap();
         assert_eq!(
@@ -845,7 +982,7 @@ mod tests {
 
     #[test]
     fn permits_are_returned_when_a_query_finishes() {
-        let permits = QueryPermits::new(4, 1);
+        let permits = QueryPermits::new(4, Some(1));
         {
             let _held = permits.try_acquire(client(11)).unwrap();
             assert!(permits.try_acquire(client(11)).is_err());
@@ -854,9 +991,78 @@ mod tests {
     }
 
     #[test]
+    fn a_single_client_may_use_the_whole_global_budget() {
+        // The observed failure: 14,237 queries refused on the per-client bound
+        // while the global budget was never once reached, on a bridge with
+        // effectively one DNS client. A share of one is the whole thing.
+        let permits = QueryPermits::new(512, None);
+        let held: Vec<_> = (0..512)
+            .map(|_| permits.try_acquire(client(11)).expect("within the budget"))
+            .collect();
+        // The whole configured capacity, not the eighth of it a fixed 64 left
+        // reachable while 448 permits sat idle.
+        assert_eq!(held.len(), permits.global_limit);
+        assert!(permits.try_acquire(client(11)).is_err());
+        drop(held);
+    }
+
+    #[test]
+    fn the_share_narrows_as_clients_arrive_and_never_below_the_floor() {
+        let permits = QueryPermits::new(512, None);
+        assert_eq!(permits.limit_for(1), 512);
+        assert_eq!(permits.limit_for(2), 256);
+        assert_eq!(permits.limit_for(8), 64);
+        // Past the floor the global budget is the bound that should shed load;
+        // squeezing every client further only refuses traffic the gateway has
+        // the capacity to serve.
+        assert_eq!(permits.limit_for(64), MIN_CLIENT_SHARE);
+        assert_eq!(permits.limit_for(4096), MIN_CLIENT_SHARE);
+    }
+
+    #[test]
+    fn the_share_reflects_the_clients_actually_using_the_forwarder() {
+        let permits = QueryPermits::new(512, None);
+        let _first = permits.try_acquire(client(11)).unwrap();
+        assert_eq!(permits.tracked_clients(), 1);
+        let _second = permits.try_acquire(client(12)).unwrap();
+        assert_eq!(permits.tracked_clients(), 2);
+    }
+
+    #[test]
+    fn a_fixed_ceiling_overrides_the_derived_share() {
+        // An operator who sets the key gets exactly what they asked for, on a
+        // gateway of any size.
+        let permits = QueryPermits::new(512, Some(4));
+        let _held: Vec<_> = (0..4)
+            .map(|_| permits.try_acquire(client(11)).expect("within the ceiling"))
+            .collect();
+        assert_eq!(
+            permits.try_acquire(client(11)).unwrap_err(),
+            Refusal::ClientLimit
+        );
+    }
+
+    #[test]
+    fn a_query_that_leaves_udp_stops_holding_admission() {
+        // Upstream latency must degrade latency, not close the door: the slot
+        // goes back when the query stops competing for admission, while the
+        // global permit keeps bounding the work itself.
+        let permits = QueryPermits::new(4, Some(1));
+        let (global, slot) = permits.try_acquire(client(11)).unwrap().into_parts();
+        assert_eq!(
+            permits.try_acquire(client(11)).unwrap_err(),
+            Refusal::ClientLimit
+        );
+        drop(slot);
+        let next = permits.try_acquire(client(11));
+        assert!(next.is_ok(), "the share should be free once released");
+        drop(global);
+    }
+
+    #[test]
     fn a_per_client_limit_above_the_global_one_is_clamped() {
-        let permits = QueryPermits::new(2, 99);
-        assert_eq!(permits.per_client_limit, 2);
+        let permits = QueryPermits::new(2, Some(99));
+        assert_eq!(permits.limit_for(1), 2);
         let _a = permits.try_acquire(client(11)).unwrap();
         let _b = permits.try_acquire(client(11)).unwrap();
         // Refused either way; a client share declared wider than the global
@@ -866,12 +1072,12 @@ mod tests {
 
     #[test]
     fn idle_client_entries_do_not_accumulate_without_bound() {
-        let permits = QueryPermits::new(4096, 2);
+        let permits = QueryPermits::new(4096, Some(2));
         for index in 0..(MAX_TRACKED_CLIENTS + 64) {
             let address = IpAddr::from(((index as u32) + 1).to_be_bytes());
             drop(permits.try_acquire(address));
         }
-        let tracked = permits.per_client.lock().unwrap().len();
+        let tracked = permits.clients.lock().unwrap().loads.len();
         assert!(tracked <= MAX_TRACKED_CLIENTS + 1, "tracked {tracked}");
     }
 
