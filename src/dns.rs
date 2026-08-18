@@ -296,6 +296,39 @@ enum DebouncedStatus {
     Degraded,
 }
 
+/// Why resolution is failing. Both are the same event to the client — it asked
+/// and got nothing usable — but they are different things to fix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Failure {
+    /// The gateway tried and the upstream did not answer.
+    Upstream,
+    /// The gateway refused before trying, on admission control.
+    Admission,
+}
+
+/// A verdict worth publishing, with the cause that produced it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Verdict {
+    status: DebouncedStatus,
+    cause: Option<Failure>,
+}
+
+/// How long a degraded verdict is held before a recovery may clear it.
+///
+/// The thresholds either side of this are counts of queries, not durations. On
+/// a gateway serving ~31 qps, three failures and two successes are about a
+/// tenth of a second and a twentieth of a second, so on their own they turn a
+/// burst of upstream failures into a state change and back before anything can
+/// observe it: a gauge read every 15-60s never samples it, and the bounded
+/// transition history fills with pairs that cancel within the same timestamp.
+/// A degraded episode has to outlive a scrape interval to be worth publishing
+/// at all.
+const DEGRADED_DWELL: Duration = Duration::from_secs(60);
+
+/// How often an unchanged verdict is re-published, so the check keeps a recent
+/// observation without costing a snapshot clone per query.
+const HEALTH_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 struct DnsHealthState {
     status: DebouncedStatus,
@@ -303,6 +336,11 @@ struct DnsHealthState {
     consecutive_successes: u32,
     failure_threshold: u32,
     success_threshold: u32,
+    /// Fixed for the length of an episode, so the reason code the check
+    /// publishes does not alternate while it stays degraded.
+    degraded_cause: Option<Failure>,
+    degraded_since: Option<Instant>,
+    published_at: Option<Instant>,
 }
 
 impl DnsHealthState {
@@ -313,41 +351,81 @@ impl DnsHealthState {
             consecutive_successes: 0,
             failure_threshold,
             success_threshold,
+            degraded_cause: None,
+            degraded_since: None,
+            published_at: None,
         }
     }
 
-    fn record(&mut self, success: bool) -> Option<DebouncedStatus> {
-        if success {
-            self.consecutive_failures = 0;
-            self.consecutive_successes = self.consecutive_successes.saturating_add(1);
-            match self.status {
-                DebouncedStatus::Unknown => {
-                    self.status = DebouncedStatus::Healthy;
-                    Some(self.status)
+    /// Fold one query's outcome into the verdict, returning it when it is worth
+    /// publishing. `failure` is `None` for a query that was answered.
+    fn record(&mut self, failure: Option<Failure>, now: Instant) -> Option<Verdict> {
+        match failure {
+            None => {
+                self.consecutive_failures = 0;
+                self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+                match self.status {
+                    DebouncedStatus::Unknown => self.enter(DebouncedStatus::Healthy, None, now),
+                    DebouncedStatus::Degraded
+                        if self.consecutive_successes >= self.success_threshold
+                            && self.degraded_for(now) >= DEGRADED_DWELL =>
+                    {
+                        self.enter(DebouncedStatus::Healthy, None, now)
+                    }
+                    _ => self.reaffirm(now),
                 }
-                DebouncedStatus::Healthy => Some(self.status),
-                DebouncedStatus::Degraded
-                    if self.consecutive_successes >= self.success_threshold =>
-                {
-                    self.status = DebouncedStatus::Healthy;
-                    Some(self.status)
-                }
-                DebouncedStatus::Degraded => None,
             }
-        } else {
-            self.consecutive_successes = 0;
-            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-            match self.status {
-                DebouncedStatus::Unknown | DebouncedStatus::Healthy
-                    if self.consecutive_failures >= self.failure_threshold =>
-                {
-                    self.status = DebouncedStatus::Degraded;
-                    Some(self.status)
+            Some(cause) => {
+                self.consecutive_successes = 0;
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                match self.status {
+                    DebouncedStatus::Unknown | DebouncedStatus::Healthy
+                        if self.consecutive_failures >= self.failure_threshold =>
+                    {
+                        self.enter(DebouncedStatus::Degraded, Some(cause), now)
+                    }
+                    _ => self.reaffirm(now),
                 }
-                DebouncedStatus::Degraded => Some(self.status),
-                DebouncedStatus::Unknown | DebouncedStatus::Healthy => None,
             }
         }
+    }
+
+    fn enter(
+        &mut self,
+        status: DebouncedStatus,
+        cause: Option<Failure>,
+        now: Instant,
+    ) -> Option<Verdict> {
+        self.status = status;
+        self.degraded_cause = cause;
+        self.degraded_since = (status == DebouncedStatus::Degraded).then_some(now);
+        self.published_at = Some(now);
+        Some(Verdict { status, cause })
+    }
+
+    /// Re-state an unchanged verdict, but no more often than the republish
+    /// interval: at 31 qps, publishing per query is 31 snapshot clones a second
+    /// that say nothing new.
+    fn reaffirm(&mut self, now: Instant) -> Option<Verdict> {
+        if self.status == DebouncedStatus::Unknown {
+            return None;
+        }
+        match self.published_at {
+            Some(at) if now.saturating_duration_since(at) < HEALTH_REPUBLISH_INTERVAL => None,
+            _ => {
+                self.published_at = Some(now);
+                Some(Verdict {
+                    status: self.status,
+                    cause: self.degraded_cause,
+                })
+            }
+        }
+    }
+
+    fn degraded_for(&self, now: Instant) -> Duration {
+        self.degraded_since
+            .map(|since| now.saturating_duration_since(since))
+            .unwrap_or_default()
     }
 }
 
@@ -521,6 +599,13 @@ async fn serve_udp(
             Err(refusal) => {
                 record_refusal(refusal);
                 warn!(%client, ?refusal, "DNS query refused by concurrency limit");
+                // A refused query is a failure to resolve, whoever caused it.
+                observe_resolution_health(
+                    settings.publisher.as_ref(),
+                    &health,
+                    Some(Failure::Admission),
+                )
+                .await;
                 // REFUSED, not silence: the gateway declined to try, which is a
                 // condition the client can act on now rather than in five
                 // seconds' time.
@@ -536,7 +621,12 @@ async fn serve_udp(
             // slow resolver must not be refusing another client's.
             let mut client_slot = Some(client_slot);
             let Some(upstream) = *settings.upstream.borrow() else {
-                observe_udp_health(settings.publisher.as_ref(), &health, false).await;
+                observe_resolution_health(
+                    settings.publisher.as_ref(),
+                    &health,
+                    Some(Failure::Upstream),
+                )
+                .await;
                 warn!(%client, "DNS upstream is not configured");
                 answer_with_rcode(&listener, client, &query, ResponseCode::ServFail).await;
                 return;
@@ -553,10 +643,10 @@ async fn serve_udp(
             .await
             {
                 Ok(result) => {
-                    observe_udp_health(
+                    observe_resolution_health(
                         settings.publisher.as_ref(),
                         &health,
-                        result.udp_succeeded,
+                        (!result.udp_succeeded).then_some(Failure::Upstream),
                     )
                     .await;
                     if result.tcp_used {
@@ -578,7 +668,12 @@ async fn serve_udp(
                     }
                 }
                 Err(error) => {
-                    observe_udp_health(settings.publisher.as_ref(), &health, false).await;
+                    observe_resolution_health(
+                        settings.publisher.as_ref(),
+                        &health,
+                        Some(Failure::Upstream),
+                    )
+                    .await;
                     warn!(%client, %error, "DNS forwarding failed");
                     // SERVFAIL: the gateway tried and could not get an answer.
                     answer_with_rcode(&listener, client, &query, ResponseCode::ServFail).await;
@@ -762,16 +857,38 @@ async fn udp_exchange(
     Ok(response)
 }
 
-async fn observe_udp_health(
+/// Fold one query's outcome into the published resolution verdict.
+///
+/// Every outcome a client experiences belongs here, not just the ones that
+/// reached the upstream. A query refused by admission control never reached a
+/// worker, so the check could not see the largest failure population on the
+/// reported gateway by construction — 14,343 refusals against 229 forwarding
+/// failures — and reported healthy throughout while a client had no working
+/// DNS at all.
+async fn observe_resolution_health(
     publisher: Option<&StatePublisher>,
     health: &Mutex<DnsHealthState>,
-    success: bool,
+    failure: Option<Failure>,
 ) {
     let Some(publisher) = publisher else { return };
-    let observation = health.lock().await.record(success);
-    let Some(status) = observation else { return };
-    let healthy = status == DebouncedStatus::Healthy;
+    let observation = health.lock().await.record(failure, Instant::now());
+    let Some(verdict) = observation else { return };
+    let healthy = verdict.status == DebouncedStatus::Healthy;
     RESOLUTION_HEALTHY.store(u64::from(healthy), Ordering::Relaxed);
+    let (reason_code, message) = match verdict.cause {
+        None => (
+            "dns.udp_healthy",
+            "The in-tunnel resolver answered over UDP",
+        ),
+        Some(Failure::Upstream) => (
+            "dns.upstream_udp_failures",
+            "Consecutive queries exhausted all in-tunnel UDP attempts",
+        ),
+        Some(Failure::Admission) => (
+            "dns.queries_refused",
+            "Consecutive queries were refused before reaching the resolver",
+        ),
+    };
     publisher
         .observe(
             "dns.upstream_udp",
@@ -781,16 +898,8 @@ async fn observe_udp_health(
                 CheckStatus::Degraded
             },
             Impact::Critical,
-            if healthy {
-                "dns.udp_healthy"
-            } else {
-                "dns.upstream_udp_failures"
-            },
-            if healthy {
-                "The in-tunnel resolver answered over UDP"
-            } else {
-                "Consecutive queries exhausted all in-tunnel UDP attempts"
-            },
+            reason_code,
+            message,
             None,
             None,
         )
@@ -1188,18 +1297,96 @@ mod tests {
         assert_eq!(response.metadata.id, 4242);
     }
 
+    fn status_of(verdict: Option<Verdict>) -> Option<DebouncedStatus> {
+        verdict.map(|verdict| verdict.status)
+    }
+
     #[test]
-    fn dns_health_requires_consecutive_failures_and_recovery_successes() {
+    fn dns_health_requires_consecutive_failures_before_degrading() {
         let mut health = DnsHealthState::new(3, 2);
-        assert_eq!(health.record(true), Some(DebouncedStatus::Healthy));
-        assert_eq!(health.record(false), None);
-        assert_eq!(health.record(true), Some(DebouncedStatus::Healthy));
-        assert_eq!(health.record(false), None);
-        assert_eq!(health.record(false), None);
-        assert_eq!(health.record(false), Some(DebouncedStatus::Degraded));
-        assert_eq!(health.record(true), None);
-        assert_eq!(health.record(false), Some(DebouncedStatus::Degraded));
-        assert_eq!(health.record(true), None);
-        assert_eq!(health.record(true), Some(DebouncedStatus::Healthy));
+        let start = Instant::now();
+        assert_eq!(
+            status_of(health.record(None, start)),
+            Some(DebouncedStatus::Healthy)
+        );
+        // An isolated failure is noise; the counters exist to ignore it.
+        assert_eq!(health.record(Some(Failure::Upstream), start), None);
+        assert_eq!(health.record(None, start), None);
+        assert_eq!(health.record(Some(Failure::Upstream), start), None);
+        assert_eq!(health.record(Some(Failure::Upstream), start), None);
+        assert_eq!(
+            status_of(health.record(Some(Failure::Upstream), start)),
+            Some(DebouncedStatus::Degraded)
+        );
+    }
+
+    #[test]
+    fn a_degraded_verdict_outlives_the_burst_that_caused_it() {
+        // The observed failure: 23 degraded episodes, every one of them back to
+        // healthy within the same second and 15 within the same timestamp. A
+        // gauge scraped every 15-60s never sampled one, so a resolver in
+        // trouble published healthy throughout.
+        let mut health = DnsHealthState::new(3, 2);
+        let start = Instant::now();
+        for _ in 0..3 {
+            health.record(Some(Failure::Upstream), start);
+        }
+        assert_eq!(health.status, DebouncedStatus::Degraded);
+
+        // Two successes 65ms later would have cleared it before.
+        let burst_over = start + Duration::from_millis(65);
+        assert_eq!(health.record(None, burst_over), None);
+        assert_eq!(health.record(None, burst_over), None);
+        assert_eq!(health.status, DebouncedStatus::Degraded);
+
+        // Held until the episode has lasted long enough to be observable, then
+        // cleared by the successes that were already accumulating.
+        let settled = start + DEGRADED_DWELL;
+        assert_eq!(
+            status_of(health.record(None, settled)),
+            Some(DebouncedStatus::Healthy)
+        );
+    }
+
+    #[test]
+    fn refusals_degrade_resolution_health_on_their_own() {
+        // A client whose queries are all being refused has no working DNS,
+        // whatever the upstream would have said.
+        let mut health = DnsHealthState::new(3, 2);
+        let start = Instant::now();
+        health.record(None, start);
+        for _ in 0..2 {
+            assert_eq!(health.record(Some(Failure::Admission), start), None);
+        }
+        let verdict = health.record(Some(Failure::Admission), start).unwrap();
+        assert_eq!(verdict.status, DebouncedStatus::Degraded);
+        assert_eq!(verdict.cause, Some(Failure::Admission));
+    }
+
+    #[test]
+    fn the_cause_stays_fixed_for_the_length_of_an_episode() {
+        // Otherwise an episode with both causes churns the bounded transition
+        // history with reason-code changes that are not state changes.
+        let mut health = DnsHealthState::new(1, 1);
+        let start = Instant::now();
+        let verdict = health.record(Some(Failure::Admission), start).unwrap();
+        assert_eq!(verdict.cause, Some(Failure::Admission));
+        let later = start + HEALTH_REPUBLISH_INTERVAL;
+        let reaffirmed = health.record(Some(Failure::Upstream), later).unwrap();
+        assert_eq!(reaffirmed.status, DebouncedStatus::Degraded);
+        assert_eq!(reaffirmed.cause, Some(Failure::Admission));
+    }
+
+    #[test]
+    fn an_unchanged_verdict_is_not_republished_per_query() {
+        // At ~31 qps this was a snapshot clone and a broadcast per query, all
+        // of them saying the same thing.
+        let mut health = DnsHealthState::new(3, 2);
+        let start = Instant::now();
+        assert!(health.record(None, start).is_some());
+        assert_eq!(health.record(None, start + Duration::from_secs(1)), None);
+        assert!(health
+            .record(None, start + HEALTH_REPUBLISH_INTERVAL)
+            .is_some());
     }
 }
