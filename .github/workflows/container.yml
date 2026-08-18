@@ -23,9 +23,19 @@ permissions:
   contents: read
   packages: write
 
+# One in-flight run per ref. Three pushes in 40 minutes previously left
+# three builds running concurrently, occupying every Docker-capable runner
+# while everything else queued behind them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: [self-hosted, node-b, linux, x64, docker]
+    # publish, not docker: node-b-gha-public-rust advertises `docker` but has
+    # no DinD sidecar, so a container build can land on a worker with no
+    # Docker daemon. Only the publish pair is backed by a real daemon.
+    runs-on: [self-hosted, publish]
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
@@ -50,13 +60,21 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          # arm64 is emulated through QEMU and is roughly an order of magnitude
+          # slower than a native build. Doing it on every push to main cost 80+
+          # minutes per run and starved the whole fleet; it is only needed on
+          # what we actually ship, so it is restricted to tags.
+          platforms: ${{ startsWith(github.ref, 'refs/tags/v') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.gateway.outputs.tags }}
           labels: ${{ steps.gateway.outputs.labels }}
-          # GHA cache export is disabled: the self-hosted BuildKit path can wedge during cache finalization.
-          cache-from: ''
-          cache-to: ''
+          # Registry-backed cache, not type=gha: the GHA cache export is what
+          # wedged during finalization on the self-hosted BuildKit path, and a
+          # local cache would not survive job-completed.sh wiping the
+          # workspace after every job. Writing needs registry auth, so both
+          # directions are gated on the same condition as the login step.
+          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache', github.repository) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache,mode=max', github.repository) || '' }}
       - name: External validator image metadata
         id: validator
         uses: docker/metadata-action@v6
@@ -71,9 +89,18 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: external-probe
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          # arm64 is emulated through QEMU and is roughly an order of magnitude
+          # slower than a native build. Doing it on every push to main cost 80+
+          # minutes per run and starved the whole fleet; it is only needed on
+          # what we actually ship, so it is restricted to tags.
+          platforms: ${{ startsWith(github.ref, 'refs/tags/v') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.validator.outputs.tags }}
           labels: ${{ steps.validator.outputs.labels }}
-          cache-from: ''
-          cache-to: ''
+          # Registry-backed cache, not type=gha: the GHA cache export is what
+          # wedged during finalization on the self-hosted BuildKit path, and a
+          # local cache would not survive job-completed.sh wiping the
+          # workspace after every job. Writing needs registry auth, so both
+          # directions are gated on the same condition as the login step.
+          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}-external-probe:buildcache', github.repository) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}-external-probe:buildcache,mode=max', github.repository) || '' }}

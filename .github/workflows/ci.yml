@@ -21,6 +21,13 @@ on:
 permissions:
   contents: read
 
+# One in-flight run per ref. Three pushes in 40 minutes previously left
+# three builds running concurrently, occupying every Docker-capable runner
+# while everything else queued behind them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust-and-validator:
     runs-on: [self-hosted, node-b, linux, x64]
