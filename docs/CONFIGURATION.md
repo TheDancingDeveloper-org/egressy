@@ -72,7 +72,10 @@ the constraints that keep it from shadowing public names or leaking internal
 ones. `cache` bounds a response cache that expires entries on the answer's own
 shortest TTL, capped at five minutes, and keys them on the exit resolver so a
 tunnel that moves exit server misses rather than serving what the previous one
-said.
+said. Denials are cached on the same terms RFC 2308 sets: NXDOMAIN and NODATA
+expire on the SOA in the authority section, bounded by its MINIMUM field and by
+the same five-minute cap. A denial the upstream did not qualify with an SOA is
+not cached, and no other rcode is.
 
 Resolution health is exported as `egressy_dns_resolution_healthy`, and is the
 signal to alert on. The container healthcheck probes `/livez`, which reports
