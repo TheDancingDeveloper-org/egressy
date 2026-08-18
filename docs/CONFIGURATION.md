@@ -65,7 +65,11 @@ Use `profile` to derive IPv4 DNS from the profile or `explicit` with
 total load, while `max_concurrent_queries_per_client` bounds any single client.
 Both matter: a global bound alone lets one client recovering from an outage
 consume every permit and deny service to every other enrolled client. Refusals
-are counted separately per limit in `egressy_dns_queries_refused_total`.
+are counted separately per limit in `egressy_dns_queries_refused_total`, and
+are answered REFUSED rather than dropped, so a refused client fails now instead
+of waiting out its own resolver timeout and retrying into the same limit. A
+query the gateway tried and could not answer is answered SERVFAIL on the same
+reasoning.
 `local_zones.enabled` answers single-label enrolled-bridge container names
 from Docker discovery instead of forwarding them; see `docs/NETWORKING.md` for
 the constraints that keep it from shadowing public names or leaking internal
