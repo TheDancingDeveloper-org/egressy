@@ -62,9 +62,18 @@ singular API field; when unset, a sole lease is selected automatically.
 Use `profile` to derive IPv4 DNS from the profile or `explicit` with
 `upstream.addresses` for reviewed overrides.
 `timeout_ms` limits each upstream attempt and `max_concurrent_queries` bounds
-total load, while `max_concurrent_queries_per_client` bounds any single client.
-Both matter: a global bound alone lets one client recovering from an outage
-consume every permit and deny service to every other enrolled client. Refusals
+total load, while a per-client bound stops any single client consuming it all:
+a global bound alone lets one client recovering from an outage take every
+permit and deny service to every other enrolled client.
+
+That per-client bound is a share of the global budget — the budget divided by
+the clients currently using the forwarder, floored at 64 and capped at the
+global budget — so a gateway with one busy client can reach the capacity it is
+configured for instead of stopping at a fixed fraction of it. Set
+`max_concurrent_queries_per_client` to pin a fixed ceiling instead; it is unset
+by default. A client's share is released when its query leaves UDP for the TCP
+fallback, so a slow upstream costs latency rather than admission capacity.
+Refusals
 are counted separately per limit in `egressy_dns_queries_refused_total`, and
 are answered REFUSED rather than dropped, so a refused client fails now instead
 of waiting out its own resolver timeout and retrying into the same limit. A
