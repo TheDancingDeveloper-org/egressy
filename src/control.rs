@@ -90,10 +90,7 @@ impl StatePublisher {
                 safe_message,
                 recovery_attempt,
             };
-            if state.transitions.len() == TRANSITION_CAPACITY {
-                state.transitions.pop_front();
-            }
-            state.transitions.push_back(transition.clone());
+            crate::domain::push_transition(&mut state.transitions, transition.clone());
             let _ = self.events.send(transition);
         }
         state.derive_aggregate();
@@ -123,10 +120,7 @@ impl StatePublisher {
             safe_message: safe_message.to_owned(),
             recovery_attempt: None,
         };
-        if state.transitions.len() == TRANSITION_CAPACITY {
-            state.transitions.pop_front();
-        }
-        state.transitions.push_back(transition.clone());
+        crate::domain::push_transition(&mut state.transitions, transition.clone());
         let _ = self.events.send(transition);
         self.snapshots.send_replace(state.clone());
     }
