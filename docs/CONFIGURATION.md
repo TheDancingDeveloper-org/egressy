@@ -109,8 +109,12 @@ checks and is the stricter choice if you want the container marked unhealthy.
 the same in-tunnel resolver. `failure_threshold` and `success_threshold`
 provide global check hysteresis while individual failures remain logged. They
 are counts of queries, so on a busy gateway they describe a fraction of a
-second; a degraded verdict is therefore held for a minute before a recovery may
-clear it, long enough for a scrape or a status poll to land on it. Queries
+second. A degraded verdict is therefore held for a minute before a recovery may
+clear it, long enough for a scrape or a status poll to land on it, and clearing
+it also requires the recent outcomes to look like a working resolver — at most
+one failure in eight across the last 128, so an episode ends when the trouble
+stops rather than when the timer does. Its duration is then a measure of how
+long the trouble lasted. Queries
 refused by admission control count towards the verdict alongside queries the
 upstream failed to answer — to a client they are the same event — and are
 reported with the `dns.queries_refused` reason code rather than

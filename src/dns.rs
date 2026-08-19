@@ -361,6 +361,28 @@ struct Verdict {
 /// at all.
 const DEGRADED_DWELL: Duration = Duration::from_secs(60);
 
+/// How many recent outcomes the recovery ratio is measured over.
+///
+/// Recovery used to need `success_threshold` *consecutive* successes, which is
+/// about a second of clean operation on a gateway whose health path sees ~2
+/// events a second. During a brownout where even a third of queries fail, a run
+/// of two successes turns up almost immediately, so the dwell expiring was what
+/// ended every episode: 76 episodes measured over 4.6h had a median duration of
+/// 64.5s against a 60s dwell, min 60.0s and max 80.5s. That distribution
+/// describes the constant, not the trouble. A ratio over a window says whether
+/// the trouble has actually stopped.
+const RECOVERY_WINDOW: u32 = 128;
+
+/// Recovery will not read a ratio off fewer outcomes than this, so a handful of
+/// queries after a quiet spell cannot clear a verdict on their own.
+const RECOVERY_MIN_SAMPLES: u32 = 32;
+
+/// The most failures the window may hold and still be considered recovered, as
+/// one part in this many. A gateway with a genuinely healthy upstream still
+/// carries a background of failures — the observed one runs at about 3% — so
+/// requiring none would leave it degraded forever.
+const RECOVERY_FAILURE_RATIO: u32 = 8;
+
 /// How often an unchanged verdict is re-published, so the check keeps a recent
 /// observation without costing a snapshot clone per query.
 const HEALTH_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
@@ -372,6 +394,11 @@ struct DnsHealthState {
     consecutive_successes: u32,
     failure_threshold: u32,
     success_threshold: u32,
+    /// The last `RECOVERY_WINDOW` outcomes, newest in the low bit, a set bit
+    /// meaning a failure. Recovery reads its ratio from this rather than from a
+    /// run of consecutive successes.
+    recent: u128,
+    recent_len: u32,
     /// Fixed for the length of an episode, so the reason code the check
     /// publishes does not alternate while it stays degraded.
     degraded_cause: Option<Failure>,
@@ -387,6 +414,8 @@ impl DnsHealthState {
             consecutive_successes: 0,
             failure_threshold,
             success_threshold,
+            recent: 0,
+            recent_len: 0,
             degraded_cause: None,
             degraded_since: None,
             published_at: None,
@@ -396,6 +425,8 @@ impl DnsHealthState {
     /// Fold one query's outcome into the verdict, returning it when it is worth
     /// publishing. `failure` is `None` for a query that was answered.
     fn record(&mut self, failure: Option<Failure>, now: Instant) -> Option<Verdict> {
+        self.recent = (self.recent << 1) | u128::from(failure.is_some());
+        self.recent_len = self.recent_len.saturating_add(1).min(RECOVERY_WINDOW);
         match failure {
             None => {
                 self.consecutive_failures = 0;
@@ -404,6 +435,7 @@ impl DnsHealthState {
                     DebouncedStatus::Unknown => self.enter(DebouncedStatus::Healthy, None, now),
                     DebouncedStatus::Degraded
                         if self.consecutive_successes >= self.success_threshold
+                            && self.trouble_has_passed()
                             && self.degraded_for(now) >= DEGRADED_DWELL =>
                     {
                         self.enter(DebouncedStatus::Healthy, None, now)
@@ -456,6 +488,17 @@ impl DnsHealthState {
                 })
             }
         }
+    }
+
+    /// Whether recent outcomes look like a working resolver.
+    ///
+    /// The dwell is a floor on how long an episode lasts; this is what decides
+    /// whether it should end at all. While failures keep arriving at a rate a
+    /// healthy gateway would not produce, the episode continues, so its duration
+    /// reflects the trouble rather than the constant.
+    fn trouble_has_passed(&self) -> bool {
+        self.recent_len >= RECOVERY_MIN_SAMPLES
+            && self.recent.count_ones() * RECOVERY_FAILURE_RATIO <= self.recent_len
     }
 
     fn degraded_for(&self, now: Instant) -> Duration {
@@ -1431,6 +1474,14 @@ mod tests {
         );
     }
 
+    /// Feed `count` outcomes, one failure every `every` events (0 = none).
+    fn feed(health: &mut DnsHealthState, at: Instant, count: u32, every: u32) {
+        for index in 0..count {
+            let failing = every > 0 && index % every == 0;
+            health.record(failing.then_some(Failure::Upstream), at);
+        }
+    }
+
     #[test]
     fn a_degraded_verdict_outlives_the_burst_that_caused_it() {
         // The observed failure: 23 degraded episodes, every one of them back to
@@ -1444,19 +1495,74 @@ mod tests {
         }
         assert_eq!(health.status, DebouncedStatus::Degraded);
 
-        // Two successes 65ms later would have cleared it before.
+        // A clean run 65ms later would have cleared it before.
         let burst_over = start + Duration::from_millis(65);
-        assert_eq!(health.record(None, burst_over), None);
-        assert_eq!(health.record(None, burst_over), None);
-        assert_eq!(health.status, DebouncedStatus::Degraded);
+        feed(&mut health, burst_over, 40, 0);
+        assert!(health.trouble_has_passed(), "the burst is over");
+        assert_eq!(
+            health.status,
+            DebouncedStatus::Degraded,
+            "held by the dwell"
+        );
 
-        // Held until the episode has lasted long enough to be observable, then
-        // cleared by the successes that were already accumulating.
+        // Cleared only once the episode has lasted long enough to be observable.
         let settled = start + DEGRADED_DWELL;
         assert_eq!(
             status_of(health.record(None, settled)),
             Some(DebouncedStatus::Healthy)
         );
+    }
+
+    #[test]
+    fn a_sustained_failure_rate_keeps_the_verdict_degraded_past_the_dwell() {
+        // The reason every episode used to last exactly the dwell: recovery
+        // needed two consecutive successes, which at ~2 health events a second
+        // turn up almost immediately even while a third of queries are failing.
+        // A continuous brownout was published as a train of 60s episodes.
+        let mut health = DnsHealthState::new(3, 2);
+        let start = Instant::now();
+        for _ in 0..3 {
+            health.record(Some(Failure::Upstream), start);
+        }
+        // A third failing, sustained well past the dwell.
+        feed(&mut health, start + DEGRADED_DWELL, 300, 3);
+        assert!(!health.trouble_has_passed());
+        assert_eq!(
+            health.status,
+            DebouncedStatus::Degraded,
+            "the trouble has not stopped, so neither should the episode"
+        );
+
+        // It ends when the trouble does, not when the timer does.
+        feed(&mut health, start + DEGRADED_DWELL * 2, 128, 0);
+        assert_eq!(health.status, DebouncedStatus::Healthy);
+    }
+
+    #[test]
+    fn a_healthy_gateway_s_background_of_failures_still_recovers() {
+        // The measured gateway carries ~3% failures with a working upstream, so
+        // a rule that demanded none would leave it degraded forever.
+        let mut health = DnsHealthState::new(3, 2);
+        let start = Instant::now();
+        for _ in 0..3 {
+            health.record(Some(Failure::Upstream), start);
+        }
+        feed(&mut health, start + DEGRADED_DWELL, 128, 32);
+        assert!(health.trouble_has_passed());
+        assert_eq!(health.status, DebouncedStatus::Healthy);
+    }
+
+    #[test]
+    fn a_verdict_is_not_cleared_off_a_handful_of_outcomes() {
+        // After a quiet spell, two successes are not evidence of anything.
+        let mut health = DnsHealthState::new(3, 2);
+        let start = Instant::now();
+        for _ in 0..3 {
+            health.record(Some(Failure::Upstream), start);
+        }
+        feed(&mut health, start + DEGRADED_DWELL, 4, 0);
+        assert!(!health.trouble_has_passed());
+        assert_eq!(health.status, DebouncedStatus::Degraded);
     }
 
     #[test]
