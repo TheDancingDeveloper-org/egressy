@@ -122,12 +122,24 @@ static QUERIES_REFUSED_PER_CLIENT: AtomicU64 = AtomicU64::new(0);
 /// currently using the forwarder — floored, so a bridge full of quiet clients
 /// cannot squeeze a busy one down to nothing, and capped at the global budget,
 /// which remains the only bound on total load.
+///
+/// A share is also only worth enforcing while there is something to compete
+/// for. Dividing by the clients *present* still refuses a lone busy client on a
+/// gateway whose budget is entirely idle, because the other clients counted in
+/// the divisor want almost none of it — 15,175 refusals against a global budget
+/// that was never once reached. Admission is therefore work-conserving: above a
+/// reserve of free permits a client may borrow the idle capacity, and once the
+/// free pool falls to that reserve everyone is held to their share again. The
+/// reserve is what keeps a late-arriving client able to claim one, so the
+/// anti-starvation property survives.
 pub struct QueryPermits {
     global: Arc<Semaphore>,
     global_limit: usize,
     clients: StdMutex<ClientTable>,
     /// An operator-set fixed ceiling, which overrides the derived share.
     fixed_per_client: Option<usize>,
+    /// Free global permits below which shares start binding.
+    borrow_reserve: usize,
 }
 
 /// The floor under a derived share. Below this a client has too little
@@ -137,6 +149,11 @@ const MIN_CLIENT_SHARE: usize = 64;
 
 /// How long a client counts towards the divisor after its last query.
 const CLIENT_IDLE_AFTER: Duration = Duration::from_secs(60);
+
+/// The fraction of the global budget held back from borrowing. Shares bind once
+/// free permits fall to this, so capacity is always left for a client that has
+/// not asked for anything yet.
+const BORROW_RESERVE_DIVISOR: usize = 4;
 
 /// How often idle clients are swept. The divisor changes on the timescale
 /// clients arrive and leave, so a stale count for up to this long is harmless
@@ -204,14 +221,16 @@ impl QueryPermits {
                 pruned_at: Instant::now(),
             }),
             fixed_per_client: per_client.map(|limit| limit.clamp(1, global_limit)),
+            borrow_reserve: (global_limit / BORROW_RESERVE_DIVISOR).max(1),
         }
     }
 
     pub fn try_acquire(&self, client: IpAddr) -> Result<QueryPermit, Refusal> {
-        let (in_flight, limit) = self.client_share(client, Instant::now());
+        let (in_flight, active_clients) = self.client_share(client, Instant::now());
         // Take the client's share first: refusing here is the cheaper outcome
         // and keeps a burst from briefly holding global permits.
-        let slot = claim(&in_flight, limit).ok_or(Refusal::ClientLimit)?;
+        let slot =
+            claim(&in_flight, self.admission_limit(active_clients)).ok_or(Refusal::ClientLimit)?;
         let global = Arc::clone(&self.global)
             .try_acquire_owned()
             .map_err(|_| Refusal::GlobalLimit)?;
@@ -221,7 +240,8 @@ impl QueryPermits {
         })
     }
 
-    /// This client's in-flight counter and the bound that currently applies.
+    /// This client's in-flight counter, and how many clients are using the
+    /// forwarder right now.
     fn client_share(&self, client: IpAddr, now: Instant) -> (Arc<AtomicUsize>, usize) {
         let mut table = self
             .clients
@@ -234,7 +254,23 @@ impl QueryPermits {
         });
         load.last_seen = now;
         let in_flight = Arc::clone(&load.in_flight);
-        (in_flight, self.limit_for(table.loads.len()))
+        (in_flight, table.loads.len())
+    }
+
+    /// The bound to admit against right now.
+    ///
+    /// A share describes how capacity is divided when it is scarce. While it is
+    /// not scarce there is nobody to divide it from, so a client may use what is
+    /// idle; refusing a query the gateway has the capacity to serve buys
+    /// nothing. An operator-set ceiling is absolute and never borrows past.
+    fn admission_limit(&self, active_clients: usize) -> usize {
+        if self.fixed_per_client.is_some() {
+            return self.limit_for(active_clients);
+        }
+        if self.global.available_permits() > self.borrow_reserve {
+            return self.global_limit;
+        }
+        self.limit_for(active_clients)
     }
 
     #[cfg(test)]
@@ -1135,6 +1171,81 @@ mod tests {
         assert_eq!(permits.tracked_clients(), 1);
         let _second = permits.try_acquire(client(12)).unwrap();
         assert_eq!(permits.tracked_clients(), 2);
+    }
+
+    #[test]
+    fn idle_capacity_is_lent_to_a_client_past_its_share() {
+        // The residual after #21: one busy client refused against a share of
+        // 64-102 while all 512 permits sat free. Nobody was being starved,
+        // because nobody else wanted any of it.
+        let permits = crowded_permits();
+        let held: Vec<_> = (0..128)
+            .map(|_| {
+                permits
+                    .try_acquire(client(11))
+                    .expect("idle capacity is lent out")
+            })
+            .collect();
+        assert!(held.len() > permits.limit_for(permits.tracked_clients()));
+    }
+
+    /// Eight clients present, so the derived share is 64 of the 512 budget.
+    fn crowded_permits() -> QueryPermits {
+        let permits = QueryPermits::new(512, None);
+        for last in 11..19 {
+            drop(permits.try_acquire(client(last)));
+        }
+        assert_eq!(permits.limit_for(permits.tracked_clients()), 64);
+        permits
+    }
+
+    #[test]
+    fn a_burst_stops_at_the_reserve_and_the_share_binds_again() {
+        // Borrowing is not unlimited: once the free pool reaches the reserve,
+        // a client already holding more than its share is refused.
+        let permits = crowded_permits();
+        let mut held = Vec::new();
+        while let Ok(permit) = permits.try_acquire(client(11)) {
+            held.push(permit);
+            assert!(held.len() <= 512, "borrowing never stopped");
+        }
+        assert!(held.len() > 64, "the share should have been lent past");
+        assert!(
+            permits.global.available_permits() >= permits.borrow_reserve,
+            "the reserve was consumed"
+        );
+    }
+
+    #[test]
+    fn the_reserve_keeps_a_quiet_client_admissible() {
+        // What the reserve is for: a burst from one client must not leave a
+        // client that has asked for nothing with nowhere to go.
+        let permits = crowded_permits();
+        let mut held = Vec::new();
+        while let Ok(permit) = permits.try_acquire(client(11)) {
+            held.push(permit);
+            if held.len() > 512 {
+                break;
+            }
+        }
+        assert!(
+            permits.try_acquire(client(12)).is_ok(),
+            "a quiet client was starved by a burst"
+        );
+    }
+
+    #[test]
+    fn a_fixed_ceiling_is_never_borrowed_past() {
+        // An operator who names a number gets that number, idle budget or not.
+        let permits = QueryPermits::new(512, Some(4));
+        let _held: Vec<_> = (0..4)
+            .map(|_| permits.try_acquire(client(11)).expect("within the ceiling"))
+            .collect();
+        assert!(permits.global.available_permits() > permits.borrow_reserve);
+        assert_eq!(
+            permits.try_acquire(client(11)).unwrap_err(),
+            Refusal::ClientLimit
+        );
     }
 
     #[test]
