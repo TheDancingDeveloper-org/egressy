@@ -1,10 +1,51 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
 use crate::state::{ClientState, TrafficState};
 
 pub const TRANSITION_CAPACITY: usize = 200;
+
+/// Append a transition to the bounded snapshot window.
+///
+/// The window is shared by every component, so evicting the oldest entry lets
+/// whichever checks change most often decide how far back the whole thing
+/// reaches. On a busy gateway three high-frequency checks held 98% of it and it
+/// went back barely two hours, while `topology.route_intent` and
+/// `topology.client_lifecycle` — the entries describing what the gateway
+/// actually did to client routing, and the ones an operator goes looking for
+/// when a container loses egress — held two slots each and were minutes from
+/// being pushed out.
+///
+/// Evicting from whichever component holds the most of the window instead lets a
+/// chatty component churn against itself. Nothing is lost either way: every
+/// transition is also persisted and served from `/api/v2/history/events`. This
+/// is about what the at-a-glance view is worth.
+pub fn push_transition(transitions: &mut VecDeque<Transition>, transition: Transition) {
+    while transitions.len() >= TRANSITION_CAPACITY {
+        let Some(index) = busiest_components_oldest(transitions) else {
+            break;
+        };
+        transitions.remove(index);
+    }
+    transitions.push_back(transition);
+}
+
+/// The index of the oldest entry belonging to the component holding the most
+/// slots. Ties go to whichever of them has been in the window longest.
+fn busiest_components_oldest(transitions: &VecDeque<Transition>) -> Option<usize> {
+    let mut holdings: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (index, transition) in transitions.iter().enumerate() {
+        let entry = holdings
+            .entry(transition.component.as_str())
+            .or_insert((0, index));
+        entry.0 += 1;
+    }
+    holdings
+        .into_values()
+        .max_by_key(|(count, oldest)| (*count, std::cmp::Reverse(*oldest)))
+        .map(|(_, oldest)| oldest)
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -294,6 +335,85 @@ impl CanonicalSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transition(component: &str, sequence: u64) -> Transition {
+        Transition {
+            sequence,
+            timestamp_unix_ms: sequence,
+            component: component.to_owned(),
+            from_status: CheckStatus::Healthy,
+            to_status: CheckStatus::Degraded,
+            reason_code: "test".to_owned(),
+            safe_message: "test".to_owned(),
+            recovery_attempt: None,
+        }
+    }
+
+    fn held(transitions: &VecDeque<Transition>, component: &str) -> usize {
+        transitions
+            .iter()
+            .filter(|entry| entry.component == component)
+            .count()
+    }
+
+    #[test]
+    fn a_chatty_component_cannot_evict_a_quiet_one() {
+        // The observed window: three high-frequency checks held 98% of it, and
+        // the route-intent entries an operator actually goes looking for were
+        // minutes from being pushed out.
+        let mut transitions = VecDeque::new();
+        push_transition(&mut transitions, transition("topology.route_intent", 0));
+        push_transition(&mut transitions, transition("topology.route_intent", 1));
+        for sequence in 2..(TRANSITION_CAPACITY as u64 * 4) {
+            push_transition(&mut transitions, transition("dns.upstream_udp", sequence));
+        }
+        assert_eq!(transitions.len(), TRANSITION_CAPACITY);
+        assert_eq!(
+            held(&transitions, "topology.route_intent"),
+            2,
+            "the quiet component was evicted by the chatty one"
+        );
+    }
+
+    #[test]
+    fn the_window_stays_within_capacity() {
+        let mut transitions = VecDeque::new();
+        for sequence in 0..(TRANSITION_CAPACITY as u64 * 3) {
+            push_transition(&mut transitions, transition("dns.upstream_udp", sequence));
+        }
+        assert_eq!(transitions.len(), TRANSITION_CAPACITY);
+    }
+
+    #[test]
+    fn one_component_on_its_own_still_evicts_oldest_first() {
+        let mut transitions = VecDeque::new();
+        for sequence in 0..(TRANSITION_CAPACITY as u64 + 5) {
+            push_transition(&mut transitions, transition("dns.upstream_udp", sequence));
+        }
+        assert_eq!(transitions.front().unwrap().sequence, 5);
+        assert_eq!(
+            transitions.back().unwrap().sequence,
+            TRANSITION_CAPACITY as u64 + 4
+        );
+    }
+
+    #[test]
+    fn components_converge_on_a_share_rather_than_a_race() {
+        // Two components pushing at very different rates should end up sharing
+        // the window, not with the faster one owning it.
+        let mut transitions = VecDeque::new();
+        for sequence in 0..(TRANSITION_CAPACITY as u64 * 5) {
+            push_transition(&mut transitions, transition("fast", sequence));
+            if sequence % 10 == 0 {
+                push_transition(&mut transitions, transition("slow", sequence));
+            }
+        }
+        let slow = held(&transitions, "slow");
+        assert!(
+            slow >= TRANSITION_CAPACITY / 4,
+            "the slow component held only {slow} slots"
+        );
+    }
 
     #[test]
     fn protection_and_availability_are_independent() {

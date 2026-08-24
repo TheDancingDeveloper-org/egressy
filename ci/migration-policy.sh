@@ -29,7 +29,7 @@ if [[ -n "$workflow_matches" ]]; then
 fi
 
 if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
-  git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}" >/dev/null 2>&1 || true
+  git fetch --no-tags origin "${GITHUB_BASE_REF}" >/dev/null 2>&1 || true
   base="origin/${GITHUB_BASE_REF}"
   if git rev-parse --verify "$base" >/dev/null 2>&1; then
     commits="$(git rev-list --reverse "$base..HEAD")"

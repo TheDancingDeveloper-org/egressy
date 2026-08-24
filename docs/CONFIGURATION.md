@@ -71,8 +71,17 @@ the clients currently using the forwarder, floored at 64 and capped at the
 global budget — so a gateway with one busy client can reach the capacity it is
 configured for instead of stopping at a fixed fraction of it. Set
 `max_concurrent_queries_per_client` to pin a fixed ceiling instead; it is unset
-by default. A client's share is released when its query leaves UDP for the TCP
-fallback, so a slow upstream costs latency rather than admission capacity.
+by default and, unlike the derived share, is absolute. A client's share is
+released when its query leaves UDP for the TCP fallback, so a slow upstream
+costs latency rather than admission capacity.
+
+The derived share binds only while the budget is scarce. A share describes how
+capacity is divided when clients compete for it, so while a quarter of the
+global budget is still free a client may borrow the idle capacity above its
+share; once the free pool falls to that reserve, every client is held to its
+share again. That keeps a gateway with one busy client from refusing traffic it
+has the capacity to serve, while the reserve keeps a client that has not asked
+for anything yet able to be admitted.
 Refusals
 are counted separately per limit in `egressy_dns_queries_refused_total`, and
 are answered REFUSED rather than dropped, so a refused client fails now instead
@@ -100,8 +109,12 @@ checks and is the stricter choice if you want the container marked unhealthy.
 the same in-tunnel resolver. `failure_threshold` and `success_threshold`
 provide global check hysteresis while individual failures remain logged. They
 are counts of queries, so on a busy gateway they describe a fraction of a
-second; a degraded verdict is therefore held for a minute before a recovery may
-clear it, long enough for a scrape or a status poll to land on it. Queries
+second. A degraded verdict is therefore held for a minute before a recovery may
+clear it, long enough for a scrape or a status poll to land on it, and clearing
+it also requires the recent outcomes to look like a working resolver — at most
+one failure in eight across the last 128, so an episode ends when the trouble
+stops rather than when the timer does. Its duration is then a measure of how
+long the trouble lasted. Queries
 refused by admission control count towards the verdict alongside queries the
 upstream failed to answer — to a client they are the same event — and are
 reported with the `dns.queries_refused` reason code rather than
