@@ -115,6 +115,20 @@ An external validation result is optional and advisory. A successful container
 start, Compose run, image publish, dashboard load, or handshake alone is not
 acceptance evidence.
 
+## IPv6 end-to-end test
+
+`tests/ipv6-docker.sh` runs the real daemon, host agent, and Docker IPv6 networks
+inside a disposable Docker-in-Docker sandbox, against a local WireGuard peer. It
+does not change the host's routes, firewall, containers, or networks, but it does
+need a privileged container and network access to pull its base images:
+
+```sh
+docker build -t egressy:test .
+EGRESSY_RUN_DOCKER_TESTS=1 tests/ipv6-docker.sh
+```
+
+A provider's real IPv6 service is still a live acceptance step.
+
 ## Secret scan
 
 Before publication or release, inspect tracked files and the commits being

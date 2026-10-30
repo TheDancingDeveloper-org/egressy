@@ -227,6 +227,15 @@ enrolled IPv6 to it, and clients can use a private `fd00::/8` subnet.
 - **Bridge isolation.** `IsolationPolicy.ipv6_subnet` extends audit and enforce
   modes to IPv6 peer traffic. Allowances remain IPv4, so peer-to-peer IPv6 is not
   allowed in enforce mode.
+- **Startup.** The kill switch exists only once the host policy is installed. A
+  client that sends IPv6 before that, such as one that starts ahead of the agent
+  after a reboot, can leave by the host's IPv6 default route. IPv4 has the same
+  window. On a host with an IPv6 uplink, install the host policy at boot, before
+  Docker starts, by running the `render-host-setup` output or an equivalent.
+- **MTU.** `config/docker-network.sh` sets the network's MTU to 1420, WireGuard's
+  default. With a larger bridge MTU, TCP still adapts through Packet Too Big, but
+  oversized UDP and ICMP can be lost. A profile with a lower `MTU` needs the same
+  value on the network.
 - **External validation.** The probe still validates IPv4 only. Verify IPv6 by hand
   with the commands below.
 
