@@ -310,7 +310,7 @@ export function App() {
                   <td><b>{client.name}</b><div className="reason mono">{client.usage_id}</div><span className="chip dim">{client.usage_id_source}</span></td>
                   <td><span className={`pill ${client.running ? 'ok' : 'mut'}`}>{client.running ? 'running' : 'stopped'}</span></td>
                   <td className="mono"><span className="ip">{client.ipv4_address}</span>
-                    {client.ipv6_address && <><br /><span className="chip warn">IPv6 {client.ipv6_address}</span></>}</td>
+                    {client.ipv6_address && <><br /><span className={`chip ${snapshot.topology.client_ipv6_supported ? '' : 'warn'}`}>IPv6 {client.ipv6_address}</span></>}</td>
                   <td>{client.networks.map(network => <span key={network} className="chip dim" style={{ marginRight: 4 }}>{network}</span>)}</td>
                   <td><StatusPill status={client.route_intent.status} />
                     <div className="reason">{client.route_intent.ipv4_default_network ?? 'not determined'}</div>
@@ -330,7 +330,9 @@ export function App() {
           </div>
           <div className="notice warn"><WarnGlyph />
             Docker tells Egressy which network an app is expected to use for internet traffic, but cannot prove the route inside the app.
-            Only IPv4 traffic is protected; IPv6 is not supported.</div>
+            {snapshot.topology.client_ipv6_supported
+              ? 'IPv4 and IPv6 traffic must leave through the tunnel. Inbound port forwarding is IPv4 only.'
+              : 'IPv6 routing is off, so only IPv4 traffic is routed; IPv6 from these apps is blocked.'}</div>
           <div className={`notice ${snapshot.isolation_policy?.eligible_for_enforcement ? '' : 'warn'}`}><InfoGlyph />
             App-to-app blocking: {snapshot.isolation_policy?.eligible_for_enforcement ? 'configured correctly' : snapshot.isolation_policy?.safe_message ?? 'not checked'}.
             {snapshot.isolation_policy?.issues?.length ? ` Issues: ${snapshot.isolation_policy.issues.join('; ')}` : ''}</div>

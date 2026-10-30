@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use egressy::host_policy::HostPolicy;
 
@@ -10,19 +10,24 @@ use crate::config::Config;
 /// the published policy document stay byte-identical for the same config.
 pub fn host_policy(config: &Config, generated_at_unix_ms: u64) -> HostPolicy {
     let network = &config.network;
-    HostPolicy::new(
+    let policy = HostPolicy::new(
         generated_at_unix_ms,
         network.subnet.to_string(),
         network.host_bridge.clone(),
         network.gateway_ip.to_string(),
         network.route_table,
-    )
+    );
+    match network.ipv6_routing() {
+        Some(ipv6) => policy.with_ipv6(ipv6.subnet.to_string(), ipv6.gateway_ip.to_string()),
+        None => policy,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientCounterRule {
     pub container_id: String,
     pub address: Ipv4Addr,
+    pub ipv6_address: Option<Ipv6Addr>,
     pub download_packets: u64,
     pub downloaded_bytes: u64,
     pub upload_packets: u64,
@@ -37,6 +42,7 @@ pub fn render_host_setup(config: &Config) -> String {
         .iter()
         .map(|args| format!("ip {}\n", args.join(" ")))
         .collect::<String>();
+    let ipv6 = render_host_ipv6_setup(&policy);
     format!(
         r#"#!/bin/sh
 set -eu
@@ -51,7 +57,7 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 ip rule del from {subnet} lookup {table} 2>/dev/null || true
 ip {rule}
-{routes}
+{routes}{ipv6}
 nft delete table inet {nft_table} 2>/dev/null || true
 nft -f - <<'NFT'
 {nft}NFT
@@ -60,8 +66,26 @@ nft -f - <<'NFT'
         table = policy.route_table,
         rule = rule,
         routes = routes,
+        ipv6 = ipv6,
         nft_table = egressy::host_policy::HOST_POLICY_TABLE,
         nft = policy.render_nft(),
+    )
+}
+
+fn render_host_ipv6_setup(policy: &HostPolicy) -> String {
+    let (Some(ipv6), Some(rule)) = (policy.ipv6.as_ref(), policy.ipv6_rule_add_args()) else {
+        return String::new();
+    };
+    let routes = policy
+        .ipv6_route_replace_args()
+        .iter()
+        .map(|args| format!("ip {}\n", args.join(" ")))
+        .collect::<String>();
+    format!(
+        "\n# Enables IPv6 forwarding host-wide. An uplink that learns its default route from\n# router advertisements also needs accept_ra=2; see docs/NETWORKING.md.\nsysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null\n\nip -6 rule del from {subnet} lookup {table} 2>/dev/null || true\nip {rule}\n{routes}",
+        subnet = ipv6.subnet,
+        table = policy.route_table,
+        rule = rule.join(" "),
     )
 }
 
@@ -72,6 +96,7 @@ pub fn render_gateway_firewall(
 ) -> String {
     let network = &config.network;
     let tunnel = &config.wireguard.interface;
+    let ipv6 = network.ipv6_routing();
     let dnat = port_forwards
         .iter()
         .map(|(tunnel_port, target, target_port)| format!(
@@ -97,26 +122,58 @@ pub fn render_gateway_firewall(
             ]
         })
         .collect::<String>();
+    // IPv6 is counted on the client's existing counters, so traffic totals cover
+    // both families and survive a client gaining or losing an IPv6 address.
+    let client_ipv6 = |client: &ClientCounterRule| ipv6.and(client.ipv6_address);
     let download_counters = client_counters
         .iter()
         .map(|client| {
-            format!(
-                "    iifname \"{tunnel}\" ip daddr {} counter name {}\n",
+            let name = client_counter_name("down", &client.container_id);
+            let mut rules = format!(
+                "    iifname \"{tunnel}\" ip daddr {} counter name {name}\n",
                 client.address,
-                client_counter_name("down", &client.container_id)
-            )
+            );
+            if let Some(address) = client_ipv6(client) {
+                rules.push_str(&format!(
+                    "    iifname \"{tunnel}\" ip6 daddr {address} counter name {name}\n"
+                ));
+            }
+            rules
         })
         .collect::<String>();
     let upload_counters = client_counters
         .iter()
         .map(|client| {
-            format!(
-                "    ip saddr {} oifname \"{tunnel}\" counter name {}\n",
+            let name = client_counter_name("up", &client.container_id);
+            let mut rules = format!(
+                "    ip saddr {} oifname \"{tunnel}\" counter name {name}\n",
                 client.address,
-                client_counter_name("up", &client.container_id)
-            )
+            );
+            if let Some(address) = client_ipv6(client) {
+                rules.push_str(&format!(
+                    "    ip6 saddr {address} oifname \"{tunnel}\" counter name {name}\n"
+                ));
+            }
+            rules
         })
         .collect::<String>();
+    // There is deliberately no IPv6 equivalent of the unsolicited-inbound accept
+    // or of DNAT: NAT-PMP maps IPv4 only, so inbound IPv6 is return traffic alone.
+    let (ipv6_input, ipv6_forward, ipv6_postrouting) = ipv6.map_or_else(
+        Default::default,
+        |ipv6| {
+            let subnet = ipv6.subnet;
+            (
+                format!(
+                    "    iifname != \"{tunnel}\" icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert }} accept\n"
+                ),
+                format!(
+                    "    ip6 saddr {subnet} udp dport 53 reject with icmpv6 type admin-prohibited\n    ip6 saddr {subnet} tcp dport 53 reject with icmpv6 type admin-prohibited\n    ip6 saddr {subnet} oifname \"{tunnel}\" accept\n"
+                ),
+                format!("    ip6 saddr {subnet} oifname \"{tunnel}\" masquerade\n"),
+            )
+        },
+    );
     let natpmp_input =
         if config.port_forwarding.backend == crate::config::PortForwardingBackend::NatPmp {
             format!(
@@ -133,7 +190,8 @@ pub fn render_gateway_firewall(
     type filter hook input priority 0; policy drop;
     iifname "lo" accept
     ct state established,related accept
-    ip saddr {subnet} udp dport 53 accept
+    iifname "{tunnel}" meta nfproto ipv6 drop
+{ipv6_input}    ip saddr {subnet} udp dport 53 accept
     ip saddr {subnet} tcp dport 53 accept
     tcp dport 8080 accept
 {natpmp_input}
@@ -146,11 +204,11 @@ pub fn render_gateway_firewall(
     ip saddr {subnet} tcp dport 53 ip daddr != {gateway} reject with icmp type admin-prohibited
     ip saddr {subnet} oifname "{tunnel}" accept
     iifname "{tunnel}" ip daddr {subnet} accept
-  }}
+{ipv6_forward}  }}
   chain postrouting {{
     type nat hook postrouting priority srcnat; policy accept;
     ip saddr {subnet} oifname "{tunnel}" masquerade
-  }}
+{ipv6_postrouting}  }}
   chain prerouting {{
     type nat hook prerouting priority dstnat; policy accept;
 {dnat}  }}
@@ -164,6 +222,9 @@ pub fn render_gateway_firewall(
         counter_objects = counter_objects,
         download_counters = download_counters,
         upload_counters = upload_counters,
+        ipv6_input = ipv6_input,
+        ipv6_forward = ipv6_forward,
+        ipv6_postrouting = ipv6_postrouting,
     )
 }
 
@@ -227,6 +288,7 @@ mod tests {
             &[ClientCounterRule {
                 container_id: "abc123".to_owned(),
                 address: "172.30.0.10".parse().unwrap(),
+                ipv6_address: None,
                 download_packets: 3,
                 downloaded_bytes: 99,
                 upload_packets: 4,
@@ -238,6 +300,101 @@ mod tests {
         assert!(rules.contains("ip daddr 172.30.0.10 counter name client_down_abc123"));
         assert!(
             rules.contains("ip saddr 172.30.0.10 oifname \"wg0\" counter name client_up_abc123")
+        );
+    }
+
+    fn ipv6_config() -> Config {
+        serde_yaml::from_str("network:\n  ipv6:\n    enabled: true\n").unwrap()
+    }
+
+    #[test]
+    fn with_ipv6_off_the_gateway_forwards_no_ipv6_and_ignores_it_on_the_tunnel() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        let rules = render_gateway_firewall(&config, &[], &[]);
+        assert!(!rules.contains("ip6 "));
+        assert!(!rules.contains("icmpv6"));
+        assert!(rules.contains("type filter hook forward priority 0; policy drop;"));
+        assert!(rules.contains("iifname \"wg0\" meta nfproto ipv6 drop"));
+    }
+
+    #[test]
+    fn with_ipv6_on_enrolled_traffic_may_only_leave_by_the_tunnel() {
+        let rules = render_gateway_firewall(&ipv6_config(), &[], &[]);
+        assert!(rules.contains("ip6 saddr fd30:172:30::/64 oifname \"wg0\" accept"));
+        assert!(rules.contains("ip6 saddr fd30:172:30::/64 oifname \"wg0\" masquerade"));
+        assert_eq!(rules.matches("ip6 saddr fd30:172:30::/64").count(), 4);
+        assert!(rules.contains("type filter hook forward priority 0; policy drop;"));
+    }
+
+    #[test]
+    fn plain_ipv6_dns_is_rejected_for_both_transports() {
+        let rules = render_gateway_firewall(&ipv6_config(), &[], &[]);
+        let accept = rules.find("oifname \"wg0\" accept\n  }").unwrap();
+        for transport in ["udp", "tcp"] {
+            let reject = rules
+                .find(&format!(
+                    "ip6 saddr fd30:172:30::/64 {transport} dport 53 reject with icmpv6 type admin-prohibited"
+                ))
+                .unwrap();
+            assert!(reject < accept);
+        }
+    }
+
+    #[test]
+    fn unsolicited_inbound_ipv6_has_no_forward_or_dnat_path() {
+        let rules = render_gateway_firewall(
+            &ipv6_config(),
+            &[(45678, Ipv4Addr::new(172, 30, 0, 10), 6881)],
+            &[],
+        );
+        assert!(!rules.contains("ip6 daddr"));
+        assert!(!rules.contains("dnat ip6"));
+        assert!(rules.contains("iifname \"wg0\" meta nfproto ipv6 drop"));
+    }
+
+    #[test]
+    fn neighbor_discovery_is_accepted_off_the_tunnel_only() {
+        let rules = render_gateway_firewall(&ipv6_config(), &[], &[]);
+        assert!(rules.contains(
+            "iifname != \"wg0\" icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } accept"
+        ));
+    }
+
+    #[test]
+    fn client_ipv6_counts_on_the_same_named_counters() {
+        let rule = ClientCounterRule {
+            container_id: "abc123".to_owned(),
+            address: "172.30.0.10".parse().unwrap(),
+            ipv6_address: Some("fd30:172:30::10".parse().unwrap()),
+            download_packets: 0,
+            downloaded_bytes: 0,
+            upload_packets: 0,
+            uploaded_bytes: 0,
+        };
+        let rules = render_gateway_firewall(&ipv6_config(), &[], std::slice::from_ref(&rule));
+        assert!(rules
+            .contains("iifname \"wg0\" ip6 daddr fd30:172:30::10 counter name client_down_abc123"));
+        assert!(rules
+            .contains("ip6 saddr fd30:172:30::10 oifname \"wg0\" counter name client_up_abc123"));
+        let off: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(!render_gateway_firewall(&off, &[], &[rule]).contains("ip6 "));
+    }
+
+    #[test]
+    fn host_setup_adds_ipv6_only_when_routed() {
+        let off: Config = serde_yaml::from_str("{}").unwrap();
+        let script = render_host_setup(&off);
+        assert!(!script.contains("ip -6"));
+        assert!(!script.contains("net.ipv6"));
+        assert!(script.contains("egressy-ipv6-kill-switch:disabled"));
+        let script = render_host_setup(&ipv6_config());
+        assert!(script.contains("net.ipv6.conf.all.forwarding=1"));
+        assert!(script.contains("ip -6 rule add priority 100 from fd30:172:30::/64 lookup 200"));
+        assert!(script.contains(
+            "ip -6 route replace table 200 default via fd30:172:30::2 dev br-vpn-egress onlink"
+        ));
+        assert!(
+            script.contains("ip -6 route replace table 200 unreachable default metric 4294967295")
         );
     }
 

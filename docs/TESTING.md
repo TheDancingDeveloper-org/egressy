@@ -80,6 +80,18 @@ sudo tests/isolation-agent-nft.sh
 tests/docker-proxy-acl.sh
 ```
 
+`tests/ipv6-netns.sh` exercises the rendered IPv6 policy, the host agent, and
+leak paths between namespaces, using `egressy` and `egressy-isolation-agent`
+binaries from `target/debug`. It is opt-in and needs root, so run it in a disposable
+container with no network, in an image that has `iproute2`, `nftables`,
+`wireguard-tools`, `iputils-ping`, `netcat-openbsd`, and a compatible libc:
+
+```sh
+cargo build --bins
+docker run --rm --privileged --network none -e EGRESSY_RUN_NETNS_TESTS=1 \
+  -v "$PWD:/src:ro" -w /src egressy-netns-test tests/ipv6-netns.sh
+```
+
 Read each script before running it. Do not mutate a workstation or production
 host's routing/firewall state as an ordinary test step.
 
