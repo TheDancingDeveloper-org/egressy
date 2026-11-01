@@ -417,7 +417,7 @@ impl WireGuardProfile {
             warnings.push(ProfileWarning {
                 code: "ipv6_interface_unprotected".to_owned(),
                 field: "Interface.Address".to_owned(),
-                message: "IPv6 interface addresses are preserved, but enrolled clients use them only when network.ipv6 is enabled".to_owned(),
+                message: "IPv6 interface addresses are preserved, but Egressy protects enrolled IPv4 traffic only".to_owned(),
             });
         }
         if self.interface.dns.iter().any(IpAddr::is_ipv6) {
@@ -437,7 +437,7 @@ impl WireGuardProfile {
             warnings.push(ProfileWarning {
                 code: "ipv6_routes_unprotected".to_owned(),
                 field: "Peer.AllowedIPs".to_owned(),
-                message: "IPv6 allowed ranges are preserved, but enrolled clients use them only when network.ipv6 is enabled".to_owned(),
+                message: "IPv6 allowed ranges are preserved, but do not imply enrolled-client IPv6 leak protection".to_owned(),
             });
         }
         RedactedProfile {
@@ -616,20 +616,6 @@ impl WireGuardProfile {
             }
         }
         output
-    }
-
-    /// Can this profile carry enrolled IPv6? It needs an address to masquerade to
-    /// and a peer that accepts every IPv6 destination.
-    pub fn carries_ipv6(&self) -> bool {
-        self.interface
-            .addresses
-            .iter()
-            .any(|address| address.addr().is_ipv6())
-            && self
-                .peers
-                .iter()
-                .flat_map(|peer| &peer.allowed_ips)
-                .any(|network| network.addr().is_ipv6() && network.prefix_len() == 0)
     }
 
     pub fn ipv4_dns(&self) -> Vec<std::net::Ipv4Addr> {
@@ -891,22 +877,6 @@ mod tests {
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(!json.contains("fake-private"));
         assert!(!json.contains("fake-psk"));
-    }
-
-    #[test]
-    fn carrying_ipv6_needs_both_an_address_and_a_default_range() {
-        assert!(WireGuardProfile::parse(PROFILE.as_bytes())
-            .unwrap()
-            .carries_ipv6());
-        for profile in [
-            PROFILE.replace(", fd00::2/128", ""),
-            PROFILE.replace(", ::/0", ""),
-            PROFILE.replace("::/0", "2001:db8::/32"),
-        ] {
-            assert!(!WireGuardProfile::parse(profile.as_bytes())
-                .unwrap()
-                .carries_ipv6());
-        }
     }
 
     #[test]

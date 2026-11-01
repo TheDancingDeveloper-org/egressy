@@ -61,7 +61,8 @@ paths and failure behavior.
   separately if the provider supports it.
 - A dedicated, unused IPv4 subnet. Examples use `172.30.0.0/24`.
 
-Rootless Docker, Docker Desktop, Kubernetes, multiple tunnels, and hostile multi-tenant isolation are not currently supported.
+Rootless Docker, Docker Desktop, Kubernetes, IPv6 client enrollment, multiple
+tunnels, and hostile multi-tenant isolation are not currently supported.
 
 ## Quick start
 
@@ -245,8 +246,8 @@ repository; the workflow reports the resulting URL.
   exposes only the exact read operations needed for discovery.
 - The profile is copied to protected tmpfs and normalized to `Table = off`
   before `wg-quick` runs.
-- Enrolled IPv6 is rejected unless `network.ipv6` is enabled, and then it
-  leaves through the tunnel or fails closed. See `docs/NETWORKING.md`.
+- IPv6 client leak protection is not implemented. Do not attach enrolled
+  workloads to an independent IPv6 egress path.
 - Docker route-intent metadata is useful evidence, not proof of the effective
   route inside a container.
 
