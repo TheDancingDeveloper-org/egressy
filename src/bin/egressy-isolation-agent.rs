@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, process::Stdio, time::Duration};
 use anyhow::{bail, Context};
 use clap::Parser;
 use egressy::host_policy::{
-    detect_drift, HostPolicy, HostPolicyDrift, IpRouteEntry, IpRuleEntry, HOST_POLICY_TABLE,
+    detect_drift, detect_ipv6_drift, HostPolicy, HostPolicyDrift, IpRouteEntry, IpRuleEntry,
+    HOST_POLICY_TABLE, IPV6_SCHEMA_VERSION as HOST_POLICY_IPV6_SCHEMA_VERSION,
     SCHEMA_VERSION as HOST_POLICY_SCHEMA_VERSION,
 };
 use egressy::isolation::{render_bridge_policy, CounterValue, IsolationMode, IsolationPolicy};
@@ -201,6 +202,11 @@ async fn fetch_policy(client: &reqwest::Client, cli: &Cli) -> anyhow::Result<Iso
         .subnet
         .parse::<ipnet::Ipv4Net>()
         .context("invalid isolation policy subnet")?;
+    if let Some(subnet) = &policy.ipv6_subnet {
+        subnet
+            .parse::<ipnet::Ipv6Net>()
+            .context("invalid isolation policy IPv6 subnet")?;
+    }
     if policy_is_stale(&policy, cli.stale_seconds, crate_unix_ms()) {
         bail!("isolation policy snapshot is stale");
     }
@@ -301,9 +307,21 @@ fn report_violation_changes(changes: &[ViolationChange]) {
 /// restart. The bootstrap script installs the same state once; this owns it.
 async fn reconcile_host_policy(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     let policy = fetch_host_policy(client, url).await?;
-    let rules = read_ip_rules().await?;
-    let routes = read_ip_routes(policy.route_table).await?;
-    let drift = detect_drift(&rules, &routes, host_table_exists().await?, &policy);
+    let rules = read_ip_rules(IpFamily::V4).await?;
+    let routes = read_ip_routes(IpFamily::V4, policy.route_table).await?;
+    let listing = read_host_table().await?;
+    let mut drift = detect_drift(&rules, &routes, listing.is_some(), &policy);
+    drift.nft_table_stale = listing
+        .as_deref()
+        .is_some_and(|listing| !policy.nft_table_is_current(listing));
+    if policy.ipv6.is_some() {
+        detect_ipv6_drift(
+            &mut drift,
+            &read_ip_rules(IpFamily::V6).await?,
+            &read_ip_routes(IpFamily::V6, policy.route_table).await?,
+            &policy,
+        );
+    }
     if drift.is_clean() {
         return Ok(());
     }
@@ -332,9 +350,26 @@ async fn fetch_host_policy(client: &reqwest::Client, url: &str) -> anyhow::Resul
     if body.len() as u64 > MAX_POLICY_BYTES {
         bail!("host policy response is too large");
     }
-    let policy: HostPolicy = serde_json::from_slice(&body)?;
-    if policy.schema_version != HOST_POLICY_SCHEMA_VERSION {
+    parse_host_policy(&body)
+}
+
+fn parse_host_policy(body: &[u8]) -> anyhow::Result<HostPolicy> {
+    let policy: HostPolicy = serde_json::from_slice(body)?;
+    let expected_schema = if policy.ipv6.is_some() {
+        HOST_POLICY_IPV6_SCHEMA_VERSION
+    } else {
+        HOST_POLICY_SCHEMA_VERSION
+    };
+    if policy.schema_version != expected_schema {
         bail!("unsupported host policy schema");
+    }
+    if let Some(ipv6) = &policy.ipv6 {
+        ipv6.subnet
+            .parse::<ipnet::Ipv6Net>()
+            .context("invalid host policy IPv6 subnet")?;
+        ipv6.gateway_ip
+            .parse::<std::net::Ipv6Addr>()
+            .context("invalid host policy IPv6 gateway address")?;
     }
     policy
         .subnet
@@ -351,6 +386,17 @@ async fn fetch_host_policy(client: &reqwest::Client, url: &str) -> anyhow::Resul
 }
 
 async fn apply_host_policy(policy: &HostPolicy, drift: &HostPolicyDrift) -> anyhow::Result<()> {
+    // The kill switch goes first: a route cannot be installed while the bridge is
+    // absent, and that must not leave the firewall uninstalled as well.
+    if drift.nft_table_missing {
+        run_nft(&policy.render_nft()).await?;
+    } else if drift.nft_table_stale {
+        run_nft(&format!(
+            "delete table inet {HOST_POLICY_TABLE}\n{}",
+            policy.render_nft()
+        ))
+        .await?;
+    }
     if drift.rule_missing {
         // Clear any partial duplicate before adding, mirroring the bootstrap
         // script. A failure here just means there was nothing to remove.
@@ -372,15 +418,51 @@ async fn apply_host_policy(policy: &HostPolicy, drift: &HostPolicyDrift) -> anyh
             run_ip(&args).await?;
         }
     }
-    if drift.nft_table_missing {
-        run_nft(&policy.render_nft()).await?;
+    if drift.ipv6_routes_missing {
+        for args in policy.ipv6_route_replace_args() {
+            run_ip(&args).await?;
+        }
+    }
+    if drift.ipv6_rule_missing {
+        if let Some(ipv6) = &policy.ipv6 {
+            let _ = run_ip(&[
+                "-6".to_owned(),
+                "rule".to_owned(),
+                "del".to_owned(),
+                "priority".to_owned(),
+                policy.rule_priority.to_string(),
+                "from".to_owned(),
+                ipv6.subnet.clone(),
+                "lookup".to_owned(),
+                policy.route_table.to_string(),
+            ])
+            .await;
+        }
+        if let Some(args) = policy.ipv6_rule_add_args() {
+            run_ip(&args).await?;
+        }
     }
     Ok(())
 }
 
-async fn read_ip_rules() -> anyhow::Result<Vec<IpRuleEntry>> {
+#[derive(Clone, Copy)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::V4 => "-4",
+            Self::V6 => "-6",
+        }
+    }
+}
+
+async fn read_ip_rules(family: IpFamily) -> anyhow::Result<Vec<IpRuleEntry>> {
     let output = Command::new("ip")
-        .args(["-j", "rule", "show"])
+        .args(["-j", family.flag(), "rule", "show"])
         .output()
         .await?;
     if !output.status.success() {
@@ -391,9 +473,16 @@ async fn read_ip_rules() -> anyhow::Result<Vec<IpRuleEntry>> {
 
 /// An absent routing table is reported by `ip` as an error, and is exactly the
 /// state we are looking for, so it is read as "no routes" rather than a fault.
-async fn read_ip_routes(table: u32) -> anyhow::Result<Vec<IpRouteEntry>> {
+async fn read_ip_routes(family: IpFamily, table: u32) -> anyhow::Result<Vec<IpRouteEntry>> {
     let output = Command::new("ip")
-        .args(["-j", "route", "show", "table", &table.to_string()])
+        .args([
+            "-j",
+            family.flag(),
+            "route",
+            "show",
+            "table",
+            &table.to_string(),
+        ])
         .output()
         .await?;
     if !output.status.success() || output.stdout.is_empty() {
@@ -402,14 +491,16 @@ async fn read_ip_routes(table: u32) -> anyhow::Result<Vec<IpRouteEntry>> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-async fn host_table_exists() -> anyhow::Result<bool> {
-    Ok(Command::new("nft")
+/// The installed table's listing, or `None` when the table does not exist.
+async fn read_host_table() -> anyhow::Result<Option<String>> {
+    let output = Command::new("nft")
         .args(["list", "table", "inet", HOST_POLICY_TABLE])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await?
-        .success())
+        .output()
+        .await?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
 async fn run_ip(args: &[String]) -> anyhow::Result<()> {
@@ -535,6 +626,30 @@ mod tests {
             manage_host_policy: true,
             host_policy_url: host_policy_url.map(str::to_owned),
         }
+    }
+
+    fn host_policy_document(schema_version: u8, ipv6: &str) -> String {
+        format!(
+            r#"{{"schema_version":{schema_version},"generated_at_unix_ms":0,"subnet":"172.30.0.0/24","bridge":"br-vpn-egress","gateway_ip":"172.30.0.2","route_table":200,"rule_priority":100{ipv6}}}"#
+        )
+    }
+
+    #[test]
+    fn host_policy_schema_must_match_whether_ipv6_is_routed() {
+        let ipv6 = r#","ipv6":{"subnet":"fd30:172:30::/64","gateway_ip":"fd30:172:30::2"}"#;
+        assert!(parse_host_policy(host_policy_document(1, "").as_bytes()).is_ok());
+        assert!(parse_host_policy(host_policy_document(2, ipv6).as_bytes()).is_ok());
+        assert!(parse_host_policy(host_policy_document(1, ipv6).as_bytes()).is_err());
+        assert!(parse_host_policy(host_policy_document(2, "").as_bytes()).is_err());
+        assert!(parse_host_policy(host_policy_document(3, ipv6).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn an_invalid_ipv6_host_policy_is_rejected() {
+        let ipv6 = r#","ipv6":{"subnet":"172.30.0.0/24","gateway_ip":"fd30:172:30::2"}"#;
+        assert!(parse_host_policy(host_policy_document(2, ipv6).as_bytes()).is_err());
+        let ipv6 = r#","ipv6":{"subnet":"fd30:172:30::/64","gateway_ip":"172.30.0.2"}"#;
+        assert!(parse_host_policy(host_policy_document(2, ipv6).as_bytes()).is_err());
     }
 
     #[test]

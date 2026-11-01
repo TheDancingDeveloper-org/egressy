@@ -7,6 +7,12 @@ network:
   gateway_ip: 172.30.0.2
   host_bridge: br-vpn-egress
   route_table: 200
+  # Route enrolled IPv6 through the tunnel. Off by default, in which case the
+  # host and gateway reject enrolled IPv6. See docs/NETWORKING.md before enabling.
+  ipv6:
+    enabled: false
+    subnet: fd30:172:30::/64
+    gateway_ip: fd30:172:30::2
 
 wireguard:
   interface: wg0
