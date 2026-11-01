@@ -489,7 +489,16 @@
           "bridge": { "type": "string" },
           "gateway_ip": { "type": "string" },
           "route_table": { "type": "integer" },
-          "rule_priority": { "type": "integer" }
+          "rule_priority": { "type": "integer" },
+          "ipv6": {
+            "type": "object",
+            "description": "Present, with schema_version 2, only when IPv6 is routed. Without it the host still rejects all IPv6 forwarded from the enrolled bridge.",
+            "required": ["subnet", "gateway_ip"],
+            "properties": {
+              "subnet": { "type": "string" },
+              "gateway_ip": { "type": "string", "format": "ipv6" }
+            }
+          }
         }
       },
       "IsolationPolicy": {
@@ -505,7 +514,8 @@
           "reason_code": { "type": "string" },
           "safe_message": { "type": "string" },
           "issues": { "type": "array", "items": { "type": "string", "maxLength": 512 } },
-          "participants": { "type": "array", "items": { "$ref": "#/components/schemas/IsolationParticipant" } }
+          "participants": { "type": "array", "items": { "$ref": "#/components/schemas/IsolationParticipant" } },
+          "ipv6_subnet": { "type": "string", "description": "Present only when IPv6 is routed." }
         }
       },
       "IsolationParticipant": {

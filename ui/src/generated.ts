@@ -1139,6 +1139,12 @@ export interface components {
             gateway_ip: string;
             route_table: number;
             rule_priority: number;
+            /** @description Present, with schema_version 2, only when IPv6 is routed. Without it the host still rejects all IPv6 forwarded from the enrolled bridge. */
+            ipv6?: {
+                subnet: string;
+                /** Format: ipv6 */
+                gateway_ip: string;
+            };
         };
         IsolationPolicy: {
             /** @constant */
@@ -1152,6 +1158,8 @@ export interface components {
             safe_message: string;
             issues: string[];
             participants: components["schemas"]["IsolationParticipant"][];
+            /** @description Present only when IPv6 is routed. */
+            ipv6_subnet?: string;
         };
         IsolationParticipant: {
             container_id: string;

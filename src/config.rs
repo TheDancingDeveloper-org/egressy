@@ -1,12 +1,12 @@
 use std::{
     env, fs,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
     time::Duration,
 };
 
 use anyhow::{bail, Context};
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 fn default_listen() -> String {
@@ -27,6 +27,18 @@ fn default_subnet() -> Ipv4Net {
 
 fn default_gateway_ip() -> Ipv4Addr {
     Ipv4Addr::new(172, 30, 0, 2)
+}
+
+fn default_ipv6_subnet() -> Ipv6Net {
+    "fd30:172:30::/64"
+        .parse()
+        .expect("valid default IPv6 subnet")
+}
+
+fn default_ipv6_gateway_ip() -> Ipv6Addr {
+    "fd30:172:30::2"
+        .parse()
+        .expect("valid default IPv6 gateway")
 }
 
 fn default_bridge() -> String {
@@ -178,6 +190,34 @@ pub struct NetworkConfig {
     pub gateway_ip: Ipv4Addr,
     pub host_bridge: String,
     pub route_table: u32,
+    pub ipv6: Ipv6Config,
+}
+
+impl NetworkConfig {
+    /// The IPv6 enrollment settings, when IPv6 routing is switched on.
+    pub fn ipv6_routing(&self) -> Option<&Ipv6Config> {
+        self.ipv6.enabled.then_some(&self.ipv6)
+    }
+}
+
+/// IPv6 enrollment. Off by default: enrolled IPv6 is then rejected outright, on
+/// both the host and the gateway, rather than routed.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ipv6Config {
+    pub enabled: bool,
+    pub subnet: Ipv6Net,
+    pub gateway_ip: Ipv6Addr,
+}
+
+impl Default for Ipv6Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            subnet: default_ipv6_subnet(),
+            gateway_ip: default_ipv6_gateway_ip(),
+        }
+    }
 }
 
 impl Default for NetworkConfig {
@@ -188,6 +228,7 @@ impl Default for NetworkConfig {
             gateway_ip: default_gateway_ip(),
             host_bridge: default_bridge(),
             route_table: default_table(),
+            ipv6: Ipv6Config::default(),
         }
     }
 }
@@ -588,6 +629,24 @@ impl Config {
         if self.network.route_table == 0 || self.network.route_table == 253 {
             bail!("network.route_table must be a dedicated non-zero policy table");
         }
+        if let Some(ipv6) = self.network.ipv6_routing() {
+            if !ipv6.subnet.contains(&ipv6.gateway_ip) {
+                bail!("network.ipv6.gateway_ip must be inside network.ipv6.subnet");
+            }
+            if ipv6.gateway_ip == ipv6.subnet.network() {
+                bail!("network.ipv6.gateway_ip cannot be the subnet-router address");
+            }
+            if ipv6.subnet.prefix_len() > 120 {
+                bail!("network.ipv6.subnet must be /120 or shorter");
+            }
+            if ipv6.gateway_ip.is_multicast()
+                || ipv6.gateway_ip.is_loopback()
+                || ipv6.gateway_ip.is_unspecified()
+                || ipv6.gateway_ip.is_unicast_link_local()
+            {
+                bail!("network.ipv6.gateway_ip must be a routable unicast address");
+            }
+        }
         if self.port_forwarding.backend == PortForwardingBackend::NatPmp
             && self.port_forwarding.refresh_seconds
                 >= u64::from(self.port_forwarding.lifetime_seconds)
@@ -855,6 +914,41 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn ipv6_routing_is_opt_in() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(config.network.ipv6_routing().is_none());
+        let config: Config =
+            serde_yaml::from_str("network:\n  ipv6:\n    enabled: true\n").unwrap();
+        config.validate().unwrap();
+        assert!(config.network.ipv6_routing().is_some());
+    }
+
+    #[test]
+    fn ipv6_gateway_must_be_a_usable_address_in_the_subnet() {
+        for (subnet, gateway) in [
+            ("fd30:172:30::/64", "fd30:172:31::2"),
+            ("fd30:172:30::/64", "fd30:172:30::"),
+            ("fd30:172:30::/124", "fd30:172:30::2"),
+            ("fe80::/64", "fe80::2"),
+        ] {
+            let config: Config = serde_yaml::from_str(&format!(
+                "network:\n  ipv6:\n    enabled: true\n    subnet: \"{subnet}\"\n    gateway_ip: \"{gateway}\"\n"
+            ))
+            .unwrap();
+            assert!(config.validate().is_err(), "{subnet} {gateway}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_ipv6_gateway_is_ignored_while_ipv6_is_off() {
+        let config: Config = serde_yaml::from_str(
+            "network:\n  ipv6:\n    enabled: false\n    gateway_ip: \"fe80::2\"\n",
+        )
+        .unwrap();
         config.validate().unwrap();
     }
 
