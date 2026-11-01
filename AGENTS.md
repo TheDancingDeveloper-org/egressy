@@ -13,8 +13,9 @@ The product and project are named **Egressy**. Use `egressy` for the daemon,
 CLI, crate, container service, labels, environment variables, metrics, and
 filesystem or firewall identifiers.
 
-1. Enrolled IPv4 traffic exits through `wg0` or fails closed. It must never
-   fall back to Docker's normal host NAT path.
+1. Enrolled IPv4 traffic, and enrolled IPv6 when `network.ipv6` is enabled,
+   exits through `wg0` or fails closed. It must never fall back to Docker's
+   normal host NAT path. With `network.ipv6` off, enrolled IPv6 is rejected.
 2. Install the gateway nftables policy before bringing up WireGuard.
 3. Keep WireGuard `Table = off`; the `egressy` daemon owns source-policy routing.
 4. Preserve the priority-90 management exception and priority-100 enrolled
@@ -30,7 +31,9 @@ filesystem or firewall identifiers.
 9. Never log, return, commit, or bake credentials, WireGuard private keys, or
    complete WireGuard profiles into an image.
 10. Keep decoded WireGuard profiles on tmpfs with mode `0600`.
-11. Client enrollment is IPv4-only. Do not claim IPv6 leak protection.
+11. IPv6 enrollment is opt-in through `network.ipv6`. The host kill switch stays
+    rendered in both modes, and inbound forwarding stays IPv4-only. Do not claim
+    IPv6 protection without `network.ipv6` and the current host policy.
 
 ## Source map
 
