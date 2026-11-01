@@ -3,7 +3,7 @@ use std::{
     net::Ipv4Addr,
 };
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 
 pub const ISOLATION_ID_LABEL: &str = "egressy.isolation-id";
@@ -76,6 +76,9 @@ pub struct IsolationPolicy {
     pub safe_message: String,
     pub issues: Vec<String>,
     pub participants: Vec<IsolationParticipant>,
+    /// Set when the bridge carries routed IPv6, which then needs isolating too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_subnet: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +212,7 @@ pub fn build_policy(
         .to_owned(),
         issues,
         participants,
+        ipv6_subnet: None,
     }
 }
 
@@ -334,8 +338,25 @@ pub fn render_bridge_policy(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<String>();
+    let ipv6_rules = policy
+        .ipv6_subnet
+        .as_deref()
+        .map(|subnet| {
+            let subnet = subnet
+                .parse::<Ipv6Net>()
+                .expect("validated policy IPv6 subnet");
+            // Allowances are IPv4 addresses, so no peer-to-peer IPv6 is allowed.
+            // Link-local and multicast are included because every peer has an
+            // address there. Tunnel traffic has an outside source or destination,
+            // and only the ICMPv6 a working path depends on is let through.
+            format!(
+                "    icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, packet-too-big, destination-unreachable }} accept\n    ip6 saddr {{ {subnet}, fe80::/10 }} ip6 daddr {{ {subnet}, fe80::/10, ff00::/8 }} counter name isolation_unresolved {}\n",
+                verdict(effective_mode)
+            )
+        })
+        .unwrap_or_default();
     let rules = format!(
-        "table bridge egressy_isolation {{\n{objects}  chain forward {{\n    type filter hook forward priority -10; policy accept;\n    ct state established,related accept\n    ct status dnat accept\n    ip saddr {bridge_gateway} ip daddr {broadcast} accept\n{allowances}{pair_rules}    ip saddr {subnet} ip daddr {subnet} counter name isolation_unresolved {}\n  }}\n}}\n",
+        "table bridge egressy_isolation {{\n{objects}  chain forward {{\n    type filter hook forward priority -10; policy accept;\n    ct state established,related accept\n    ct status dnat accept\n    ip saddr {bridge_gateway} ip daddr {broadcast} accept\n{allowances}{pair_rules}    ip saddr {subnet} ip daddr {subnet} counter name isolation_unresolved {}\n{ipv6_rules}  }}\n}}\n",
         verdict(effective_mode)
     );
     (effective_mode, rules)
@@ -469,6 +490,25 @@ mod tests {
                 && allowed < dropped
         );
         assert!(rules.contains("counter name isolation_unresolved drop"));
+    }
+
+    #[test]
+    fn ipv6_peer_traffic_is_isolated_only_when_ipv6_is_routed() {
+        let mut policy = policy(vec![candidate("app", "172.30.0.10", None)]);
+        let (_, rules) = render_bridge_policy(&policy, IsolationMode::Enforce, &BTreeMap::new());
+        assert!(!rules.contains("ip6 "));
+        assert!(!rules.contains("icmpv6"));
+
+        policy.ipv6_subnet = Some("fd30:172:30::/64".to_owned());
+        let (_, rules) = render_bridge_policy(&policy, IsolationMode::Enforce, &BTreeMap::new());
+        let discovery = rules.find("nd-neighbor-solicit").unwrap();
+        let drop = rules
+            .find("ip6 saddr { fd30:172:30::/64, fe80::/10 } ip6 daddr { fd30:172:30::/64, fe80::/10, ff00::/8 } counter name isolation_unresolved drop")
+            .unwrap();
+        assert!(discovery < drop);
+
+        let (_, audit) = render_bridge_policy(&policy, IsolationMode::Audit, &BTreeMap::new());
+        assert!(audit.contains("ff00::/8 } counter name isolation_unresolved accept"));
     }
 
     #[test]

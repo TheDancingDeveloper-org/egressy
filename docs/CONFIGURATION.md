@@ -26,6 +26,9 @@ the security boundary even when the mount is marked read-only.
 | `gateway_ip` | `172.30.0.2` | Egressy address on that network. |
 | `host_bridge` | `br-vpn-egress` | Stable host bridge interface name. |
 | `route_table` | `200` | Dedicated Linux policy table. |
+| `ipv6.enabled` | `false` | Route enrolled IPv6 through the tunnel. When off, enrolled IPv6 is rejected. |
+| `ipv6.subnet` | `fd30:172:30::/64` | Enrolled IPv6 subnet, /120 or shorter. Must match the Docker network. |
+| `ipv6.gateway_ip` | `fd30:172:30::2` | Egressy's IPv6 address on the enrolled network. |
 
 These values must match the Docker network and installed host policy.
 

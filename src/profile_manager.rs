@@ -460,6 +460,7 @@ impl ProfileManager {
                     &self.config,
                     &previous_dns,
                     &candidate.ipv4_dns(),
+                    candidate.carries_ipv6(),
                 )
                 .await
             }
@@ -469,6 +470,7 @@ impl ProfileManager {
                     &self.config,
                     &previous_dns,
                     &candidate.ipv4_dns(),
+                    candidate.carries_ipv6(),
                 )
                 .await?;
                 Ok(())
@@ -514,6 +516,7 @@ impl ProfileManager {
             &self.config,
             &previous.map_or_else(Vec::new, WireGuardProfile::ipv4_dns),
             &profile.ipv4_dns(),
+            profile.carries_ipv6(),
         )
         .await
     }
