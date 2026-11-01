@@ -80,6 +80,18 @@ sudo tests/isolation-agent-nft.sh
 tests/docker-proxy-acl.sh
 ```
 
+`tests/ipv6-netns.sh` exercises the rendered IPv6 policy, the host agent, and
+leak paths between namespaces, using `egressy` and `egressy-isolation-agent`
+binaries from `target/debug`. It is opt-in and needs root, so run it in a disposable
+container with no network, in an image that has `iproute2`, `nftables`,
+`wireguard-tools`, `iputils-ping`, `netcat-openbsd`, and a compatible libc:
+
+```sh
+cargo build --bins
+docker run --rm --privileged --network none -e EGRESSY_RUN_NETNS_TESTS=1 \
+  -v "$PWD:/src:ro" -w /src egressy-netns-test tests/ipv6-netns.sh
+```
+
 Read each script before running it. Do not mutate a workstation or production
 host's routing/firewall state as an ordinary test step.
 
@@ -102,6 +114,20 @@ Use a disposable enrolled container and verify:
 An external validation result is optional and advisory. A successful container
 start, Compose run, image publish, dashboard load, or handshake alone is not
 acceptance evidence.
+
+## IPv6 end-to-end test
+
+`tests/ipv6-docker.sh` runs the real daemon, host agent, and Docker IPv6 networks
+inside a disposable Docker-in-Docker sandbox, against a local WireGuard peer. It
+does not change the host's routes, firewall, containers, or networks, but it does
+need a privileged container and network access to pull its base images:
+
+```sh
+docker build -t egressy:test .
+EGRESSY_RUN_DOCKER_TESTS=1 tests/ipv6-docker.sh
+```
+
+A provider's real IPv6 service is still a live acceptance step.
 
 ## Secret scan
 

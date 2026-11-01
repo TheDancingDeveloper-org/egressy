@@ -113,6 +113,7 @@ pub async fn run(
             gateway_address: config.network.gateway_ip.to_string(),
             host_bridge: config.network.host_bridge.clone(),
             policy_table: config.network.route_table,
+            client_ipv6_supported: config.network.ipv6_routing().is_some(),
             ..TopologyStatus::default()
         },
         vpn_server: configured_peer
@@ -267,6 +268,7 @@ pub async fn run(
         &config.docker_socket,
         config.network.name.clone(),
         config.network.subnet,
+        config.network.ipv6_routing().map(|ipv6| ipv6.subnet),
         config.port_forwarding.max_leases,
     )?;
 
@@ -667,7 +669,13 @@ async fn reconcile_docker(
     let mut ticker = interval(config.reconcile_interval());
     loop {
         ticker.tick().await;
-        match observer.inspect_network(config.network.gateway_ip).await {
+        match observer
+            .inspect_network(
+                config.network.gateway_ip,
+                config.network.ipv6_routing().map(|ipv6| ipv6.gateway_ip),
+            )
+            .await
+        {
             Ok(network) => {
                 let matches = network.exists && network.subnet_matches && network.gateway_attached;
                 publisher.observe(
@@ -692,14 +700,33 @@ async fn reconcile_docker(
                         )
                         .await;
                 }
-                if network.ipv6_enabled {
+                if config.network.ipv6_routing().is_some() {
+                    let ready = network.ipv6_enabled
+                        && network.ipv6_subnet_matches
+                        && network.ipv6_gateway_attached;
+                    publisher
+                        .observe(
+                            "topology.network_ipv6",
+                            if ready { CheckStatus::Healthy } else { CheckStatus::Degraded },
+                            Impact::Advisory,
+                            if ready { "topology.network_ipv6_ready" } else { "topology.network_ipv6_mismatch" },
+                            if ready {
+                                "The enrolled Docker network matches network.ipv6 and the gateway is attached"
+                            } else {
+                                "network.ipv6 is enabled, but the enrolled Docker network lacks IPv6, the configured subnet, or the gateway's address; enrolled IPv6 stays blocked"
+                            },
+                            None,
+                            None,
+                        )
+                        .await;
+                } else if network.ipv6_enabled {
                     publisher
                         .observe(
                             "topology.network_ipv6",
                             CheckStatus::Degraded,
                             Impact::Advisory,
                             "topology.network_ipv6_enabled",
-                            "The enrolled Docker network has IPv6 enabled, which is unsupported",
+                            "The enrolled Docker network has IPv6 enabled while network.ipv6 is off; enrolled IPv6 is rejected",
                             None,
                             None,
                         )
@@ -824,12 +851,21 @@ async fn reconcile_docker(
                         None,
                     )
                     .await;
+                let ipv6_routed = config.network.ipv6_routing().is_some();
                 publisher.observe(
                     "topology.client_ipv6",
-                    if has_ipv6 { CheckStatus::Degraded } else { CheckStatus::Healthy },
+                    if has_ipv6 && !ipv6_routed { CheckStatus::Degraded } else { CheckStatus::Healthy },
                     Impact::Advisory,
-                    if has_ipv6 { "topology.client_ipv6_unsupported" } else { "topology.client_ipv4_only" },
-                    if has_ipv6 { "An enrolled client has an IPv6 address; client IPv6 leak protection is unsupported" } else { "No enrolled client IPv6 address was discovered" },
+                    match (has_ipv6, ipv6_routed) {
+                        (true, true) => "topology.client_ipv6_routed",
+                        (true, false) => "topology.client_ipv6_unsupported",
+                        (false, _) => "topology.client_ipv4_only",
+                    },
+                    match (has_ipv6, ipv6_routed) {
+                        (true, true) => "Enrolled client IPv6 addresses are routed through the tunnel or fail closed",
+                        (true, false) => "An enrolled client has an IPv6 address while network.ipv6 is off; its IPv6 is rejected",
+                        (false, _) => "No enrolled client IPv6 address was discovered",
+                    },
                     None,
                     None,
                 ).await;
@@ -911,13 +947,17 @@ async fn reconcile_docker(
         }
         match observer.discover_isolation_candidates().await {
             Ok(candidates) => {
-                let policy = crate::isolation::build_policy(
+                let mut policy = crate::isolation::build_policy(
                     &config.network.name,
                     &config.network.host_bridge,
                     config.network.subnet,
                     candidates,
                     unix_ms(),
                 );
+                policy.ipv6_subnet = config
+                    .network
+                    .ipv6_routing()
+                    .map(|ipv6| ipv6.subnet.to_string());
                 let complete = policy.eligible_for_enforcement;
                 let has_participants = !policy.participants.is_empty();
                 publisher
@@ -2005,7 +2045,7 @@ pub(crate) async fn wireguard_up(
         .to_str()
         .context("WireGuard runtime path is not valid UTF-8")?;
     command("wg-quick", &["up", runtime_path]).await?;
-    configure_gateway_routes(config, &profile.ipv4_dns()).await
+    configure_gateway_routes(config, &profile.ipv4_dns(), profile.carries_ipv6()).await
 }
 
 pub(crate) async fn load_mounted_profile(
@@ -2092,6 +2132,7 @@ async fn verify_tmpfs(directory: &std::path::Path) -> anyhow::Result<()> {
 pub(crate) async fn configure_gateway_routes(
     config: &Config,
     profile_dns: &[Ipv4Addr],
+    profile_carries_ipv6: bool,
 ) -> anyhow::Result<()> {
     let table = config.network.route_table.to_string();
     let subnet = config.network.subnet.to_string();
@@ -2153,15 +2194,102 @@ pub(crate) async fn configure_gateway_routes(
         )
         .await?;
     }
-    Ok(())
+    configure_gateway_ipv6_routes(config, profile_carries_ipv6).await
+}
+
+/// Mirror the IPv4 source rules for IPv6. The unreachable route is installed
+/// first and outlives the tunnel route, so a lookup from the enrolled subnet can
+/// never fall through to the management default route, even without the firewall.
+async fn configure_gateway_ipv6_routes(
+    config: &Config,
+    profile_carries_ipv6: bool,
+) -> anyhow::Result<()> {
+    let Some(ipv6) = config.network.ipv6_routing() else {
+        return Ok(());
+    };
+    let table = config.network.route_table.to_string();
+    let subnet = ipv6.subnet.to_string();
+    let local_gateway = ipv6.gateway_ip.to_string();
+    let tunnel = &config.wireguard.interface;
+    command(
+        "ip",
+        &[
+            "-6",
+            "route",
+            "replace",
+            "table",
+            &table,
+            "unreachable",
+            "default",
+            "metric",
+            &egressy::host_policy::IPV6_UNREACHABLE_METRIC.to_string(),
+        ],
+    )
+    .await?;
+    let tunnel_route = [
+        "-6", "route", "replace", "table", &table, "default", "dev", tunnel,
+    ];
+    if profile_carries_ipv6 {
+        command("ip", &tunnel_route).await?;
+    } else {
+        warn!("network.ipv6 is enabled but the profile has no IPv6 address or ::/0 peer range; enrolled IPv6 is blocked");
+        let _ = command(
+            "ip",
+            &[
+                "-6", "route", "del", "table", &table, "default", "dev", tunnel,
+            ],
+        )
+        .await;
+    }
+    let _ = command(
+        "ip",
+        &["-6", "rule", "del", "from", &subnet, "lookup", &table],
+    )
+    .await;
+    let _ = command(
+        "ip",
+        &[
+            "-6",
+            "rule",
+            "del",
+            "from",
+            &local_gateway,
+            "lookup",
+            "main",
+        ],
+    )
+    .await;
+    command(
+        "ip",
+        &[
+            "-6",
+            "rule",
+            "add",
+            "priority",
+            "90",
+            "from",
+            &local_gateway,
+            "lookup",
+            "main",
+        ],
+    )
+    .await?;
+    command(
+        "ip",
+        &[
+            "-6", "rule", "add", "priority", "100", "from", &subnet, "lookup", &table,
+        ],
+    )
+    .await
 }
 
 pub(crate) async fn reconcile_gateway_routes(
     config: &Config,
     previous_profile_dns: &[Ipv4Addr],
     desired_profile_dns: &[Ipv4Addr],
+    profile_carries_ipv6: bool,
 ) -> anyhow::Result<()> {
-    configure_gateway_routes(config, desired_profile_dns).await?;
+    configure_gateway_routes(config, desired_profile_dns, profile_carries_ipv6).await?;
     let desired = tunnel_service_routes(config, desired_profile_dns);
     for address in previous_profile_dns {
         if desired.contains(address) {

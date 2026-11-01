@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Context;
 use bollard::{models::EndpointSettings, query_parameters::ListContainersOptionsBuilder, Docker};
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 
 use crate::isolation::{IsolationCandidate, ISOLATION_ALLOW_LABEL, ISOLATION_ID_LABEL};
 use crate::state::{ClientState, RouteIntentState, RouteIntentStatus, UsageIdentitySource};
@@ -21,6 +21,7 @@ pub struct DockerObserver {
     docker: Docker,
     network_name: String,
     subnet: Ipv4Net,
+    ipv6_subnet: Option<Ipv6Net>,
     max_port_forward_leases: usize,
 }
 
@@ -30,6 +31,8 @@ pub struct NetworkObservation {
     pub subnet_matches: bool,
     pub gateway_attached: bool,
     pub ipv6_enabled: bool,
+    pub ipv6_subnet_matches: bool,
+    pub ipv6_gateway_attached: bool,
     /// Whether Docker's dynamic pool is kept away from the gateway's address.
     /// When it is not, IPAM may hand that address to whichever container starts
     /// first, and the gateway then cannot start at all.
@@ -64,6 +67,7 @@ impl DockerObserver {
         socket: &str,
         network_name: String,
         subnet: Ipv4Net,
+        ipv6_subnet: Option<Ipv6Net>,
         max_port_forward_leases: usize,
     ) -> anyhow::Result<Self> {
         let docker = if socket.starts_with("http://") || socket.starts_with("tcp://") {
@@ -78,6 +82,7 @@ impl DockerObserver {
             docker,
             network_name,
             subnet,
+            ipv6_subnet,
             max_port_forward_leases,
         })
     }
@@ -144,7 +149,19 @@ impl DockerObserver {
                 ),
             };
             let route_matches = route_intent_is_compatible(&route_intent);
-            let compliant = attached && running && port_forward_label_valid && route_matches;
+            let ipv6_problem = self.ipv6_subnet.and_then(|subnet| {
+                ipv6_compliance_problem(
+                    subnet,
+                    ipv6_address.as_deref(),
+                    &route_intent,
+                    &self.network_name,
+                )
+            });
+            let compliant = attached
+                && running
+                && port_forward_label_valid
+                && route_matches
+                && ipv6_problem.is_none();
             if attached && !running {
                 compliance_message = "enrolled container is not running".to_owned();
             } else if attached && !port_forward_label_valid {
@@ -152,8 +169,10 @@ impl DockerObserver {
                     "port forwarding requested without a valid egressy.target-port".to_owned();
             } else if attached && !route_matches {
                 compliance_message = "Docker declares an alternate IPv4 default network; the client is ineligible for compliant routing and port forwarding".to_owned();
-            } else if attached && ipv6_address.is_some() {
-                compliance_message.push_str("; IPv6 address present and unsupported");
+            } else if let (true, Some(problem)) = (attached, ipv6_problem) {
+                compliance_message = problem;
+            } else if attached && ipv6_address.is_some() && self.ipv6_subnet.is_none() {
+                compliance_message.push_str("; IPv6 address present and rejected");
             }
 
             clients.insert(
@@ -227,7 +246,11 @@ impl DockerObserver {
         Ok(candidates)
     }
 
-    pub async fn inspect_network(&self, gateway: Ipv4Addr) -> anyhow::Result<NetworkObservation> {
+    pub async fn inspect_network(
+        &self,
+        gateway: Ipv4Addr,
+        ipv6_gateway: Option<Ipv6Addr>,
+    ) -> anyhow::Result<NetworkObservation> {
         let network = self
             .docker
             .inspect_network(&self.network_name, None)
@@ -251,19 +274,64 @@ impl DockerObserver {
                     .unwrap_or_default();
                 gateway_address_is_reserved(config.ip_range.as_deref(), &auxiliary, gateway)
             });
-        let gateway_attached = network
-            .containers
-            .unwrap_or_default()
+        let ipv6_subnet_matches = self.ipv6_subnet.is_some_and(|expected| {
+            ipam_configs.iter().any(|config| {
+                config
+                    .subnet
+                    .as_deref()
+                    .and_then(|subnet| subnet.parse::<Ipv6Net>().ok())
+                    == Some(expected)
+            })
+        });
+        let containers = network.containers.unwrap_or_default();
+        let gateway_attached = containers
             .values()
             .filter_map(|endpoint| endpoint.ipv4_address.as_deref())
             .any(|address| address.split('/').next() == Some(&gateway.to_string()));
+        let ipv6_gateway_attached = ipv6_gateway.is_some_and(|expected| {
+            containers
+                .values()
+                .filter_map(|endpoint| endpoint.ipv6_address.as_deref())
+                .filter_map(|address| address.split('/').next())
+                .filter_map(|address| address.parse::<Ipv6Addr>().ok())
+                .any(|address| address == expected)
+        });
         Ok(NetworkObservation {
             exists: true,
             subnet_matches,
             gateway_attached,
             ipv6_enabled: network.enable_ipv6.unwrap_or(false),
+            ipv6_subnet_matches,
+            ipv6_gateway_attached,
             gateway_address_reserved,
         })
+    }
+}
+
+/// With IPv6 routed, a client is only compliant if its IPv6 can use the tunnel
+/// path: an address on the enrolled subnet, and no other network chosen for its
+/// IPv6 default. An IPv4-only client on the enrolled network has nothing to leak.
+fn ipv6_compliance_problem(
+    subnet: Ipv6Net,
+    address: Option<&str>,
+    route_intent: &RouteIntentState,
+    egress_network: &str,
+) -> Option<String> {
+    if let Some(address) = address {
+        if !address
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|address| subnet.contains(&address))
+        {
+            return Some(format!(
+                "IPv6 address is outside the enrolled subnet {subnet}"
+            ));
+        }
+    }
+    match route_intent.ipv6_default_network.as_deref() {
+        Some(network) if network != egress_network => Some(format!(
+            "Docker declares {network} as the IPv6 default network instead of {egress_network}; the client is ineligible for compliant routing and port forwarding"
+        )),
+        _ => None,
     }
 }
 
@@ -604,6 +672,7 @@ mod tests {
             "http://docker-api-proxy:2375",
             "vpn-egress".to_owned(),
             "172.30.0.0/24".parse().unwrap(),
+            None,
             5,
         )
         .is_ok());
@@ -740,6 +809,24 @@ mod tests {
         );
         assert_eq!(observation.status, RouteIntentStatus::Mismatch);
         assert_eq!(observation.ipv4_default_network.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn ipv6_compliance_requires_the_enrolled_subnet_and_default_network() {
+        let subnet: Ipv6Net = "fd30:172:30::/64".parse().unwrap();
+        let intent = |network: Option<&str>| RouteIntentState {
+            ipv6_default_network: network.map(str::to_owned),
+            ..RouteIntentState::default()
+        };
+        let check = |address, network| {
+            ipv6_compliance_problem(subnet, address, &intent(network), "vpn-egress")
+        };
+        assert_eq!(check(None, None), None);
+        assert_eq!(check(Some("fd30:172:30::10"), Some("vpn-egress")), None);
+        assert!(check(Some("2001:db8::10"), Some("vpn-egress")).is_some());
+        assert!(check(Some("not-an-address"), Some("vpn-egress")).is_some());
+        assert!(check(Some("fd30:172:30::10"), Some("ipv6-app")).is_some());
+        assert!(check(None, Some("ipv6-app")).is_some());
     }
 
     #[test]
