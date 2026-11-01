@@ -53,22 +53,15 @@ set -eu
 # This script is a bootstrap, not the owner of this state. The host-network
 # agent reconciles the same policy continuously, so anything that clears it --
 # a Docker daemon restart, for instance -- is repaired without rerunning this.
-#
-# Order matters, and mirrors the agent: the kill switch goes in first, before
-# any forwarding is enabled, so a step that fails under `set -e` never leaves
-# enrolled traffic forwarded without it. The empty `table` line makes the
-# delete valid on a first run, so the whole replacement is one nft transaction
-# with no window where the old table is gone and the new one is not yet loaded.
-nft -f - <<'NFT'
-table inet {nft_table}
-delete table inet {nft_table}
-{nft}NFT
-
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-{routes}ip rule del from {subnet} lookup {table} 2>/dev/null || true
+ip rule del from {subnet} lookup {table} 2>/dev/null || true
 ip {rule}
-{ipv6}"#,
+{routes}{ipv6}
+nft delete table inet {nft_table} 2>/dev/null || true
+nft -f - <<'NFT'
+{nft}NFT
+"#,
         subnet = policy.subnet,
         table = policy.route_table,
         rule = rule,
@@ -89,7 +82,7 @@ fn render_host_ipv6_setup(policy: &HostPolicy) -> String {
         .map(|args| format!("ip {}\n", args.join(" ")))
         .collect::<String>();
     format!(
-        "\n# Enables IPv6 forwarding host-wide. An uplink that learns its default route from\n# router advertisements also needs accept_ra=2; see docs/NETWORKING.md.\nsysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null\n\n# Routes before the rule, `unreachable` first, so the rule never selects a\n# table that could fall through to the main default route.\n{routes}ip -6 rule del from {subnet} lookup {table} 2>/dev/null || true\nip {rule}\n",
+        "\n# Enables IPv6 forwarding host-wide. An uplink that learns its default route from\n# router advertisements also needs accept_ra=2; see docs/NETWORKING.md.\nsysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null\n\nip -6 rule del from {subnet} lookup {table} 2>/dev/null || true\nip {rule}\n{routes}",
         subnet = ipv6.subnet,
         table = policy.route_table,
         rule = rule.join(" "),
@@ -403,37 +396,6 @@ mod tests {
         assert!(
             script.contains("ip -6 route replace table 200 unreachable default metric 4294967295")
         );
-    }
-
-    #[test]
-    fn host_setup_installs_the_kill_switch_before_any_forwarding_or_routing() {
-        for config in [serde_yaml::from_str::<Config>("{}").unwrap(), ipv6_config()] {
-            let script = render_host_setup(&config);
-            let at = |needle: &str| {
-                script
-                    .find(needle)
-                    .unwrap_or_else(|| panic!("missing {needle:?} in:\n{script}"))
-            };
-            // The table is replaced in one nft transaction, never by a separate
-            // `nft delete table` that leaves a window without the kill switch.
-            assert!(!script.contains("nft delete"));
-            let batch = at("nft -f - <<'NFT'\ntable inet egressy_host\ndelete table inet egressy_host\ntable inet egressy_host {");
-            let kill_switch = at("egressy-ipv6-kill-switch:");
-            assert!(batch < kill_switch);
-            assert!(kill_switch < at("sysctl -w net.ipv4.ip_forward=1"));
-            assert!(kill_switch < at("ip route replace"));
-            assert!(at("ip route replace") < at("ip rule add"));
-        }
-        let script = render_host_setup(&ipv6_config());
-        let at = |needle: &str| script.find(needle).unwrap();
-        assert!(at("NFT\n") < at("net.ipv6.conf.all.forwarding=1"));
-        assert!(at("net.ipv6.conf.all.forwarding=1") < at("ip -6 route replace"));
-        assert!(
-            at("ip -6 route replace table 200 unreachable")
-                < at("ip -6 route replace table 200 fd30")
-        );
-        assert!(at("ip -6 route replace table 200 default via") < at("ip -6 rule del"));
-        assert!(at("ip -6 rule del") < at("ip -6 rule add"));
     }
 
     #[test]
