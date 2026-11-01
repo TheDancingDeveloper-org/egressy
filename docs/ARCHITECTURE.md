@@ -8,8 +8,8 @@ policy routing sends packets sourced from that bridge to the gateway container,
 which applies fail-closed policy and forwards them through WireGuard.
 
 The system deliberately does not mutate client containers, provide an
-application proxy, select provider servers, or manage provider credentials.
-IPv6 client routing is opt-in; see `docs/NETWORKING.md`.
+application proxy, select provider servers, manage provider credentials, or
+claim IPv6 client protection.
 
 ## Components
 

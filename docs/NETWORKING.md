@@ -164,88 +164,9 @@ does not provide hostile Layer-2 tenant isolation.
 
 ## IPv6
 
-IPv6 routing is opt-in through `network.ipv6`, and it is off by default. In both
-modes, the host and gateway policies reject enrolled IPv6 that would leave any
-other way than through the tunnel.
-
-| | `network.ipv6` off | `network.ipv6` on |
-|---|---|---|
-| Enrolled IPv6 egress | Rejected on the host; dropped on the gateway | Through `wg0`, masqueraded to the profile's IPv6 address |
-| Tunnel or route loss | Rejected | Unreachable or rejected |
-| Host policy schema | 1 | 2 |
-
-### Enabling
-
-1. Use a profile with an IPv6 `Address` and `::/0` in `AllowedIPs`. Otherwise
-   Egressy logs a warning and enrolled IPv6 stays unreachable.
-2. Recreate the Docker network with `EGRESSY_IPV6=1 config/docker-network.sh`.
-   Docker cannot add IPv6 to an existing network, so enrolled containers must be
-   recreated as well.
-3. Set `network.ipv6.enabled: true`, and start with
-   `docker compose -f compose.yaml -f compose.ipv6.yaml up -d`.
-4. Upgrade the host agent at the same time. An older agent refuses schema 2
-   rather than leaving client IPv6 without host policy, and it logs that failure.
-5. If the host is not using the agent, rerun `render-host-setup`.
-
-The script enables `net.ipv6.conf.all.forwarding` on the host, as Docker itself
-does for IPv6 networks. A host uplink that learns its default route from router
-advertisements needs `accept_ra=2` on that interface, or it loses that route.
-
-### Packet path
-
-The path mirrors IPv4: a client's default route points at the Docker bridge, the
-host's priority-100 source rule selects table 200, and table 200 routes through
-the gateway's `fd30:172:30::2` address. On the gateway, priority 90 keeps the
-gateway's own address on `main`, priority 100 selects table 200, and table 200
-defaults to `wg0`. The tunnel provides one address, so the gateway masquerades
-enrolled IPv6 to it, and clients can use a private `fd00::/8` subnet.
-
-### Fail-closed layers
-
-- **Host kill switch.** Every IPv6 packet forwarded from the enrolled bridge to
-  another interface is rejected, whatever its source, and IPv6 forwarded toward
-  the bridge from another interface is dropped. The rule is rendered in both
-  modes, and the agent replaces a table that lacks the current rule.
-- **Gateway firewall.** The forward chain's drop policy permits enrolled IPv6 only
-  toward `wg0` and return state from it. Plain IPv6 DNS is rejected, and new IPv6
-  arriving on `wg0` is dropped.
-- **Unreachable routes.** Table 200 on the host and gateway ends with an
-  `unreachable` default, so a lookup that loses its tunnel or gateway route does
-  not fall through to the main table, even if a firewall table was removed.
-- **Compliance.** A client whose IPv6 address is off the configured subnet, or
-  whose declared IPv6 default is another network, is reported as non-compliant.
-  Docker metadata does not attest the route inside the container.
-
-### Limits
-
-- **Inbound.** NAT-PMP maps IPv4 only, so forwarded ports stay IPv4 and unsolicited
-  inbound IPv6 is dropped. Publishing a client's port over IPv6 through Docker
-  does not work, because the host kill switch blocks it.
-- **DNS.** Clients keep using the gateway's IPv4 address as their resolver. That
-  transport returns `AAAA` answers from the provider resolver, and upstream IPv6
-  resolvers remain unused.
-- **Bridge isolation.** `IsolationPolicy.ipv6_subnet` extends audit and enforce
-  modes to IPv6 peer traffic. Allowances remain IPv4, so peer-to-peer IPv6 is not
-  allowed in enforce mode.
-- **Startup.** The kill switch exists only once the host policy is installed. A
-  client that sends IPv6 before that, such as one that starts ahead of the agent
-  after a reboot, can leave by the host's IPv6 default route. IPv4 has the same
-  window. On a host with an IPv6 uplink, install the host policy at boot, before
-  Docker starts, by running the `render-host-setup` output or an equivalent.
-- **MTU.** `config/docker-network.sh` sets the network's MTU to 1420, WireGuard's
-  default. With a larger bridge MTU, TCP still adapts through Packet Too Big, but
-  oversized UDP and ICMP can be lost. A profile with a lower `MTU` needs the same
-  value on the network.
-- **External validation.** The probe still validates IPv4 only. Verify IPv6 by hand
-  with the commands below.
-
-### Rollback
-
-Set `network.ipv6.enabled: false` and drop the overlay. The agent replaces the
-host table, so enrolled IPv6 is rejected right away. The IPv6 rule and routes it
-leaves behind are inert, and you can remove them with
-`ip -6 rule del priority 100 from fd30:172:30::/64 lookup 200` and
-`ip -6 route flush table 200`.
+The host client-source rule, bridge enrollment, and leak protections are IPv4
+only. A WireGuard profile containing IPv6 does not extend these controls to
+clients. Do not give enrolled clients a separate IPv6 default route.
 
 ## Verification
 
@@ -264,14 +185,6 @@ docker exec egressy wg show wg0 latest-handshakes
 docker exec disposable-client ip -4 route
 docker exec disposable-client getent hosts example.com
 docker exec disposable-client wget -qO- https://ifconfig.co/ip
-
-# With network.ipv6 enabled:
-ip -6 rule show
-ip -6 route show table 200
-docker exec egressy ip -6 rule show
-docker exec egressy ip -6 route show table 200
-docker exec disposable-client ip -6 route
-docker exec disposable-client wget -6 -qO- https://ifconfig.co/ip
 ```
 
 Confirm the client exit differs from the host's ordinary exit without placing

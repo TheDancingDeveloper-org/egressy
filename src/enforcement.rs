@@ -1,9 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    net::{Ipv4Addr, Ipv6Addr},
-    process::Stdio,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, net::Ipv4Addr, process::Stdio, sync::Arc};
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
@@ -58,7 +53,6 @@ impl CounterAccumulator {
 #[derive(Clone, Debug)]
 struct ClientCounters {
     address: Ipv4Addr,
-    ipv6_address: Option<Ipv6Addr>,
     download_packets: CounterAccumulator,
     downloaded_bytes: CounterAccumulator,
     upload_packets: CounterAccumulator,
@@ -69,7 +63,6 @@ impl ClientCounters {
     fn new(address: Ipv4Addr) -> Self {
         Self {
             address,
-            ipv6_address: None,
             download_packets: CounterAccumulator::default(),
             downloaded_bytes: CounterAccumulator::default(),
             upload_packets: CounterAccumulator::default(),
@@ -200,7 +193,6 @@ impl EnforcementCoordinator {
                 ClientCounterRule {
                     container_id: container_id.clone(),
                     address: counters.address,
-                    ipv6_address: counters.ipv6_address,
                     download_packets: totals.download_packets,
                     downloaded_bytes: totals.downloaded_bytes,
                     upload_packets: totals.upload_packets,
@@ -309,11 +301,7 @@ fn sync_clients(policy: &mut DesiredPolicy, clients: &BTreeMap<String, ClientSta
             policy
                 .clients
                 .entry(container_id.clone())
-                .or_insert_with(|| ClientCounters::new(client.ipv4_address))
-                .ipv6_address = client
-                .ipv6_address
-                .as_deref()
-                .and_then(|address| address.parse().ok());
+                .or_insert_with(|| ClientCounters::new(client.ipv4_address));
         }
     }
 }
@@ -429,23 +417,6 @@ mod tests {
             "172.30.0.11".parse::<Ipv4Addr>().unwrap()
         );
         assert_eq!(policy.clients["same"].downloaded_bytes.total, 0);
-    }
-
-    #[test]
-    fn an_ipv6_address_change_keeps_the_client_totals() {
-        let mut policy = DesiredPolicy::default();
-        let mut client = client("same", "172.30.0.10");
-        sync_clients(&mut policy, &[("same".to_owned(), client.clone())].into());
-        assert_eq!(policy.clients["same"].ipv6_address, None);
-        policy.clients.get_mut("same").unwrap().uploaded_bytes.total = 1_000;
-
-        client.ipv6_address = Some("fd30:172:30::10".to_owned());
-        sync_clients(&mut policy, &[("same".to_owned(), client)].into());
-        assert_eq!(
-            policy.clients["same"].ipv6_address,
-            Some("fd30:172:30::10".parse().unwrap())
-        );
-        assert_eq!(policy.clients["same"].uploaded_bytes.total, 1_000);
     }
 
     #[test]

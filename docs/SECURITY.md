@@ -87,11 +87,10 @@ and dependency is inventoried.
 
 ## IPv6
 
-IPv6 enrollment is opt-in through `network.ipv6`. With it off, the host and
-gateway reject enrolled IPv6, and a provider profile's IPv6 addresses do not
-reach clients. With it on, enrolled IPv6 leaves through the tunnel or fails
-closed, as described in `docs/NETWORKING.md`. Both modes depend on the host
-policy being installed, so treat a sustained agent failure as loss of protection.
+Client enrollment is IPv4-only. A provider profile may contain IPv6 tunnel
+addresses, but that does not create host source routing or a complete
+fail-closed policy for client IPv6. Disable independent IPv6 egress for enrolled
+workloads and do not claim IPv6 leak protection.
 
 ## Supply chain
 
