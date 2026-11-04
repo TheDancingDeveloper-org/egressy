@@ -234,7 +234,7 @@ impl DockerObserver {
                 let mac = endpoint
                     .mac_address
                     .as_deref()
-                    .and_then(crate::kubernetes::normalize_mac);
+                    .and_then(crate::isolation::normalize_mac);
                 Some(IsolationCandidate {
                     container_id: id,
                     name,

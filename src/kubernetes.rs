@@ -16,7 +16,9 @@ use serde::Deserialize;
 
 use crate::config::KubernetesConfig;
 use crate::docker::{ENABLE_LABEL, PORT_FORWARD_LABEL, TARGET_PORT_LABEL, USAGE_ID_LABEL};
-use crate::isolation::{IsolationCandidate, ISOLATION_ALLOW_LABEL, ISOLATION_ID_LABEL};
+use crate::isolation::{
+    normalize_mac, IsolationCandidate, ISOLATION_ALLOW_LABEL, ISOLATION_ID_LABEL,
+};
 use crate::state::{
     ClientState, ClientTrafficState, RouteIntentState, RouteIntentStatus, UsageIdentitySource,
 };
@@ -218,29 +220,6 @@ pub fn parse_attachment(
             .iter()
             .any(|address| address.parse::<Ipv4Addr>().ok() == Some(gateway_ip)),
     })
-}
-
-/// A unicast MAC in canonical lower-case colon form, or `None`. The result is
-/// rendered into nftables, so nothing but hex digits and colons gets through.
-pub fn normalize_mac(raw: &str) -> Option<String> {
-    let octets = raw
-        .split(':')
-        .map(|octet| {
-            (octet.len() == 2 && octet.chars().all(|c| c.is_ascii_hexdigit()))
-                .then(|| u8::from_str_radix(octet, 16).ok())
-                .flatten()
-        })
-        .collect::<Option<Vec<_>>>()?;
-    if octets.len() != 6 || octets[0] & 1 == 1 || octets.iter().all(|octet| *octet == 0) {
-        return None;
-    }
-    Some(
-        octets
-            .iter()
-            .map(|octet| format!("{octet:02x}"))
-            .collect::<Vec<_>>()
-            .join(":"),
-    )
 }
 
 pub fn snapshot_from_pods(scope: &DiscoveryScope, pods: Vec<Pod>) -> KubernetesSnapshot {
