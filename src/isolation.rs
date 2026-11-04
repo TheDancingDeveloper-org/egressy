@@ -62,6 +62,11 @@ pub struct IsolationParticipant {
     pub isolation_id: Option<String>,
     pub ipv4_address: Ipv4Addr,
     pub allowances: Vec<IsolationAllowance>,
+    /// When set, the host agent drops frames that carry this participant's
+    /// address from any other MAC, and frames from this MAC with any other
+    /// address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -79,6 +84,14 @@ pub struct IsolationPolicy {
     /// Set when the bridge carries routed IPv6, which then needs isolating too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv6_subnet: Option<String>,
+    /// An address range (the Kubernetes pod range) whose every source address
+    /// must belong to a participant bound by MAC; anything else is dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_range: Option<String>,
+    /// The egress gateway's address. The gateway forwards return traffic with
+    /// outside source addresses, so its MAC is not held to its own address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_address: Option<Ipv4Addr>,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +146,32 @@ pub fn build_policy(
         }
     }
 
+    // An address or MAC claimed by more than one participant cannot be bound
+    // to either; the claim itself is the problem an operator must resolve.
+    let mut address_claims = BTreeMap::<Ipv4Addr, usize>::new();
+    let mut mac_claims = BTreeMap::<String, BTreeSet<Ipv4Addr>>::new();
+    for candidate in &candidates {
+        *address_claims.entry(candidate.ipv4_address).or_default() += 1;
+        if let Some(mac) = candidate.mac.as_deref().and_then(normalize_mac) {
+            mac_claims
+                .entry(mac)
+                .or_default()
+                .insert(candidate.ipv4_address);
+        }
+    }
+    for (address, claims) in &address_claims {
+        if *claims > 1 {
+            issues.push(format!(
+                "address {address} is claimed by more than one participant"
+            ));
+        }
+    }
+    for (mac, addresses) in &mac_claims {
+        if addresses.len() > 1 {
+            issues.push(format!("MAC {mac} is claimed by more than one address"));
+        }
+    }
+
     let unique_addresses = identities
         .iter()
         .filter(|(_, indexes)| indexes.len() == 1)
@@ -164,7 +203,18 @@ pub fn build_policy(
                 Err(error) => issues.push(format!("{}: {error}", candidate.name)),
             }
         }
+        let mac = candidate
+            .mac
+            .as_deref()
+            .and_then(normalize_mac)
+            .filter(|mac| {
+                address_claims.get(&candidate.ipv4_address) == Some(&1)
+                    && mac_claims
+                        .get(mac)
+                        .is_some_and(|addresses| addresses.len() == 1)
+            });
         participants.push(IsolationParticipant {
+            mac,
             container_id: candidate.container_id,
             name: candidate.name,
             isolation_id: candidate.isolation_id.filter(|value| valid_identity(value)),
@@ -216,7 +266,80 @@ pub fn build_policy(
         issues,
         participants,
         ipv6_subnet: None,
+        bound_range: None,
+        gateway_address: None,
     }
+}
+
+/// A unicast MAC in canonical lower-case colon form, or `None`. The result is
+/// rendered into nftables, so nothing but hex digits and colons gets through.
+pub fn normalize_mac(raw: &str) -> Option<String> {
+    let octets = raw
+        .split(':')
+        .map(|octet| {
+            (octet.len() == 2 && octet.chars().all(|c| c.is_ascii_hexdigit()))
+                .then(|| u8::from_str_radix(octet, 16).ok())
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if octets.len() != 6 || octets[0] & 1 == 1 || octets.iter().all(|octet| *octet == 0) {
+        return None;
+    }
+    Some(
+        octets
+            .iter()
+            .map(|octet| format!("{octet:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+/// Anti-spoof rules: bind each participant's address to its MAC, and admit
+/// sources in the bound range only from a bound participant. These drop in
+/// audit mode too; a forged address is never a policy gap to observe. Only
+/// rendered when a bound range is set (Kubernetes discovery is on), so a
+/// Docker-only bridge keeps its existing policy.
+fn render_address_bindings(policy: &IsolationPolicy) -> String {
+    let Some(range) = policy
+        .bound_range
+        .as_deref()
+        .and_then(|range| range.parse::<Ipv4Net>().ok())
+    else {
+        return String::new();
+    };
+    let mut rules = String::new();
+    let mut bound = BTreeSet::new();
+    for participant in &policy.participants {
+        let Some(mac) = participant.mac.as_deref().and_then(normalize_mac) else {
+            continue;
+        };
+        let address = participant.ipv4_address;
+        bound.insert(address);
+        rules.push_str(&format!(
+            "    ip saddr {address} ether saddr != {mac} counter name isolation_spoofed drop\n    arp saddr ip {address} ether saddr != {mac} counter name isolation_spoofed drop\n"
+        ));
+        if policy.gateway_address != Some(address) {
+            rules.push_str(&format!(
+                "    ether saddr {mac} ip saddr != {address} counter name isolation_spoofed drop\n    ether saddr {mac} arp saddr ip != {{ {address}, 0.0.0.0 }} counter name isolation_spoofed drop\n"
+            ));
+        }
+    }
+    let members = bound
+        .iter()
+        .filter(|address| range.contains(*address))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        rules.push_str(&format!(
+            "    ip saddr {range} counter name isolation_spoofed drop\n    arp saddr ip {range} counter name isolation_spoofed drop\n"
+        ));
+    } else {
+        let members = members.join(", ");
+        rules.push_str(&format!(
+            "    ip saddr {range} ip saddr != {{ {members} }} counter name isolation_spoofed drop\n    arp saddr ip {range} arp saddr ip != {{ {members} }} counter name isolation_spoofed drop\n"
+        ));
+    }
+    rules
 }
 
 fn parse_allow_list(raw: &str) -> Result<Vec<AllowSpec>, String> {
@@ -324,6 +447,15 @@ pub fn render_bridge_policy(
         "  counter isolation_unresolved {{ packets {} bytes {}; }}\n",
         unresolved.packets, unresolved.bytes
     ));
+    let spoofed = counters
+        .get("isolation_spoofed")
+        .copied()
+        .unwrap_or_default();
+    objects.push_str(&format!(
+        "  counter isolation_spoofed {{ packets {} bytes {}; }}\n",
+        spoofed.packets, spoofed.bytes
+    ));
+    let bindings = render_address_bindings(policy);
     let allowances = policy
         .participants
         .iter()
@@ -359,7 +491,7 @@ pub fn render_bridge_policy(
         })
         .unwrap_or_default();
     let rules = format!(
-        "table bridge egressy_isolation {{\n{objects}  chain forward {{\n    type filter hook forward priority -10; policy accept;\n    ct state established,related accept\n    ct status dnat accept\n    ip saddr {bridge_gateway} ip daddr {broadcast} accept\n{allowances}{pair_rules}    ip saddr {subnet} ip daddr {subnet} counter name isolation_unresolved {}\n{ipv6_rules}  }}\n}}\n",
+        "table bridge egressy_isolation {{\n{objects}  chain forward {{\n    type filter hook forward priority -10; policy accept;\n{bindings}    ct state established,related accept\n    ct status dnat accept\n    ip saddr {bridge_gateway} ip daddr {broadcast} accept\n{allowances}{pair_rules}    ip saddr {subnet} ip daddr {subnet} counter name isolation_unresolved {}\n{ipv6_rules}  }}\n}}\n",
         verdict(effective_mode)
     );
     (effective_mode, rules)
@@ -532,5 +664,215 @@ mod tests {
         .into();
         let (_, rules) = render_bridge_policy(&policy, IsolationMode::Audit, &counters);
         assert!(rules.contains(&format!("counter {name} {{ packets 3 bytes 99; }}")));
+    }
+
+    fn bound(id: &str, address: &str, mac: &str, allow: Option<&str>) -> IsolationCandidate {
+        IsolationCandidate {
+            mac: Some(mac.to_owned()),
+            ..candidate(id, address, allow)
+        }
+    }
+
+    /// Docker gateway and app plus two Multus pods in the bound range.
+    fn mixed_policy() -> IsolationPolicy {
+        let mut policy = policy(vec![
+            bound("gateway", "172.30.0.2", "02:42:ac:1e:00:02", None),
+            bound(
+                "probe",
+                "172.30.0.5",
+                "02:42:ac:1e:00:05",
+                Some("gateway:53/udp"),
+            ),
+            bound(
+                "sonarr",
+                "172.30.0.200",
+                "0a:58:ac:1e:00:c8",
+                Some("qbit:8080/tcp"),
+            ),
+            bound(
+                "qbit",
+                "172.30.0.201",
+                "0a:58:ac:1e:00:c9",
+                Some("gateway:53/udp"),
+            ),
+        ]);
+        policy.bound_range = Some("172.30.0.192/26".to_owned());
+        policy.gateway_address = Some("172.30.0.2".parse().unwrap());
+        policy
+    }
+
+    #[test]
+    fn normalizes_only_unicast_colon_macs() {
+        assert_eq!(
+            normalize_mac("0A:58:ac:1e:00:C8").as_deref(),
+            Some("0a:58:ac:1e:00:c8")
+        );
+        for raw in [
+            "",
+            "0a:58:ac:1e:00",
+            "0a:58:ac:1e:00:c8:01",
+            "0a-58-ac-1e-00-c8",
+            "0a:58:ac:1e:00:zz",
+            "0a:58:ac:1e:00:c8 drop",
+            "+a:58:ac:1e:00:c8",
+            "01:00:5e:00:00:01",
+            "00:00:00:00:00:00",
+            "ff:ff:ff:ff:ff:ff",
+        ] {
+            assert!(normalize_mac(raw).is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn mixed_docker_and_kubernetes_clients_share_one_policy() {
+        let policy = mixed_policy();
+        assert!(policy.eligible_for_enforcement, "{:?}", policy.issues);
+        let (mode, rules) = render_bridge_policy(&policy, IsolationMode::Enforce, &BTreeMap::new());
+        assert_eq!(mode, IsolationMode::Enforce);
+        // Allowances resolve across sources, in both directions.
+        assert!(rules.contains("ip saddr 172.30.0.200 ip daddr 172.30.0.201 tcp dport 8080 accept"));
+        assert!(rules.contains("ip saddr 172.30.0.201 ip daddr 172.30.0.2 udp dport 53 accept"));
+        assert!(rules.contains("ip saddr 172.30.0.5 ip daddr 172.30.0.2 udp dport 53 accept"));
+        // Lateral pairs between a container and a pod are dropped like any pair.
+        let pod_to_container = pair_counter_name("containersonarr", "containerprobe");
+        assert!(rules.contains(&format!(
+            "ip saddr 172.30.0.200 ip daddr 172.30.0.5 counter name {pod_to_container} drop"
+        )));
+    }
+
+    #[test]
+    fn bindings_drop_forged_addresses_before_anything_is_accepted() {
+        let (_, rules) =
+            render_bridge_policy(&mixed_policy(), IsolationMode::Enforce, &BTreeMap::new());
+        let first_binding = rules.find("counter name isolation_spoofed drop").unwrap();
+        let established = rules.find("ct state established,related accept").unwrap();
+        assert!(first_binding < established);
+        for (address, mac) in [
+            ("172.30.0.5", "02:42:ac:1e:00:05"),
+            ("172.30.0.200", "0a:58:ac:1e:00:c8"),
+        ] {
+            assert!(rules.contains(&format!(
+                "ip saddr {address} ether saddr != {mac} counter name isolation_spoofed drop"
+            )));
+            assert!(rules.contains(&format!(
+                "ether saddr {mac} ip saddr != {address} counter name isolation_spoofed drop"
+            )));
+            assert!(rules.contains(&format!(
+                "arp saddr ip {address} ether saddr != {mac} counter name isolation_spoofed drop"
+            )));
+        }
+        // Unknown senders in the pod range are dropped.
+        assert!(rules.contains(
+            "ip saddr 172.30.0.192/26 ip saddr != { 172.30.0.200, 172.30.0.201 } counter name isolation_spoofed drop"
+        ));
+        assert!(rules.contains(
+            "arp saddr ip 172.30.0.192/26 arp saddr ip != { 172.30.0.200, 172.30.0.201 } counter name isolation_spoofed drop"
+        ));
+    }
+
+    #[test]
+    fn the_gateway_may_forward_other_sources_but_its_address_stays_bound() {
+        let (_, rules) =
+            render_bridge_policy(&mixed_policy(), IsolationMode::Enforce, &BTreeMap::new());
+        assert!(rules.contains(
+            "ip saddr 172.30.0.2 ether saddr != 02:42:ac:1e:00:02 counter name isolation_spoofed drop"
+        ));
+        assert!(!rules.contains("ether saddr 02:42:ac:1e:00:02 ip saddr !="));
+    }
+
+    #[test]
+    fn bindings_drop_even_when_enforce_degrades_to_audit() {
+        let mut policy = mixed_policy();
+        policy.eligible_for_enforcement = false;
+        let (mode, rules) = render_bridge_policy(&policy, IsolationMode::Enforce, &BTreeMap::new());
+        assert_eq!(mode, IsolationMode::Audit);
+        assert!(
+            rules.contains("ether saddr != 0a:58:ac:1e:00:c8 counter name isolation_spoofed drop")
+        );
+        assert!(rules.contains("counter name isolation_unresolved accept"));
+    }
+
+    #[test]
+    fn an_empty_pod_range_drops_every_source_in_it() {
+        let mut policy = policy(vec![bound(
+            "probe",
+            "172.30.0.5",
+            "02:42:ac:1e:00:05",
+            None,
+        )]);
+        policy.bound_range = Some("172.30.0.192/26".to_owned());
+        let (_, rules) = render_bridge_policy(&policy, IsolationMode::Audit, &BTreeMap::new());
+        assert!(
+            rules.contains("    ip saddr 172.30.0.192/26 counter name isolation_spoofed drop\n")
+        );
+    }
+
+    #[test]
+    fn docker_only_bridges_render_no_bindings() {
+        let policy = policy(vec![bound(
+            "probe",
+            "172.30.0.5",
+            "02:42:ac:1e:00:05",
+            None,
+        )]);
+        let (_, rules) = render_bridge_policy(&policy, IsolationMode::Enforce, &BTreeMap::new());
+        assert!(!rules.contains("ether saddr"));
+        assert!(!rules.contains("isolation_spoofed drop"));
+    }
+
+    #[test]
+    fn a_claimed_address_or_mac_is_never_bound() {
+        let mut policy = policy(vec![
+            bound("victim", "172.30.0.200", "0a:58:ac:1e:00:c8", None),
+            bound("forger", "172.30.0.200", "0a:58:ac:1e:00:ff", None),
+            bound("one", "172.30.0.210", "0a:58:ac:1e:00:d2", None),
+            bound("two", "172.30.0.211", "0a:58:ac:1e:00:d2", None),
+        ]);
+        assert!(!policy.eligible_for_enforcement);
+        assert!(policy
+            .issues
+            .iter()
+            .any(|issue| issue.contains("172.30.0.200 is claimed")));
+        assert!(policy
+            .issues
+            .iter()
+            .any(|issue| issue.contains("MAC 0a:58:ac:1e:00:d2")));
+        assert!(policy
+            .participants
+            .iter()
+            .all(|participant| participant.mac.is_none()));
+        policy.bound_range = Some("172.30.0.192/26".to_owned());
+        let (_, rules) = render_bridge_policy(&policy, IsolationMode::Enforce, &BTreeMap::new());
+        // With nothing bound, the whole range fails closed.
+        assert!(
+            rules.contains("    ip saddr 172.30.0.192/26 counter name isolation_spoofed drop\n")
+        );
+    }
+
+    #[test]
+    fn a_malformed_mac_in_a_published_policy_is_not_rendered() {
+        let mut policy = mixed_policy();
+        policy.participants[2].mac = Some("0a:58:ac:1e:00:c8 accept".to_owned());
+        let (_, rules) = render_bridge_policy(&policy, IsolationMode::Enforce, &BTreeMap::new());
+        assert!(!rules.contains("accept counter"));
+        assert!(rules.contains("ip saddr != { 172.30.0.201 }"));
+    }
+
+    #[test]
+    fn policy_without_binding_fields_still_decodes() {
+        let policy = mixed_policy();
+        let mut json = serde_json::to_value(&policy).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("bound_range");
+        object.remove("gateway_address");
+        for participant in object["participants"].as_array_mut().unwrap() {
+            participant.as_object_mut().unwrap().remove("mac");
+        }
+        let decoded: IsolationPolicy = serde_json::from_value(json).unwrap();
+        assert!(decoded.bound_range.is_none());
+        assert!(decoded
+            .participants
+            .iter()
+            .all(|participant| participant.mac.is_none()));
     }
 }
