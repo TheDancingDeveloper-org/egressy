@@ -33,9 +33,14 @@ pub const SCHEMA_VERSION: u8 = 1;
 /// rather than reconciling the IPv4 half and leaving client IPv6 unprotected.
 pub const IPV6_SCHEMA_VERSION: u8 = 2;
 
-/// Metric of the last-resort route that stops IPv6 lookups falling through the
-/// policy table to the main table's default route.
-pub const IPV6_UNREACHABLE_METRIC: u32 = u32::MAX;
+/// Metric of the last-resort route that stops a lookup from the enrolled subnet
+/// falling through the policy table to the main table's default route, for
+/// either family, when the table's real routes are gone (their device was
+/// deleted, or the tunnel went down).
+pub const UNREACHABLE_METRIC: u32 = u32::MAX;
+
+/// The IPv6 name of [`UNREACHABLE_METRIC`], kept for existing callers.
+pub const IPV6_UNREACHABLE_METRIC: u32 = UNREACHABLE_METRIC;
 
 /// Identifies the rendered kill switch. It carries the routed subnet, or
 /// `disabled`, so a table left by an older release or configuration is replaced.
@@ -104,8 +109,20 @@ impl HostPolicy {
     }
 
     /// `ip route replace` argument sets, in the order they must be applied.
+    /// The unreachable route comes first, so the table never relies on the main
+    /// table while it is being filled or after the bridge routes vanish.
     pub fn route_replace_args(&self) -> Vec<Vec<String>> {
         vec![
+            vec![
+                "route".into(),
+                "replace".into(),
+                "table".into(),
+                self.route_table.to_string(),
+                "unreachable".into(),
+                "default".into(),
+                "metric".into(),
+                UNREACHABLE_METRIC.to_string(),
+            ],
             vec![
                 "route".into(),
                 "replace".into(),
@@ -333,7 +350,11 @@ pub fn routes_present(routes: &[IpRouteEntry], policy: &HostPolicy) -> (bool, bo
             && route.dev.as_deref() == Some(policy.bridge.as_str())
             && route.gateway.as_deref() == Some(policy.gateway_ip.as_str())
     });
-    (subnet_route, default_route)
+    let unreachable = routes.iter().any(|route| {
+        route.dst.as_deref() == Some("default")
+            && route.route_type.as_deref() == Some("unreachable")
+    });
+    (subnet_route, default_route && unreachable)
 }
 
 /// Compare observed host state against the desired policy.
@@ -458,6 +479,11 @@ mod tests {
                 gateway: Some("172.30.0.2".to_owned()),
                 ..Default::default()
             },
+            IpRouteEntry {
+                dst: Some("default".to_owned()),
+                route_type: Some("unreachable".to_owned()),
+                ..Default::default()
+            },
         ]
     }
 
@@ -545,9 +571,15 @@ mod tests {
             ]
         );
         let routes = policy.route_replace_args();
-        assert_eq!(routes.len(), 2);
-        assert!(routes[0].ends_with(&["scope".to_owned(), "link".to_owned()]));
-        assert!(routes[1].contains(&"onlink".to_owned()));
+        assert_eq!(routes.len(), 3);
+        assert!(routes[0].ends_with(&[
+            "unreachable".to_owned(),
+            "default".to_owned(),
+            "metric".to_owned(),
+            u32::MAX.to_string()
+        ]));
+        assert!(routes[1].ends_with(&["scope".to_owned(), "link".to_owned()]));
+        assert!(routes[2].contains(&"onlink".to_owned()));
     }
 
     fn ipv6_policy() -> HostPolicy {
@@ -698,9 +730,21 @@ mod tests {
     fn ip_route_json_from_iproute2_deserializes() {
         let entries: Vec<IpRouteEntry> = serde_json::from_str(
             r#"[{"dst":"172.30.0.0/24","dev":"br-vpn-egress","scope":"link"},
-                {"dst":"default","gateway":"172.30.0.2","dev":"br-vpn-egress","flags":["onlink"]}]"#,
+                {"dst":"default","gateway":"172.30.0.2","dev":"br-vpn-egress","flags":["onlink"]},
+                {"type":"unreachable","dst":"default","metric":4294967295,"flags":[]}]"#,
         )
         .unwrap();
         assert_eq!(routes_present(&entries, &policy()), (true, true));
+    }
+
+    #[test]
+    fn a_table_without_the_ipv4_unreachable_default_is_drift() {
+        let entries: Vec<IpRouteEntry> = serde_json::from_str(
+            r#"[{"dst":"172.30.0.0/24","dev":"br-vpn-egress","scope":"link"},
+                {"dst":"default","gateway":"172.30.0.2","dev":"br-vpn-egress","flags":["onlink"]}]"#,
+        )
+        .unwrap();
+        assert_eq!(routes_present(&entries, &policy()), (true, false));
+        assert!(detect_drift(&[], &entries, true, &policy()).default_route_missing);
     }
 }

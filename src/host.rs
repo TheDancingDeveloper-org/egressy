@@ -181,6 +181,17 @@ pub fn render_gateway_firewall(
             )
         },
     );
+    // Enrolled traffic may only cross the gateway through the tunnel, and this
+    // is checked before the established accept: a flow's conntrack entry
+    // outlives the tunnel (DNAT'd flows are not masqueraded, so the kernel does
+    // not drop them with the interface), and its next packet would otherwise be
+    // routed out of the uplink once the tunnel's routes are gone.
+    let ipv6_leak_guard = ipv6.map_or_else(String::new, |ipv6| {
+        let subnet = ipv6.subnet;
+        format!(
+            "    ip6 saddr {subnet} ip6 daddr != {subnet} oifname != \"{tunnel}\" drop\n    ip6 daddr {subnet} ip6 saddr != {subnet} iifname != \"{tunnel}\" drop\n"
+        )
+    });
     let natpmp_input =
         if config.port_forwarding.backend == crate::config::PortForwardingBackend::NatPmp {
             format!(
@@ -206,7 +217,9 @@ pub fn render_gateway_firewall(
   chain forward {{
     type filter hook forward priority 0; policy drop;
 {download_counters}{upload_counters}
-    ct state established,related accept
+    ip saddr {subnet} ip daddr != {subnet} oifname != "{tunnel}" drop
+    ip daddr {subnet} ip saddr != {subnet} iifname != "{tunnel}" drop
+{ipv6_leak_guard}    ct state established,related accept
     ip saddr {subnet} udp dport 53 ip daddr != {gateway} reject with icmp type admin-prohibited
     ip saddr {subnet} tcp dport 53 ip daddr != {gateway} reject with icmp type admin-prohibited
     ip saddr {subnet} oifname "{tunnel}" accept
@@ -231,6 +244,7 @@ pub fn render_gateway_firewall(
         upload_counters = upload_counters,
         ipv6_input = ipv6_input,
         ipv6_forward = ipv6_forward,
+        ipv6_leak_guard = ipv6_leak_guard,
         ipv6_postrouting = ipv6_postrouting,
     )
 }
@@ -310,6 +324,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn enrolled_traffic_is_held_to_the_tunnel_before_the_established_accept() {
+        let rules = render_gateway_firewall(&ipv6_config(), &[], &[]);
+        let forward = &rules[rules.find("chain forward").unwrap()..];
+        let established = forward.find("ct state established,related accept").unwrap();
+        for guard in [
+            "ip saddr 172.30.0.0/24 ip daddr != 172.30.0.0/24 oifname != \"wg0\" drop",
+            "ip daddr 172.30.0.0/24 ip saddr != 172.30.0.0/24 iifname != \"wg0\" drop",
+            "ip6 saddr fd30:172:30::/64 ip6 daddr != fd30:172:30::/64 oifname != \"wg0\" drop",
+            "ip6 daddr fd30:172:30::/64 ip6 saddr != fd30:172:30::/64 iifname != \"wg0\" drop",
+        ] {
+            let at = forward
+                .find(guard)
+                .unwrap_or_else(|| panic!("missing {guard}"));
+            assert!(
+                at < established,
+                "{guard} must precede the established accept"
+            );
+        }
+    }
+
     fn ipv6_config() -> Config {
         serde_yaml::from_str("network:\n  ipv6:\n    enabled: true\n").unwrap()
     }
@@ -329,7 +364,8 @@ mod tests {
         let rules = render_gateway_firewall(&ipv6_config(), &[], &[]);
         assert!(rules.contains("ip6 saddr fd30:172:30::/64 oifname \"wg0\" accept"));
         assert!(rules.contains("ip6 saddr fd30:172:30::/64 oifname \"wg0\" masquerade"));
-        assert_eq!(rules.matches("ip6 saddr fd30:172:30::/64").count(), 4);
+        // Reject x2, accept, masquerade, and the leak guard (a drop).
+        assert_eq!(rules.matches("ip6 saddr fd30:172:30::/64").count(), 5);
         assert!(rules.contains("type filter hook forward priority 0; policy drop;"));
     }
 
@@ -354,7 +390,11 @@ mod tests {
             &[(45678, Ipv4Addr::new(172, 30, 0, 10), 6881)],
             &[],
         );
-        assert!(!rules.contains("ip6 daddr"));
+        // The only rule naming an IPv6 client destination is the leak guard's drop.
+        assert!(rules
+            .lines()
+            .filter(|line| line.contains("ip6 daddr"))
+            .all(|line| line.trim_end().ends_with("drop")));
         assert!(!rules.contains("dnat ip6"));
         assert!(rules.contains("iifname \"wg0\" meta nfproto ipv6 drop"));
     }
