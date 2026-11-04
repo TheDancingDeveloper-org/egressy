@@ -71,7 +71,16 @@ nothing is rendered, so do not enable Kubernetes discovery without the agent.
 
 If a pod listing fails, the last good listing is kept and
 `kubernetes.discovery` turns degraded. Stale bindings can only drop a
-replacement pod's frames, never admit an unknown sender.
+replacement pod's frames, never admit an unknown sender. The listing is kept
+for at most `max_stale_seconds` (default 300); after that every pod is
+dropped, so deleted pods lose their clients and leases and every source in
+the pod range is dropped until a listing succeeds.
+
+Only pods in `kubernetes.namespaces` are discovered. A pod writes its own
+annotations, and Multus lets a pod in any namespace reference the attachment
+by default, so the allowlist is what decides who may enrol. List only
+namespaces whose pod authors you trust (usually just the attachment's).
+Egressy refuses to start with discovery on and no namespaces.
 
 The `network-status` annotation is written by Multus, but anyone who can patch
 pods in the namespace can also edit it. Restrict pod `patch`/`update` in the
@@ -84,12 +93,14 @@ kubernetes:
   enabled: true
   node_name: node-b
   network_attachment: personal-arr/vpn-egress
+  namespaces: [personal-arr]
   address_range: 172.30.0.192/26
   # Omit api_url in-cluster; KUBERNETES_SERVICE_HOST/PORT are used.
   api_url: https://192.168.1.10:6443
   token_path: /run/secrets/egressy-k8s/token
   ca_path: /run/secrets/egressy-k8s/ca.crt
   timeout_seconds: 10
+  max_stale_seconds: 300
 ```
 
 `address_range` must sit inside `network.subnet` and exclude the bridge and
@@ -98,10 +109,12 @@ Docker IPAM and the CNI never hand out the same address.
 
 ## Credentials
 
-Egressy needs only `get`, `list` and `watch` on `pods`.
-`deploy/kubernetes/rbac.yaml` creates a ServiceAccount, a ClusterRole with
-those verbs, a binding, and a long-lived token Secret for a gateway that runs
-outside the cluster. `deploy/kubernetes/vpn-egress-nad.yaml` is an example
+Egressy needs only `list` on `pods`, in each trusted namespace.
+`deploy/kubernetes/rbac.yaml` creates a ServiceAccount, a namespaced Role and
+RoleBinding granting that verb in `personal-arr`, and a long-lived token
+Secret for a gateway that runs outside the cluster. Repeat the Role and
+RoleBinding for every other namespace in `kubernetes.namespaces`. There is no
+ClusterRole: the account cannot read pods anywhere else. `deploy/kubernetes/vpn-egress-nad.yaml` is an example
 attachment.
 
 - **In-cluster** (only if the gateway itself runs as a pod): leave `api_url`
@@ -115,5 +128,25 @@ attachment.
   `0600`, and point `api_url`, `ca_path` and `token_path` at them. The API URL
   must be `https`. Never commit the token or bake it into an image.
 
-Egressy lists pods with the field selector `spec.nodeName=<node_name>`, so it
+### Token storage and rotation
+
+The long-lived token from `egressy-discovery-token` is a credential and lives
+in Infisical, never in Git or the transcript:
+
+- Store it, with the CA, in the estate Infisical `infrastructure` project
+  (for example `EGRESSY_K8S_DISCOVERY_TOKEN` and `EGRESSY_K8S_CA`), written
+  from stdin with the `secret set` wrapper.
+- The gateway's deployment renders both into `0600` files at `token_path` and
+  `ca_path`. Egressy re-reads the token on every listing, so a new value takes
+  effect without a restart.
+- Rotate it at least every 90 days, and at once if it may have leaked: delete
+  and recreate the `egressy-discovery-token` Secret (Kubernetes mints a new
+  token and the old one stops working), store the new value in Infisical,
+  and redeploy the files. Discovery fails while the old token is in place;
+  after `max_stale_seconds` pods fail closed until the new token lands.
+- The token can only `list` pods in the trusted namespaces, so a leak exposes
+  those pod specs (including any inline env) and nothing else.
+
+Egressy lists pods through `/api/v1/namespaces/<ns>/pods` for each trusted
+namespace, with the field selector `spec.nodeName=<node_name>`, so it
 only ever sees pods on its own node.

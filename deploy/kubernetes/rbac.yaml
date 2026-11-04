@@ -1,6 +1,10 @@
 # Read-only pod access for Egressy's Kubernetes discovery (docs/KUBERNETES.md).
-# Egressy only lists pods on its own node; it never writes to the cluster.
-# Example only: adjust the namespace to wherever the credential is issued.
+# Egressy only lists pods on its own node, in its trusted namespaces; it never
+# writes to the cluster. There is deliberately no ClusterRole: repeat the Role
+# and RoleBinding below for each namespace in kubernetes.namespaces, and grant
+# nothing beyond `list`.
+# Example only: adjust the ServiceAccount's namespace to wherever the
+# credential is issued.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -8,21 +12,23 @@ metadata:
   namespace: egressy
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
   name: egressy-pod-discovery
+  namespace: personal-arr
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: egressy-pod-discovery
+  namespace: personal-arr
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: egressy-pod-discovery
 subjects:
   - kind: ServiceAccount
@@ -31,6 +37,7 @@ subjects:
 ---
 # A long-lived token for a gateway that runs outside the cluster (on Docker).
 # In-cluster deployments use the projected service-account token instead.
+# Store it in Infisical and rotate it as docs/KUBERNETES.md describes.
 apiVersion: v1
 kind: Secret
 metadata:

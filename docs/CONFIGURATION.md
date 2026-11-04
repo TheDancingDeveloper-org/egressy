@@ -188,11 +188,13 @@ default. See `docs/KUBERNETES.md`.
 | `enabled` | `false` | Lists pods and merges them with Docker discovery. |
 | `node_name` | empty | Required when enabled. Pods are listed with `spec.nodeName=<node_name>`. |
 | `network_attachment` | `personal-arr/vpn-egress` | The `namespace/name` entry read from `k8s.v1.cni.cncf.io/network-status`. |
+| `namespaces` | empty | Required when enabled. The trusted namespaces whose pods are listed, each through its own namespaced URL. Pods anywhere else are ignored. |
 | `address_range` | unset | Required when enabled. The pod IPAM range; inside `network.subnet`, clear of the bridge and gateway addresses. Every source in it must be a discovered pod. |
 | `api_url` | unset | `https` API server URL. Unset means in-cluster (`KUBERNETES_SERVICE_HOST`). |
 | `token_path` | service-account token path | Bearer token file, re-read on every listing. |
 | `ca_path` | service-account CA path | CA bundle for the API server. |
 | `timeout_seconds` | `10` | Listing timeout, 1 to 60. |
+| `max_stale_seconds` | `300` | How long the last good listing is kept while the API is unreachable, 1 to 3600. Past it every pod is dropped (fails closed). |
 
 ## Client labels
 
