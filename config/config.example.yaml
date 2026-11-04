@@ -118,3 +118,11 @@ reconcile:
   interval_seconds: 5
   # Required fail-closed owner. false is rejected by configuration validation.
   apply_gateway_firewall: true
+
+# Read-only discovery of Multus-attached pods. Off by default; needs the
+# isolation agent. See docs/KUBERNETES.md.
+kubernetes:
+  enabled: false
+  node_name: node-b
+  network_attachment: personal-arr/vpn-egress
+  address_range: 172.30.0.192/26
