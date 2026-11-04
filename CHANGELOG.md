@@ -4,6 +4,10 @@
 
 ### Added
 
+- Optional read-only Kubernetes pod discovery (`kubernetes`, off by default).
+  Pods attached to the bridge through Multus are enrolled by annotations that
+  mirror the container labels, and the isolation agent binds every
+  participant's address to its MAC. See `docs/KUBERNETES.md`.
 - Opt-in IPv6 routing for enrolled clients (`network.ipv6`). When enabled,
   enrolled IPv6 leaves through the tunnel or fails closed; when disabled, the
   host and gateway reject it. See `docs/NETWORKING.md`.
