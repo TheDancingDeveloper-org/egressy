@@ -1044,6 +1044,13 @@ async fn reconcile_docker(
                         .map(|range| range.to_string());
                     policy.gateway_address = Some(config.network.gateway_ip);
                 }
+                if !policy.rejected.is_empty() {
+                    warn!(
+                        rejected = policy.rejected.len(),
+                        notes = ?policy.rejected,
+                        "Kubernetes isolation candidates or allowances were left out"
+                    );
+                }
                 let complete = policy.eligible_for_enforcement;
                 let has_participants = !policy.participants.is_empty();
                 publisher

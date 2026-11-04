@@ -18,7 +18,8 @@ use serde::Deserialize;
 use crate::config::KubernetesConfig;
 use crate::docker::{ENABLE_LABEL, PORT_FORWARD_LABEL, TARGET_PORT_LABEL, USAGE_ID_LABEL};
 use crate::isolation::{
-    normalize_mac, IsolationCandidate, ISOLATION_ALLOW_LABEL, ISOLATION_ID_LABEL,
+    normalize_mac, CandidateSource, IsolationCandidate, ISOLATION_ACCEPT_LABEL,
+    ISOLATION_ALLOW_LABEL, ISOLATION_ID_LABEL,
 };
 use crate::state::{
     ClientState, ClientTrafficState, RouteIntentState, RouteIntentStatus, UsageIdentitySource,
@@ -278,6 +279,8 @@ pub fn snapshot_from_pods(scope: &DiscoveryScope, pods: Vec<Pod>) -> KubernetesS
                 isolation_id: annotations.get(ISOLATION_ID_LABEL).cloned(),
                 allow: annotations.get(ISOLATION_ALLOW_LABEL).cloned(),
                 mac: Some(attachment.mac.clone()),
+                source: CandidateSource::Kubernetes,
+                accept: annotations.get(ISOLATION_ACCEPT_LABEL).cloned(),
             });
         }
         if !annotation_is_true(annotations.get(ENABLE_LABEL)) {

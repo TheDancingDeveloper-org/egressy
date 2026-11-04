@@ -242,6 +242,10 @@ impl DockerObserver {
                     isolation_id: labels.get(ISOLATION_ID_LABEL).cloned(),
                     allow: labels.get(ISOLATION_ALLOW_LABEL).cloned(),
                     mac,
+                    source: crate::isolation::CandidateSource::Docker,
+                    accept: labels
+                        .get(crate::isolation::ISOLATION_ACCEPT_LABEL)
+                        .cloned(),
                 })
             })
             .collect::<Vec<_>>();
@@ -360,7 +364,7 @@ pub(crate) fn apply_port_forward_constraints(
         }
     }
     for (port, container_ids) in ports.iter().filter(|(_, ids)| ids.len() > 1) {
-        for container_id in container_ids {
+        for container_id in losing_collision(container_ids, "target port") {
             if let Some(client) = clients.get_mut(container_id) {
                 client.compliant = false;
                 client.compliance_message = format!(
@@ -370,7 +374,7 @@ pub(crate) fn apply_port_forward_constraints(
         }
     }
     for (usage_id, container_ids) in usage_ids.iter().filter(|(_, ids)| ids.len() > 1) {
-        for container_id in container_ids {
+        for container_id in losing_collision(container_ids, "usage ID") {
             if let Some(client) = clients.get_mut(container_id) {
                 client.compliant = false;
                 client.compliance_message = format!(
@@ -383,10 +387,18 @@ pub(crate) fn apply_port_forward_constraints(
     let mut eligible = clients
         .iter()
         .filter(|(_, client)| client.port_forward_target && client.compliant)
-        .map(|(container_id, client)| (client.usage_id.clone(), container_id.clone()))
+        .map(|(container_id, client)| {
+            (
+                is_pod(container_id),
+                client.usage_id.clone(),
+                container_id.clone(),
+            )
+        })
         .collect::<Vec<_>>();
+    // Docker clients take lease slots before pods, so a pod cannot push a
+    // Docker client out of its lease.
     eligible.sort();
-    for (_, container_id) in eligible.into_iter().skip(max_leases) {
+    for (_, _, container_id) in eligible.into_iter().skip(max_leases) {
         if let Some(client) = clients.get_mut(&container_id) {
             client.compliant = false;
             client.compliance_message = format!(
@@ -394,6 +406,29 @@ pub(crate) fn apply_port_forward_constraints(
             );
         }
     }
+}
+
+fn is_pod(container_id: &str) -> bool {
+    container_id.starts_with(crate::kubernetes::CLIENT_ID_PREFIX)
+}
+
+/// The clients that lose a collision. When a Docker client is involved only
+/// the pods lose, so a pod annotation cannot cancel a Docker client's lease;
+/// otherwise every colliding client loses, as before.
+fn losing_collision<'a>(container_ids: &'a [String], what: &str) -> Vec<&'a String> {
+    if container_ids.iter().all(|id| is_pod(id)) || !container_ids.iter().any(|id| is_pod(id)) {
+        return container_ids.iter().collect();
+    }
+    let pods = container_ids
+        .iter()
+        .filter(|id| is_pod(id))
+        .collect::<Vec<_>>();
+    tracing::warn!(
+        pods = pods.len(),
+        what,
+        "Kubernetes pods ignored for port forwarding: they collide with a Docker client"
+    );
+    pods
 }
 
 fn derive_usage_identity(
@@ -720,6 +755,42 @@ mod tests {
         assert!(!clients["a"].compliant);
         assert!(!clients["b"].compliant);
         assert!(clients["c"].compliant);
+    }
+
+    #[test]
+    fn a_pod_cannot_cancel_a_docker_clients_lease() {
+        let mut clients = [
+            ("docker".to_owned(), forwarding_client("qbittorrent", 6881)),
+            (
+                "k8s-uid-a".to_owned(),
+                forwarding_client("qbittorrent", 6882),
+            ),
+            ("k8s-uid-b".to_owned(), forwarding_client("other", 6881)),
+            ("k8s-uid-c".to_owned(), forwarding_client("aaa", 6890)),
+        ]
+        .into();
+        apply_port_forward_constraints(&mut clients, 2);
+        assert!(
+            clients["docker"].compliant,
+            "{}",
+            clients["docker"].compliance_message
+        );
+        assert!(!clients["k8s-uid-a"].compliant);
+        assert!(clients["k8s-uid-a"].compliance_message.contains("usage-id"));
+        assert!(!clients["k8s-uid-b"].compliant);
+        assert!(clients["k8s-uid-b"]
+            .compliance_message
+            .contains("target-port"));
+        // A pod with a lower usage ID still queues behind Docker for leases.
+        assert!(clients["k8s-uid-c"].compliant);
+        let mut clients = [
+            ("docker".to_owned(), forwarding_client("zzz", 6881)),
+            ("k8s-uid-c".to_owned(), forwarding_client("aaa", 6890)),
+        ]
+        .into();
+        apply_port_forward_constraints(&mut clients, 1);
+        assert!(clients["docker"].compliant);
+        assert!(!clients["k8s-uid-c"].compliant);
     }
 
     #[test]
