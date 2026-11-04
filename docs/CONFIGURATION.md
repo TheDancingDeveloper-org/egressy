@@ -206,6 +206,7 @@ default. See `docs/KUBERNETES.md`.
 | `egressy.target-port` | Unique NAT-PMP lease key and TCP/UDP destination port inside that client. |
 | `egressy.isolation-id` | Stable shared-bridge policy identity. |
 | `egressy.isolation-allow` | Comma-separated destination and port allowances. |
+| `egressy.isolation-accept` | Comma-separated isolation identities whose Kubernetes pod allowances may open this client (see `docs/KUBERNETES.md`). |
 
 A label without a valid network address or with a declared alternate default
 route is non-compliant. Labels never alter container networking. Kubernetes

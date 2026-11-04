@@ -720,6 +720,8 @@ mod tests {
                     isolation_id: Some("one".into()),
                     allow: None,
                     mac: None,
+                    source: Default::default(),
+                    accept: None,
                 },
                 IsolationCandidate {
                     container_id: "two-container".into(),
@@ -728,6 +730,8 @@ mod tests {
                     isolation_id: Some("two".into()),
                     allow: None,
                     mac: None,
+                    source: Default::default(),
+                    accept: None,
                 },
             ],
             now,

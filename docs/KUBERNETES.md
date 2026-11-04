@@ -25,7 +25,8 @@ leaves through `wg0` or fails closed, and Egressy never writes to the cluster.
    | `egressy.port-forward: "true"` | Requests a forwarding lease. |
    | `egressy.target-port` | Unique lease key and destination port inside the pod. |
    | `egressy.isolation-id` | Shared-bridge policy identity. |
-   | `egressy.isolation-allow` | Comma-separated `identity:port/proto` allowances. |
+   | `egressy.isolation-allow` | Comma-separated `identity:port/proto` allowances. Honoured only where the destination accepts this pod (below). |
+   | `egressy.isolation-accept` | Comma-separated isolation identities whose pod allowances may open this pod. |
 
 3. On every reconcile, Egressy lists the pods on `kubernetes.node_name`, reads
    the configured attachment's entry from `network-status`, and merges the
@@ -62,9 +63,29 @@ bridge `forward` chain, before conntrack or any allowance:
   send anything until it is discovered.
 
 Docker containers are bound by the MAC Docker reports for their endpoint.
-An address or MAC claimed by more than one participant is never bound; the
-policy reports it as an issue and, inside the pod range, that address fails
-closed. These rules drop in `audit` mode too, and are counted as
+An address or MAC claimed by more than one Docker container is never bound;
+the policy reports it as an issue, as before.
+
+Pod annotations can never widen access or weaken enforcement:
+
+- **Allowances need the destination's consent.** A Docker container's
+  `egressy.isolation-allow` is granted by the source alone, as before. A
+  pod's allowance is honoured only when the destination's
+  `egressy.isolation-accept` label or annotation names the pod's isolation
+  identity. Without it a pod cannot open any Docker container's or other
+  pod's port.
+- **Docker wins every conflict.** A pod that claims a Docker participant's
+  address, MAC or isolation identity, shares one with another pod, or lacks a
+  valid `egressy.isolation-id`, is left out of the policy. Only that pod is
+  affected: it is unbound, so its address fails closed, and the bridge stays
+  eligible for `enforce`. A pod's malformed or unaccepted allowance is
+  dropped the same way. Each case is listed in the policy's `rejected` notes
+  and logged.
+- **Docker keeps its leases.** A pod whose `egressy.usage-id` or
+  `egressy.target-port` collides with a Docker client is not forwarded; the
+  Docker client keeps its lease. Docker clients also take lease slots before
+  pods when `max_leases` is reached. Collisions only among pods, or only among
+  containers, still make every colliding client non-compliant. These rules drop in `audit` mode too, and are counted as
 `isolation_spoofed`; the agent logs an increase as a violation. They need the
 isolation agent running in `audit` or `enforce`; with isolation `disabled`
 nothing is rendered, so do not enable Kubernetes discovery without the agent.

@@ -1049,6 +1049,8 @@ mod tests {
                     isolation_id: Some("client".to_owned()),
                     allow: None,
                     mac: None,
+                    source: crate::isolation::CandidateSource::Docker,
+                    accept: None,
                 }],
                 123,
             ),
