@@ -27,6 +27,7 @@ use crate::{
     },
     enforcement::{DnatTarget, EnforcementCoordinator},
     history::{HistoryStore, PortForwardObservation, UsageObservation},
+    kubernetes::{KubernetesObserver, KubernetesSnapshot},
     natpmp::{self, Client as NatPmpClient},
     state::{AppState, RouteIntentStatus, SharedState},
     web,
@@ -272,6 +273,16 @@ pub async fn run(
         config.port_forwarding.max_leases,
     )?;
 
+    let kubernetes = if config.kubernetes.enabled {
+        Some(KubernetesObserver::connect(
+            &config.kubernetes,
+            config.network.subnet,
+            config.network.gateway_ip,
+        )?)
+    } else {
+        None
+    };
+
     let listen: SocketAddr = config.listen.parse()?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let app = web::router(
@@ -320,6 +331,7 @@ pub async fn run(
         state.clone(),
         publisher.clone(),
         observer,
+        kubernetes,
         enforcement.clone(),
         port_change_tx.clone(),
         local_names_tx,
@@ -657,18 +669,55 @@ async fn monitor_telemetry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_docker(
     config: Config,
     state: SharedState,
     publisher: StatePublisher,
     observer: DockerObserver,
+    kubernetes: Option<KubernetesObserver>,
     enforcement: EnforcementCoordinator,
     port_change_tx: watch::Sender<u64>,
     local_names_tx: watch::Sender<Arc<std::collections::BTreeMap<String, std::net::Ipv4Addr>>>,
 ) -> anyhow::Result<()> {
     let mut ticker = interval(config.reconcile_interval());
+    // The last good pod listing. A failed refresh keeps it: stale bindings can
+    // only drop a replacement pod's frames, never admit an unknown sender.
+    let mut pods = KubernetesSnapshot::default();
     loop {
         ticker.tick().await;
+        if let Some(kubernetes) = &kubernetes {
+            match kubernetes.discover().await {
+                Ok(snapshot) => {
+                    pods = snapshot;
+                    publisher
+                        .observe(
+                            "kubernetes.discovery",
+                            CheckStatus::Healthy,
+                            Impact::Advisory,
+                            "kubernetes.discovery_fresh",
+                            "Kubernetes pod inventory is fresh",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    warn!(%error, "Kubernetes discovery failed");
+                    publisher
+                        .observe(
+                            "kubernetes.discovery",
+                            CheckStatus::Degraded,
+                            Impact::Advisory,
+                            "kubernetes.discovery_failed",
+                            "Kubernetes pod inventory could not be refreshed; the last listing is kept",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+            }
+        }
         match observer
             .inspect_network(
                 config.network.gateway_ip,
@@ -749,7 +798,14 @@ async fn reconcile_docker(
             }
         }
         match observer.discover().await {
-            Ok(clients) => {
+            Ok(mut clients) => {
+                if kubernetes.is_some() {
+                    clients.extend(pods.clients.clone());
+                    crate::docker::apply_port_forward_constraints(
+                        &mut clients,
+                        config.port_forwarding.max_leases,
+                    );
+                }
                 let target_count = clients
                     .values()
                     .filter(|client| client.port_forward_target && client.compliant)
@@ -761,7 +817,6 @@ async fn reconcile_docker(
                     .iter()
                     .map(|(id, client)| (id.clone(), (client.ipv4_address, client.traffic.clone())))
                     .collect::<std::collections::BTreeMap<_, _>>();
-                let mut clients = clients;
                 for (id, client) in &mut clients {
                     if let Some((_, traffic)) = existing_traffic
                         .get(id)
@@ -946,7 +1001,13 @@ async fn reconcile_docker(
             }
         }
         match observer.discover_isolation_candidates().await {
-            Ok(candidates) => {
+            Ok(mut candidates) => {
+                candidates.extend(pods.candidates.iter().cloned());
+                candidates.sort_by(|left, right| {
+                    left.ipv4_address
+                        .cmp(&right.ipv4_address)
+                        .then_with(|| left.container_id.cmp(&right.container_id))
+                });
                 let mut policy = crate::isolation::build_policy(
                     &config.network.name,
                     &config.network.host_bridge,

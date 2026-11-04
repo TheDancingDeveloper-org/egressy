@@ -88,6 +88,9 @@ pub struct IsolationCandidate {
     pub ipv4_address: Ipv4Addr,
     pub isolation_id: Option<String>,
     pub allow: Option<String>,
+    /// The attachment's MAC address, when the source reports one. Used to bind
+    /// the address to the client so another bridge port cannot claim it.
+    pub mac: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -397,6 +400,7 @@ mod tests {
             ipv4_address: address.parse().unwrap(),
             isolation_id: Some(id.to_owned()),
             allow: allow.map(str::to_owned),
+            mac: None,
         }
     }
 

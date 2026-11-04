@@ -720,6 +720,7 @@ mod tests {
                     ipv4_address: "172.30.0.10".parse().unwrap(),
                     isolation_id: Some("one".into()),
                     allow: None,
+                    mac: None,
                 },
                 IsolationCandidate {
                     container_id: "two-container".into(),
@@ -727,6 +728,7 @@ mod tests {
                     ipv4_address: "172.30.0.11".parse().unwrap(),
                     isolation_id: Some("two".into()),
                     allow: None,
+                    mac: None,
                 },
             ],
             now,

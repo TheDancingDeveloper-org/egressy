@@ -1048,6 +1048,7 @@ mod tests {
                     ipv4_address: "172.30.0.10".parse().unwrap(),
                     isolation_id: Some("client".to_owned()),
                     allow: None,
+                    mac: None,
                 }],
                 123,
             ),

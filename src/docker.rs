@@ -222,19 +222,26 @@ impl DockerObserver {
                     .unwrap_or_else(|| id.clone())
                     .trim_start_matches('/')
                     .to_owned();
-                let address = container
+                let endpoint = container
                     .network_settings
                     .and_then(|settings| settings.networks)
-                    .and_then(|networks| networks.get(&self.network_name).cloned())
-                    .and_then(|endpoint| endpoint.ip_address)
+                    .and_then(|networks| networks.get(&self.network_name).cloned())?;
+                let address = endpoint
+                    .ip_address
+                    .as_deref()
                     .and_then(|address| address.parse::<Ipv4Addr>().ok())
                     .filter(|address| self.subnet.contains(address))?;
+                let mac = endpoint
+                    .mac_address
+                    .as_deref()
+                    .and_then(crate::kubernetes::normalize_mac);
                 Some(IsolationCandidate {
                     container_id: id,
                     name,
                     ipv4_address: address,
                     isolation_id: labels.get(ISOLATION_ID_LABEL).cloned(),
                     allow: labels.get(ISOLATION_ALLOW_LABEL).cloned(),
+                    mac,
                 })
             })
             .collect::<Vec<_>>();
@@ -335,7 +342,10 @@ fn ipv6_compliance_problem(
     }
 }
 
-fn apply_port_forward_constraints(clients: &mut BTreeMap<String, ClientState>, max_leases: usize) {
+pub(crate) fn apply_port_forward_constraints(
+    clients: &mut BTreeMap<String, ClientState>,
+    max_leases: usize,
+) {
     let mut ports = BTreeMap::<u16, Vec<String>>::new();
     let mut usage_ids = BTreeMap::<String, Vec<String>>::new();
     for (container_id, client) in clients.iter() {
@@ -412,7 +422,7 @@ fn derive_usage_identity(
     )
 }
 
-fn valid_usage_identity(value: &str) -> bool {
+pub(crate) fn valid_usage_identity(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value.chars().all(|character| {

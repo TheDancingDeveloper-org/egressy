@@ -180,6 +180,8 @@ pub struct Config {
     pub recovery: RecoveryConfig,
     #[serde(default)]
     pub reconcile: ReconcileConfig,
+    #[serde(default)]
+    pub kubernetes: KubernetesConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -577,6 +579,43 @@ impl Default for ReconcileConfig {
     }
 }
 
+/// Optional read-only discovery of Kubernetes pods attached to the enrolled
+/// bridge through a Multus network attachment. Off by default.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesConfig {
+    pub enabled: bool,
+    /// The node whose pods are listed (`spec.nodeName` field selector).
+    pub node_name: String,
+    /// The Multus attachment, as `namespace/name`, whose entry in the pod's
+    /// `k8s.v1.cni.cncf.io/network-status` annotation carries its address.
+    pub network_attachment: String,
+    /// The static IPAM range pods are given. Must sit inside `network.subnet`
+    /// and exclude the bridge and gateway addresses. Every source address in
+    /// it must belong to a discovered pod, or the host agent drops it.
+    pub address_range: Option<Ipv4Net>,
+    /// API server URL. Empty means in-cluster (`KUBERNETES_SERVICE_HOST`).
+    pub api_url: Option<String>,
+    pub token_path: String,
+    pub ca_path: String,
+    pub timeout_seconds: u64,
+}
+
+impl Default for KubernetesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_name: String::new(),
+            network_attachment: "personal-arr/vpn-egress".to_owned(),
+            address_range: None,
+            api_url: None,
+            token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token".to_owned(),
+            ca_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".to_owned(),
+            timeout_seconds: 10,
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = fs::read_to_string(path)?;
@@ -732,6 +771,9 @@ impl Config {
                 );
             }
         }
+        if self.kubernetes.enabled {
+            self.validate_kubernetes()?;
+        }
         if self.validation.identity.enabled {
             let url = reqwest::Url::parse(&self.validation.identity.url)
                 .context("invalid validation.identity.url")?;
@@ -870,6 +912,45 @@ impl Config {
     }
 }
 
+impl Config {
+    fn validate_kubernetes(&self) -> anyhow::Result<()> {
+        let kubernetes = &self.kubernetes;
+        if kubernetes.node_name.trim().is_empty() {
+            bail!("kubernetes.node_name must name the node whose pods are discovered");
+        }
+        match kubernetes.network_attachment.split_once('/') {
+            Some((namespace, name)) if !namespace.is_empty() && !name.is_empty() => {}
+            _ => bail!("kubernetes.network_attachment must be namespace/name"),
+        }
+        let range = kubernetes
+            .address_range
+            .context("kubernetes.address_range is required when kubernetes.enabled")?;
+        let subnet = self.network.subnet;
+        if range.prefix_len() < subnet.prefix_len() || !subnet.contains(&range.network()) {
+            bail!("kubernetes.address_range must sit inside network.subnet");
+        }
+        let bridge_gateway = subnet.hosts().next();
+        if range.contains(&self.network.gateway_ip)
+            || bridge_gateway.is_some_and(|address| range.contains(&address))
+        {
+            bail!("kubernetes.address_range must exclude the bridge and gateway addresses");
+        }
+        if let Some(url) = &kubernetes.api_url {
+            let url = reqwest::Url::parse(url).context("invalid kubernetes.api_url")?;
+            if url.scheme() != "https" {
+                bail!("kubernetes.api_url must use https");
+            }
+        }
+        if kubernetes.token_path.trim().is_empty() || kubernetes.ca_path.trim().is_empty() {
+            bail!("kubernetes.token_path and kubernetes.ca_path must not be empty");
+        }
+        if kubernetes.timeout_seconds == 0 || kubernetes.timeout_seconds > 60 {
+            bail!("kubernetes.timeout_seconds must be between 1 and 60");
+        }
+        Ok(())
+    }
+}
+
 fn validate_match_value(value: &str) -> anyhow::Result<()> {
     if value.trim().is_empty() || value.len() > 128 {
         bail!("validation identity match values must contain 1-128 characters");
@@ -915,6 +996,41 @@ mod tests {
     fn defaults_are_valid() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn kubernetes_discovery_is_off_by_default() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(!config.kubernetes.enabled);
+        assert_eq!(
+            config.kubernetes.network_attachment,
+            "personal-arr/vpn-egress"
+        );
+    }
+
+    #[test]
+    fn enabled_kubernetes_discovery_needs_a_node_and_a_range_clear_of_the_gateway() {
+        let base = "kubernetes:\n  enabled: true\n  node_name: node-b\n";
+        let config: Config =
+            serde_yaml::from_str(&format!("{base}  address_range: 172.30.0.192/26\n")).unwrap();
+        config.validate().unwrap();
+        for extra in [
+            "",
+            "  address_range: 172.30.0.0/26\n",
+            "  address_range: 172.31.0.192/26\n",
+            "  address_range: 172.30.0.0/16\n",
+            "  address_range: 172.30.0.192/26\n  network_attachment: vpn-egress\n",
+            "  address_range: 172.30.0.192/26\n  api_url: http://10.0.0.1\n",
+            "  address_range: 172.30.0.192/26\n  timeout_seconds: 0\n",
+        ] {
+            let config: Config = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
+            assert!(config.validate().is_err(), "{extra}");
+        }
+        let config: Config = serde_yaml::from_str(
+            "kubernetes:\n  enabled: true\n  address_range: 172.30.0.192/26\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
