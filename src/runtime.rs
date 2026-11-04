@@ -1019,6 +1019,13 @@ async fn reconcile_docker(
                     .network
                     .ipv6_routing()
                     .map(|ipv6| ipv6.subnet.to_string());
+                if config.kubernetes.enabled {
+                    policy.bound_range = config
+                        .kubernetes
+                        .address_range
+                        .map(|range| range.to_string());
+                    policy.gateway_address = Some(config.network.gateway_ip);
+                }
                 let complete = policy.eligible_for_enforcement;
                 let has_participants = !policy.participants.is_empty();
                 publisher

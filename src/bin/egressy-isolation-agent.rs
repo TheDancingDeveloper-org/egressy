@@ -269,21 +269,20 @@ fn violation_changes(
             }
         }
     }
-    let value = current
-        .get("isolation_unresolved")
-        .copied()
-        .unwrap_or_default();
-    let old = previous
-        .get("isolation_unresolved")
-        .copied()
-        .unwrap_or_default();
-    if value.packets > old.packets || value.bytes > old.bytes {
-        changes.push(ViolationChange {
-            source_id: "unresolved".to_owned(),
-            destination_id: "unresolved".to_owned(),
-            packets: value.packets,
-            bytes: value.bytes,
-        });
+    for (counter, label) in [
+        ("isolation_unresolved", "unresolved"),
+        ("isolation_spoofed", "spoofed"),
+    ] {
+        let value = current.get(counter).copied().unwrap_or_default();
+        let old = previous.get(counter).copied().unwrap_or_default();
+        if value.packets > old.packets || value.bytes > old.bytes {
+            changes.push(ViolationChange {
+                source_id: label.to_owned(),
+                destination_id: label.to_owned(),
+                packets: value.packets,
+                bytes: value.bytes,
+            });
+        }
     }
     changes
 }
