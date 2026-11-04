@@ -1,0 +1,30 @@
+# Example Multus attachment onto the gateway's existing Docker bridge. The
+# cluster's own copy is managed with the cluster, not from this repository.
+# The range must match kubernetes.address_range and sit outside Docker's own
+# allocation pool on the same bridge. A pod may pin an address from the range
+# with the static IPAM `ips` capability instead.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: vpn-egress
+  namespace: personal-arr
+spec:
+  config: |
+    {
+      "cniVersion": "0.4.0",
+      "type": "bridge",
+      "bridge": "br-vpn-egress",
+      "isGateway": false,
+      "ipMasq": false,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{
+          "subnet": "172.30.0.0/24",
+          "rangeStart": "172.30.0.192",
+          "rangeEnd": "172.30.0.254",
+          "gateway": "172.30.0.2"
+        }]],
+        "routes": [{ "dst": "0.0.0.0/0", "gw": "172.30.0.2" }]
+      },
+      "dns": { "nameservers": ["172.30.0.2"] }
+    }

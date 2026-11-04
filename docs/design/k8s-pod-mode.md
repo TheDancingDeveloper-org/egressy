@@ -1,6 +1,7 @@
 # Design: Kubernetes pod mode
 
-Status: **proposal, not implemented.** Work item WI-2964. Nothing here changes
+Status: **superseded** by Kubernetes pod discovery on the existing bridge
+(`docs/KUBERNETES.md`, WI-3228). Kept for its test ideas. Was: **proposal, not implemented.** Work item WI-2964. Nothing here changes
 the running Docker gateway (`personal-egressd`), and nothing here may be
 deployed until the open questions at the end are answered.
 

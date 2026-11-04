@@ -162,6 +162,11 @@ namespace. The optional isolation agent applies host bridge-family policy from
 a complete inventory and explicit allowances. It is disabled by default and
 does not provide hostile Layer-2 tenant isolation.
 
+With Kubernetes discovery on, the policy also binds each participant's IPv4
+address to its MAC and drops any source in the pod range that is not a
+discovered pod, ahead of every other rule and in `audit` mode too. See
+`docs/KUBERNETES.md`.
+
 ## IPv6
 
 IPv6 routing is opt-in through `network.ipv6`, and it is off by default. In both

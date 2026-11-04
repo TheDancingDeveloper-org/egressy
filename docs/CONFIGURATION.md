@@ -178,6 +178,22 @@ failure and success hysteresis plus maximum backoff. `reconcile.interval_seconds
 sets the enforcement loop. `apply_gateway_firewall` must remain `true`; false
 is rejected because managed routing without a fail-closed owner is unsafe.
 
+### `kubernetes`
+
+Read-only discovery of pods attached to the bridge through Multus. Off by
+default. See `docs/KUBERNETES.md`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Lists pods and merges them with Docker discovery. |
+| `node_name` | empty | Required when enabled. Pods are listed with `spec.nodeName=<node_name>`. |
+| `network_attachment` | `personal-arr/vpn-egress` | The `namespace/name` entry read from `k8s.v1.cni.cncf.io/network-status`. |
+| `address_range` | unset | Required when enabled. The pod IPAM range; inside `network.subnet`, clear of the bridge and gateway addresses. Every source in it must be a discovered pod. |
+| `api_url` | unset | `https` API server URL. Unset means in-cluster (`KUBERNETES_SERVICE_HOST`). |
+| `token_path` | service-account token path | Bearer token file, re-read on every listing. |
+| `ca_path` | service-account CA path | CA bundle for the API server. |
+| `timeout_seconds` | `10` | Listing timeout, 1 to 60. |
+
 ## Client labels
 
 | Label | Purpose |
@@ -190,7 +206,8 @@ is rejected because managed routing without a fail-closed owner is unsafe.
 | `egressy.isolation-allow` | Comma-separated destination and port allowances. |
 
 A label without a valid network address or with a declared alternate default
-route is non-compliant. Labels never alter container networking.
+route is non-compliant. Labels never alter container networking. Kubernetes
+pods use the same keys as annotations (`docs/KUBERNETES.md`).
 
 ## Commands
 

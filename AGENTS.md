@@ -40,6 +40,7 @@ filesystem or firewall identifiers.
 - `src/runtime.rs`: lifecycle, routing, reconciliation, traffic, and NAT-PMP.
 - `src/host.rs`: rendered host and gateway nftables/routing policy.
 - `src/docker.rs`: read-only Docker discovery.
+- `src/kubernetes.rs`: optional read-only discovery of Multus-attached pods.
 - `src/natpmp.rs`: RFC 6886 mapping logic.
 - `src/dns.rs`: bounded UDP/TCP DNS forwarding.
 - `src/domain.rs`, `src/control.rs`: canonical state and transitions.

@@ -98,6 +98,8 @@ Compatibility v1 state remains available for existing consumers.
   ordinary egress.
 - Docker API loss: discovery becomes stale, but existing routing and firewall
   ownership continue.
+- Kubernetes API loss (when `kubernetes.enabled`): the last pod listing is
+  kept, so address bindings can only fail closed; see `docs/KUBERNETES.md`.
 - Probe or external-validator loss: diagnostics degrade without weakening
   enforcement.
 - History or OTLP loss: current state and data plane remain operational.
