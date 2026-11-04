@@ -34,6 +34,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # Registry refs must be lowercase; github.repository keeps the org's case.
+      - name: Lowercase image repository
+        run: echo "IMAGE_REPO=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       # The `build` check is required on main, so it must report on every
       # pull request, including docs-only ones. Detect docs-only changes here
       # and skip only the expensive image steps below.
@@ -97,8 +100,8 @@ jobs:
           # local cache would not survive job-completed.sh wiping the
           # workspace after every job. Writing needs registry auth, so both
           # directions are gated on the same condition as the login step.
-          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache', github.repository) || '' }}
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache,mode=max', github.repository) || '' }}
+          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache', env.IMAGE_REPO) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache,mode=max', env.IMAGE_REPO) || '' }}
       - name: External validator image metadata
         id: validator
         uses: docker/metadata-action@v6
@@ -128,5 +131,5 @@ jobs:
           # local cache would not survive job-completed.sh wiping the
           # workspace after every job. Writing needs registry auth, so both
           # directions are gated on the same condition as the login step.
-          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}-external-probe:buildcache', github.repository) || '' }}
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}-external-probe:buildcache,mode=max', github.repository) || '' }}
+          cache-from: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}-external-probe:buildcache', env.IMAGE_REPO) || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}-external-probe:buildcache,mode=max', env.IMAGE_REPO) || '' }}
