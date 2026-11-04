@@ -120,6 +120,20 @@ otherwise visible: bridge isolation keeps working and the gateway keeps
 reporting a healthy tunnel while enrolled traffic is one netfilter rebuild away
 from leaving on the host's default route.
 
+Set `EGRESSY_HOST_POLICY_CACHE` to a file on persistent storage (the compose
+file uses a named volume). Every policy fetched is written there, and when the
+gateway does not answer the agent installs the cached policy instead, so after
+a host reboot the kill switch is back on the agent's first tick rather than once
+the gateway's API is up. A cache-only reconcile still counts as a failure for
+the escalation above. The cache does not cover the time before Docker starts
+the agent: install a boot-time baseline for that (the rule, an `unreachable`
+default in the policy table and the `inet egressy_host` table, from a systemd
+unit ordered before `docker.service`).
+
+The policy routing table carries `unreachable default metric 4294967295` for
+both families, so if the bridge and its routes disappear a lookup from the
+enrolled subnet is refused rather than falling through to the main table.
+
 ### Gateway
 
 The gateway table is installed before WireGuard starts. Its forward chain
@@ -127,6 +141,21 @@ permits enrolled traffic only toward `wg0`, return state from `wg0`, DNS and
 management input, and active forwarding state. Other enrolled forwarding is
 rejected. If `wg0` disappears or table 200 lacks a route, traffic remains
 blocked while recovery runs.
+
+Three things keep that true when `wg0` disappears, not only while it is down:
+
+- The forward chain drops enrolled traffic toward any interface other than
+  `wg0` (and traffic to the enrolled subnet from any interface other than
+  `wg0`) *before* the established/related accept. A DNAT'd flow is not
+  masqueraded, so the kernel keeps its conntrack entry when `wg0` goes, and its
+  next packet would otherwise be accepted out of the uplink.
+- Table 200 holds `unreachable default metric 4294967295` beneath
+  `default dev wg0`, so a lookup from the enrolled subnet never falls through
+  to the main table.
+- The DNS forwarder's upstream sockets and the NAT-PMP client are bound to
+  `wg0` with `SO_BINDTODEVICE`. Their host routes into the tunnel vanish with
+  the interface; bound, a query fails with `ENODEV` instead of leaving by the
+  uplink.
 
 Never disable gateway firewall reconciliation while Egressy manages the tunnel;
 configuration validation rejects that combination.

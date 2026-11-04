@@ -389,6 +389,7 @@ pub async fn run(
                 .then(|| Arc::new(crate::dns_cache::DnsCache::new(config.dns.cache.capacity))),
             local_names: local_names_rx,
             publisher: Some(publisher.clone()),
+            upstream_interface: Some(config.wireguard.interface.clone()),
         })))
     } else {
         None
@@ -1650,7 +1651,8 @@ async fn maintain_port_forward(
         futures_util::future::pending::<()>().await;
         return Ok(());
     }
-    let client = NatPmpClient::new(config.port_forwarding.gateway);
+    let client = NatPmpClient::new(config.port_forwarding.gateway)
+        .bound_to(config.wireguard.interface.clone());
     let mut leases = BTreeMap::<String, LeaseSlot>::new();
 
     loop {
@@ -2265,13 +2267,9 @@ pub(crate) async fn configure_gateway_routes(
         ],
     )
     .await?;
-    command(
-        "ip",
-        &[
-            "route", "replace", "table", &table, "default", "dev", tunnel,
-        ],
-    )
-    .await?;
+    for args in gateway_table_route_args(&table, tunnel) {
+        command("ip", &args.iter().map(String::as_str).collect::<Vec<_>>()).await?;
+    }
     for destination in service_routes {
         command(
             "ip",
@@ -2288,6 +2286,31 @@ pub(crate) async fn configure_gateway_routes(
         .await?;
     }
     configure_gateway_ipv6_routes(config, profile_carries_ipv6).await
+}
+
+/// IPv4 routes of the gateway's policy table, in the order they are applied.
+///
+/// The unreachable default goes first and outlives the tunnel route: when the
+/// tunnel interface is deleted its route goes with it, and without this a
+/// lookup from the enrolled subnet would fall through to the main table and
+/// leave by the uplink.
+fn gateway_table_route_args(table: &str, tunnel: &str) -> Vec<Vec<String>> {
+    let route = |tail: &[&str]| {
+        ["route", "replace", "table", table]
+            .iter()
+            .chain(tail)
+            .map(|part| (*part).to_owned())
+            .collect::<Vec<_>>()
+    };
+    vec![
+        route(&[
+            "unreachable",
+            "default",
+            "metric",
+            &egressy::host_policy::UNREACHABLE_METRIC.to_string(),
+        ]),
+        route(&["default", "dev", tunnel]),
+    ]
 }
 
 /// Mirror the IPv4 source rules for IPv6. The unreachable route is installed
@@ -2525,6 +2548,28 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[test]
+    fn the_gateway_table_has_an_ipv4_unreachable_default_before_the_tunnel_route() {
+        let routes = gateway_table_route_args("200", "wg0");
+        assert_eq!(
+            routes[0],
+            [
+                "route",
+                "replace",
+                "table",
+                "200",
+                "unreachable",
+                "default",
+                "metric",
+                "4294967295"
+            ]
+        );
+        assert_eq!(
+            routes[1],
+            ["route", "replace", "table", "200", "default", "dev", "wg0"]
+        );
+    }
 
     #[test]
     fn a_pod_listing_expires_after_max_stale() {

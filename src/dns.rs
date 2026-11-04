@@ -45,6 +45,9 @@ pub struct Settings {
     /// Enrolled-bridge container names, refreshed by Docker discovery.
     pub local_names: watch::Receiver<Arc<std::collections::BTreeMap<String, std::net::Ipv4Addr>>>,
     pub publisher: Option<StatePublisher>,
+    /// Interface every upstream socket is bound to (the tunnel), so a query
+    /// cannot leave by another route when the tunnel is absent.
+    pub upstream_interface: Option<String>,
 }
 
 static LOCAL_ANSWERS: AtomicU64 = AtomicU64::new(0);
@@ -713,6 +716,7 @@ async fn serve_udp(
             match forward_query(
                 &query,
                 upstream,
+                settings.upstream_interface.as_deref(),
                 settings.timeout,
                 settings.udp_attempts,
                 || {
@@ -828,7 +832,13 @@ async fn handle_tcp_client(client: &mut TcpStream, settings: &Settings) -> anyho
 
 async fn forward_over_tcp(query: &[u8], settings: &Settings) -> anyhow::Result<Vec<u8>> {
     let upstream = (*settings.upstream.borrow()).context("DNS upstream is not configured")?;
-    let response = tcp_exchange(query, upstream, settings.timeout).await?;
+    let response = tcp_exchange(
+        query,
+        upstream,
+        settings.upstream_interface.as_deref(),
+        settings.timeout,
+    )
+    .await?;
     observe_tcp_success(settings.publisher.as_ref()).await;
     remember_answer(settings, query, &response, upstream);
     Ok(response)
@@ -853,6 +863,7 @@ async fn refuse_tcp_client(
 async fn forward_query(
     query: &[u8],
     upstream: SocketAddr,
+    interface: Option<&str>,
     request_timeout: Duration,
     udp_attempts: u32,
     mut leaving_udp: impl FnMut(),
@@ -862,12 +873,12 @@ async fn forward_query(
     let mut failed_udp_attempts = 0;
     for attempt in 1..=udp_attempts {
         UDP_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        match udp_exchange(query, upstream, request_timeout).await {
+        match udp_exchange(query, upstream, interface, request_timeout).await {
             Ok(response) if is_truncated(&response)? => {
                 debug!("DNS UDP response truncated; retrying over TCP");
                 leaving_udp();
                 TCP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                let response = tcp_exchange(query, upstream, request_timeout).await?;
+                let response = tcp_exchange(query, upstream, interface, request_timeout).await?;
                 TCP_FALLBACK_SUCCESSES.fetch_add(1, Ordering::Relaxed);
                 return Ok(ForwardResult {
                     response,
@@ -897,7 +908,7 @@ async fn forward_query(
     UDP_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
     leaving_udp();
     TCP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-    match tcp_exchange(query, upstream, request_timeout).await {
+    match tcp_exchange(query, upstream, interface, request_timeout).await {
         Ok(response) => {
             TCP_FALLBACK_SUCCESSES.fetch_add(1, Ordering::Relaxed);
             Ok(ForwardResult {
@@ -920,10 +931,12 @@ async fn forward_query(
 async fn udp_exchange(
     query: &[u8],
     upstream: SocketAddr,
+    interface: Option<&str>,
     request_timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.connect(upstream).await?;
+    let socket = crate::tunnel_socket::udp(upstream, interface)
+        .await
+        .context("DNS upstream UDP socket could not use the tunnel")?;
     timeout(request_timeout, socket.send(query))
         .await
         .context("DNS upstream UDP send timed out")??;
@@ -1003,12 +1016,16 @@ async fn observe_tcp_success(publisher: Option<&StatePublisher>) {
 async fn tcp_exchange(
     query: &[u8],
     upstream: SocketAddr,
+    interface: Option<&str>,
     request_timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
     validate_dns_message(query)?;
-    let mut stream = timeout(request_timeout, TcpStream::connect(upstream))
-        .await
-        .context("DNS upstream TCP connect timed out")??;
+    let mut stream = timeout(
+        request_timeout,
+        crate::tunnel_socket::tcp(upstream, interface),
+    )
+    .await
+    .context("DNS upstream TCP connect timed out")??;
     write_tcp_message(&mut stream, query, request_timeout).await?;
     let response = read_tcp_message(&mut stream, request_timeout).await?;
     validate_response(query, &response)?;

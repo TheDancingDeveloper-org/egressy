@@ -50,6 +50,15 @@ struct Cli {
     /// stayed visibly healthy.
     #[arg(long, env = "EGRESSY_HOST_POLICY_URL")]
     host_policy_url: Option<String>,
+    /// File holding the last host policy fetched from the gateway.
+    ///
+    /// After a host reboot the gateway's API answers only once the tunnel stack
+    /// is up, while Docker may already be starting enrolled clients. With a
+    /// cache the agent installs the last good policy on its first tick instead
+    /// of waiting for the gateway, and keeps re-asserting it for as long as the
+    /// gateway is unreachable. Put it on persistent storage.
+    #[arg(long, env = "EGRESSY_HOST_POLICY_CACHE")]
+    host_policy_cache: Option<std::path::PathBuf>,
 }
 
 const HOST_POLICY_PATH: &str = "/api/v2/host-policy";
@@ -110,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = ticker.tick() => {
                 if cli.manage_host_policy {
-                    match reconcile_host_policy(&client, &host_policy_url).await {
+                    match reconcile_host_policy(&client, &host_policy_url, cli.host_policy_cache.as_deref()).await {
                         Ok(()) => host_policy_failures = 0,
                         Err(error) => {
                             host_policy_failures = host_policy_failures.saturating_add(1);
@@ -304,8 +313,68 @@ fn report_violation_changes(changes: &[ViolationChange]) {
 ///
 /// This is the loop that makes the fail-closed guarantee survive a Docker daemon
 /// restart. The bootstrap script installs the same state once; this owns it.
-async fn reconcile_host_policy(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
-    let policy = fetch_host_policy(client, url).await?;
+async fn reconcile_host_policy(
+    client: &reqwest::Client,
+    url: &str,
+    cache: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let (policy, failure) = resolve_host_policy(fetch_host_policy_bytes(client, url).await, cache)?;
+    reconcile_with(policy).await?;
+    match failure {
+        // Still a failure: the cached policy may be out of date, so keep escalating.
+        Some(error) => Err(error.context("host policy reconciled from the cache only")),
+        None => Ok(()),
+    }
+}
+
+/// The policy to install: the gateway's when it answered (refreshing the
+/// cache), otherwise the cached one together with the fetch error.
+fn resolve_host_policy(
+    fetched: anyhow::Result<(HostPolicy, Vec<u8>)>,
+    cache: Option<&std::path::Path>,
+) -> anyhow::Result<(HostPolicy, Option<anyhow::Error>)> {
+    match fetched {
+        Ok((policy, body)) => {
+            if let Some(cache) = cache {
+                if let Err(error) = store_cached_policy(cache, &body) {
+                    warn!(%error, path = %cache.display(), "host policy cache could not be written");
+                }
+            }
+            Ok((policy, None))
+        }
+        Err(error) => {
+            let Some(policy) = cache.and_then(load_cached_policy) else {
+                return Err(error);
+            };
+            warn!(%error, "gateway unreachable; re-asserting the cached host policy");
+            Ok((policy, Some(error)))
+        }
+    }
+}
+
+/// The cached policy, if the file exists and still parses as a valid policy.
+fn load_cached_policy(path: &std::path::Path) -> Option<HostPolicy> {
+    let body = std::fs::read(path).ok()?;
+    match parse_host_policy(&body) {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            warn!(%error, path = %path.display(), "ignoring an invalid host policy cache");
+            None
+        }
+    }
+}
+
+/// Replace the cache atomically, and only when the policy changed.
+fn store_cached_policy(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    if std::fs::read(path).is_ok_and(|current| current == body) {
+        return Ok(());
+    }
+    let staging = path.with_extension("tmp");
+    std::fs::write(&staging, body)?;
+    std::fs::rename(&staging, path)
+}
+
+async fn reconcile_with(policy: HostPolicy) -> anyhow::Result<()> {
     let rules = read_ip_rules(IpFamily::V4).await?;
     let routes = read_ip_routes(IpFamily::V4, policy.route_table).await?;
     let listing = read_host_table().await?;
@@ -336,7 +405,10 @@ async fn reconcile_host_policy(client: &reqwest::Client, url: &str) -> anyhow::R
 /// The published policy is derived from gateway configuration and does not
 /// change while the gateway runs, so unlike the isolation policy it carries no
 /// freshness requirement — only a schema and a sanity check.
-async fn fetch_host_policy(client: &reqwest::Client, url: &str) -> anyhow::Result<HostPolicy> {
+async fn fetch_host_policy_bytes(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<(HostPolicy, Vec<u8>)> {
     let response = client.get(url).send().await?.error_for_status()?;
     const MAX_POLICY_BYTES: u64 = 65_536;
     if response
@@ -349,7 +421,7 @@ async fn fetch_host_policy(client: &reqwest::Client, url: &str) -> anyhow::Resul
     if body.len() as u64 > MAX_POLICY_BYTES {
         bail!("host policy response is too large");
     }
-    parse_host_policy(&body)
+    Ok((parse_host_policy(&body)?, body.to_vec()))
 }
 
 fn parse_host_policy(body: &[u8]) -> anyhow::Result<HostPolicy> {
@@ -624,6 +696,7 @@ mod tests {
             stale_seconds: 30,
             manage_host_policy: true,
             host_policy_url: host_policy_url.map(str::to_owned),
+            host_policy_cache: None,
         }
     }
 
@@ -641,6 +714,38 @@ mod tests {
         assert!(parse_host_policy(host_policy_document(1, ipv6).as_bytes()).is_err());
         assert!(parse_host_policy(host_policy_document(2, "").as_bytes()).is_err());
         assert!(parse_host_policy(host_policy_document(3, ipv6).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn the_cached_host_policy_is_installed_while_the_gateway_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("host-policy.json");
+        let body = host_policy_document(1, "").into_bytes();
+        let fetched = parse_host_policy(&body).unwrap();
+        let (policy, failure) =
+            resolve_host_policy(Ok((fetched.clone(), body)), Some(&cache)).unwrap();
+        assert_eq!(policy, fetched);
+        assert!(failure.is_none());
+
+        // After a reboot the gateway does not answer yet: the cache stands in.
+        let (policy, failure) =
+            resolve_host_policy(Err(anyhow::anyhow!("connection refused")), Some(&cache)).unwrap();
+        assert_eq!(policy, fetched);
+        assert!(
+            failure.is_some(),
+            "a cache-only reconcile still counts as a failure"
+        );
+
+        // Without a cache there is nothing to install.
+        assert!(resolve_host_policy(Err(anyhow::anyhow!("connection refused")), None).is_err());
+    }
+
+    #[test]
+    fn an_invalid_host_policy_cache_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("host-policy.json");
+        std::fs::write(&cache, b"{not json").unwrap();
+        assert!(resolve_host_policy(Err(anyhow::anyhow!("down")), Some(&cache)).is_err());
     }
 
     #[test]
@@ -746,6 +851,7 @@ mod tests {
             stale_seconds: 30,
             manage_host_policy: true,
             host_policy_url: Some("http://127.0.0.1:8080/api/v2/host-policy".into()),
+            host_policy_cache: None,
         }
     }
 

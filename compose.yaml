@@ -116,6 +116,11 @@ services:
       # EGRESSY_HOST_POLICY_URL is derived from EGRESSY_ISOLATION_POLICY_URL
       # above, so publishing the gateway API on another port needs only the one
       # override. Set it here only if the two are genuinely different.
+      # The last host policy fetched, re-installed when the gateway is not
+      # answering yet (after a reboot) or at all. Keep it on the volume below.
+      EGRESSY_HOST_POLICY_CACHE: /var/lib/egressy-agent/host-policy.json
+    volumes:
+      - egressy-agent-state:/var/lib/egressy-agent
     depends_on:
       - egressy
 
@@ -130,4 +135,5 @@ networks:
     external: true
 
 volumes:
+  egressy-agent-state: {}
   egressy-data: {}

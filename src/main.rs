@@ -20,6 +20,7 @@ mod recovery;
 mod runtime;
 mod state;
 mod telemetry;
+mod tunnel_socket;
 mod vpn_server;
 mod web;
 mod wireguard;

@@ -1,7 +1,7 @@
 use std::{net::Ipv4Addr, time::Duration};
 
 use thiserror::Error;
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::time::timeout;
 
 const NAT_PMP_PORT: u16 = 5351;
 
@@ -43,6 +43,7 @@ pub struct Mapping {
 pub struct Client {
     gateway: Ipv4Addr,
     initial_timeout: Duration,
+    interface: Option<String>,
 }
 
 impl Client {
@@ -50,7 +51,15 @@ impl Client {
         Self {
             gateway,
             initial_timeout: Duration::from_millis(250),
+            interface: None,
         }
+    }
+
+    /// Bind every request socket to `interface` (the tunnel), so a request
+    /// fails rather than leaving by the uplink when the tunnel is absent.
+    pub fn bound_to(mut self, interface: String) -> Self {
+        self.interface = Some(interface);
+        self
     }
 
     pub async fn external_address(&self) -> Result<Ipv4Addr, Error> {
@@ -81,8 +90,11 @@ impl Client {
     }
 
     async fn rpc(&self, request: &[u8], expected_size: usize) -> Result<Vec<u8>, Error> {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-        socket.connect((self.gateway, NAT_PMP_PORT)).await?;
+        let socket = crate::tunnel_socket::udp(
+            (self.gateway, NAT_PMP_PORT).into(),
+            self.interface.as_deref(),
+        )
+        .await?;
         let mut response = [0_u8; 16];
         let mut wait = self.initial_timeout;
         let bytes = loop {
@@ -179,6 +191,15 @@ pub async fn request_symmetric_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn requests_fail_closed_when_the_tunnel_interface_is_absent() {
+        let client = Client::new(Ipv4Addr::LOCALHOST).bound_to("egressy-nodev0".to_owned());
+        match client.external_address().await {
+            Err(Error::Io(error)) => assert_eq!(error.raw_os_error(), Some(19), "{error}"),
+            other => panic!("expected ENODEV, got {other:?}"),
+        }
+    }
 
     #[test]
     fn protocol_opcodes_match_rfc_6886() {
