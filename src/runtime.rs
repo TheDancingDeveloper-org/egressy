@@ -669,6 +669,11 @@ async fn monitor_telemetry(
     }
 }
 
+/// Whether the last good pod listing is too old to keep using.
+fn pod_listing_expired(listed_at: Option<Instant>, max_stale: Duration) -> bool {
+    listed_at.is_none_or(|listed_at| listed_at.elapsed() > max_stale)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_docker(
     config: Config,
@@ -681,15 +686,20 @@ async fn reconcile_docker(
     local_names_tx: watch::Sender<Arc<std::collections::BTreeMap<String, std::net::Ipv4Addr>>>,
 ) -> anyhow::Result<()> {
     let mut ticker = interval(config.reconcile_interval());
-    // The last good pod listing. A failed refresh keeps it: stale bindings can
-    // only drop a replacement pod's frames, never admit an unknown sender.
+    // The last good pod listing. A failed refresh keeps it for up to
+    // kubernetes.max_stale_seconds: stale bindings can only drop a replacement
+    // pod's frames, never admit an unknown sender. Past that the listing is
+    // dropped, so deleted pods lose their clients and leases (fails closed).
     let mut pods = KubernetesSnapshot::default();
+    let mut pods_listed_at: Option<Instant> = None;
+    let max_stale = Duration::from_secs(config.kubernetes.max_stale_seconds);
     loop {
         ticker.tick().await;
         if let Some(kubernetes) = &kubernetes {
             match kubernetes.discover().await {
                 Ok(snapshot) => {
                     pods = snapshot;
+                    pods_listed_at = Some(Instant::now());
                     publisher
                         .observe(
                             "kubernetes.discovery",
@@ -704,13 +714,21 @@ async fn reconcile_docker(
                 }
                 Err(error) => {
                     warn!(%error, "Kubernetes discovery failed");
+                    let expired = pod_listing_expired(pods_listed_at, max_stale);
+                    if expired {
+                        pods = KubernetesSnapshot::default();
+                    }
                     publisher
                         .observe(
                             "kubernetes.discovery",
                             CheckStatus::Degraded,
                             Impact::Advisory,
-                            "kubernetes.discovery_failed",
-                            "Kubernetes pod inventory could not be refreshed; the last listing is kept",
+                            if expired { "kubernetes.discovery_expired" } else { "kubernetes.discovery_failed" },
+                            if expired {
+                                "Kubernetes pod inventory is older than kubernetes.max_stale_seconds; every pod is dropped until a listing succeeds"
+                            } else {
+                                "Kubernetes pod inventory could not be refreshed; the last listing is kept"
+                            },
                             None,
                             None,
                         )
@@ -2500,6 +2518,17 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[test]
+    fn a_pod_listing_expires_after_max_stale() {
+        let max_stale = Duration::from_secs(300);
+        assert!(pod_listing_expired(None, max_stale));
+        assert!(!pod_listing_expired(Some(Instant::now()), max_stale));
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(301))
+            .unwrap();
+        assert!(pod_listing_expired(Some(old), max_stale));
+    }
 
     fn forwarding_client(
         id: &str,

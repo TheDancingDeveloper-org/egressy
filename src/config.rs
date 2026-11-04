@@ -590,6 +590,10 @@ pub struct KubernetesConfig {
     /// The Multus attachment, as `namespace/name`, whose entry in the pod's
     /// `k8s.v1.cni.cncf.io/network-status` annotation carries its address.
     pub network_attachment: String,
+    /// The only namespaces whose pods are listed. Required: a pod's own
+    /// annotations decide its enrolment, so only trusted namespaces may
+    /// carry them. Usually just the attachment's namespace.
+    pub namespaces: Vec<String>,
     /// The static IPAM range pods are given. Must sit inside `network.subnet`
     /// and exclude the bridge and gateway addresses. Every source address in
     /// it must belong to a discovered pod, or the host agent drops it.
@@ -599,6 +603,9 @@ pub struct KubernetesConfig {
     pub token_path: String,
     pub ca_path: String,
     pub timeout_seconds: u64,
+    /// How long the last good pod listing is kept while the API server is
+    /// unreachable. Past this every pod is dropped, which fails closed.
+    pub max_stale_seconds: u64,
 }
 
 impl Default for KubernetesConfig {
@@ -607,11 +614,13 @@ impl Default for KubernetesConfig {
             enabled: false,
             node_name: String::new(),
             network_attachment: "personal-arr/vpn-egress".to_owned(),
+            namespaces: Vec::new(),
             address_range: None,
             api_url: None,
             token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token".to_owned(),
             ca_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".to_owned(),
             timeout_seconds: 10,
+            max_stale_seconds: 300,
         }
     }
 }
@@ -922,6 +931,16 @@ impl Config {
             Some((namespace, name)) if !namespace.is_empty() && !name.is_empty() => {}
             _ => bail!("kubernetes.network_attachment must be namespace/name"),
         }
+        if kubernetes.namespaces.is_empty() {
+            bail!(
+                "kubernetes.namespaces must list the trusted namespaces whose pods are discovered"
+            );
+        }
+        for namespace in &kubernetes.namespaces {
+            if !valid_namespace(namespace) {
+                bail!("kubernetes.namespaces entry {namespace:?} is not a valid namespace name");
+            }
+        }
         let range = kubernetes
             .address_range
             .context("kubernetes.address_range is required when kubernetes.enabled")?;
@@ -947,8 +966,23 @@ impl Config {
         if kubernetes.timeout_seconds == 0 || kubernetes.timeout_seconds > 60 {
             bail!("kubernetes.timeout_seconds must be between 1 and 60");
         }
+        if kubernetes.max_stale_seconds == 0 || kubernetes.max_stale_seconds > 3600 {
+            bail!("kubernetes.max_stale_seconds must be between 1 and 3600");
+        }
         Ok(())
     }
+}
+
+/// An RFC 1123 label, as Kubernetes requires of namespace names. It is
+/// placed in an API path, so nothing else gets through.
+fn valid_namespace(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+        && !value.starts_with('-')
+        && !value.ends_with('-')
 }
 
 fn validate_match_value(value: &str) -> anyhow::Result<()> {
@@ -1010,7 +1044,8 @@ mod tests {
 
     #[test]
     fn enabled_kubernetes_discovery_needs_a_node_and_a_range_clear_of_the_gateway() {
-        let base = "kubernetes:\n  enabled: true\n  node_name: node-b\n";
+        let base =
+            "kubernetes:\n  enabled: true\n  node_name: node-b\n  namespaces: [personal-arr]\n";
         let config: Config =
             serde_yaml::from_str(&format!("{base}  address_range: 172.30.0.192/26\n")).unwrap();
         config.validate().unwrap();
@@ -1022,6 +1057,7 @@ mod tests {
             "  address_range: 172.30.0.192/26\n  network_attachment: vpn-egress\n",
             "  address_range: 172.30.0.192/26\n  api_url: http://10.0.0.1\n",
             "  address_range: 172.30.0.192/26\n  timeout_seconds: 0\n",
+            "  address_range: 172.30.0.192/26\n  max_stale_seconds: 0\n",
         ] {
             let config: Config = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
             assert!(config.validate().is_err(), "{extra}");
@@ -1031,6 +1067,25 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn kubernetes_discovery_refuses_to_start_without_a_namespace_allowlist() {
+        let base =
+            "kubernetes:\n  enabled: true\n  node_name: node-b\n  address_range: 172.30.0.192/26\n";
+        for namespaces in [
+            "",
+            "  namespaces: []\n",
+            "  namespaces: [\"../x\"]\n",
+            "  namespaces: [Arr]\n",
+            "  namespaces: [-a]\n",
+        ] {
+            let config: Config = serde_yaml::from_str(&format!("{base}{namespaces}")).unwrap();
+            assert!(config.validate().is_err(), "{namespaces}");
+        }
+        let config: Config =
+            serde_yaml::from_str(&format!("{base}  namespaces: [personal-arr]\n")).unwrap();
+        config.validate().unwrap();
     }
 
     #[test]

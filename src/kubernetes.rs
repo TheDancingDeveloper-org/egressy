@@ -2,10 +2,11 @@
 //!
 //! Pods join the bridge through a Multus network attachment and are enrolled
 //! by annotations that mirror the Docker labels. Egressy only lists pods on
-//! its own node; it never creates, patches, or deletes anything.
+//! its own node, in the configured trusted namespaces; it never creates,
+//! patches, or deletes anything.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::Ipv4Addr,
     time::Duration,
 };
@@ -38,7 +39,8 @@ pub struct KubernetesSnapshot {
 
 pub struct KubernetesObserver {
     client: reqwest::Client,
-    pods_url: reqwest::Url,
+    /// One namespaced list URL per trusted namespace.
+    pods_urls: Vec<reqwest::Url>,
     token_path: String,
     scope: DiscoveryScope,
 }
@@ -47,6 +49,8 @@ pub struct KubernetesObserver {
 #[derive(Clone, Debug)]
 pub struct DiscoveryScope {
     pub network_attachment: String,
+    /// Pods from any other namespace are ignored, whatever they carry.
+    pub namespaces: BTreeSet<String>,
     pub subnet: Ipv4Net,
     pub address_range: Ipv4Net,
     pub gateway_ip: Ipv4Addr,
@@ -72,13 +76,8 @@ impl KubernetesObserver {
                 }
             }
         };
-        let mut pods_url = reqwest::Url::parse(&base)
-            .context("invalid Kubernetes API URL")?
-            .join("/api/v1/pods")?;
-        pods_url.query_pairs_mut().append_pair(
-            "fieldSelector",
-            &format!("spec.nodeName={}", config.node_name),
-        );
+        let base = reqwest::Url::parse(&base).context("invalid Kubernetes API URL")?;
+        let pods_urls = pods_urls(&base, config)?;
         let ca = std::fs::read(&config.ca_path)
             .with_context(|| format!("reading Kubernetes CA from {}", config.ca_path))?;
         let client = reqwest::Client::builder()
@@ -89,10 +88,11 @@ impl KubernetesObserver {
             .build()?;
         Ok(Self {
             client,
-            pods_url,
+            pods_urls,
             token_path: config.token_path.clone(),
             scope: DiscoveryScope {
                 network_attachment: config.network_attachment.clone(),
+                namespaces: config.namespaces.iter().cloned().collect(),
                 subnet,
                 address_range: config
                     .address_range
@@ -106,20 +106,45 @@ impl KubernetesObserver {
         // Projected service-account tokens rotate, so read it every time.
         let token = std::fs::read_to_string(&self.token_path)
             .context("reading the Kubernetes service-account token")?;
-        let response = self
-            .client
-            .get(self.pods_url.clone())
-            .bearer_auth(token.trim())
-            .send()
-            .await
-            .context("listing pods")?;
-        let status = response.status();
-        if !status.is_success() {
-            anyhow::bail!("listing pods returned HTTP {status}");
+        // Every namespace must list, or the whole refresh fails: a partial
+        // listing would drop healthy pods' bindings.
+        let mut pods = Vec::new();
+        for url in &self.pods_urls {
+            let response = self
+                .client
+                .get(url.clone())
+                .bearer_auth(token.trim())
+                .send()
+                .await
+                .context("listing pods")?;
+            let status = response.status();
+            if !status.is_success() {
+                anyhow::bail!("listing pods returned HTTP {status}");
+            }
+            let list: PodList = response.json().await.context("decoding the pod list")?;
+            pods.extend(list.items);
         }
-        let list: PodList = response.json().await.context("decoding the pod list")?;
-        Ok(snapshot_from_pods(&self.scope, list.items))
+        Ok(snapshot_from_pods(&self.scope, pods))
     }
+}
+
+/// One namespaced pod list URL per trusted namespace, never the
+/// cluster-wide `/api/v1/pods`.
+fn pods_urls(base: &reqwest::Url, config: &KubernetesConfig) -> anyhow::Result<Vec<reqwest::Url>> {
+    let mut urls = Vec::new();
+    for namespace in &config.namespaces {
+        // Validated as an RFC 1123 label, so it is safe in the path.
+        let mut url = base.join(&format!("/api/v1/namespaces/{namespace}/pods"))?;
+        url.query_pairs_mut().append_pair(
+            "fieldSelector",
+            &format!("spec.nodeName={}", config.node_name),
+        );
+        urls.push(url);
+    }
+    if urls.is_empty() {
+        anyhow::bail!("kubernetes.namespaces must list at least one namespace");
+    }
+    Ok(urls)
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +252,11 @@ pub fn snapshot_from_pods(scope: &DiscoveryScope, pods: Vec<Pod>) -> KubernetesS
     for pod in pods {
         let metadata = &pod.metadata;
         if metadata.uid.is_empty() || metadata.name.is_empty() {
+            continue;
+        }
+        // The list URLs are namespaced already; this guards a server or
+        // proxy that ignores the path.
+        if !scope.namespaces.contains(&metadata.namespace) {
             continue;
         }
         let annotations = &metadata.annotations;
@@ -382,6 +412,7 @@ mod tests {
     fn scope() -> DiscoveryScope {
         DiscoveryScope {
             network_attachment: "personal-arr/vpn-egress".to_owned(),
+            namespaces: BTreeSet::from(["personal-arr".to_owned()]),
             subnet: "172.30.0.0/24".parse().unwrap(),
             address_range: "172.30.0.192/26".parse().unwrap(),
             gateway_ip: "172.30.0.2".parse().unwrap(),
@@ -585,6 +616,48 @@ mod tests {
         assert!(!bad_port.compliant);
         assert!(!bad_port.port_forward_label_valid);
         assert_eq!(bad_port.usage_id, "pod:personal-arr/badport");
+    }
+
+    #[test]
+    fn lists_only_the_trusted_namespaces() {
+        let base = reqwest::Url::parse("https://10.43.0.1:443").unwrap();
+        let mut config = KubernetesConfig {
+            node_name: "node-b".to_owned(),
+            namespaces: vec!["personal-arr".to_owned(), "media".to_owned()],
+            ..KubernetesConfig::default()
+        };
+        let urls = pods_urls(&base, &config)
+            .unwrap()
+            .into_iter()
+            .map(|url| url.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            [
+                "https://10.43.0.1/api/v1/namespaces/personal-arr/pods?fieldSelector=spec.nodeName%3Dnode-b",
+                "https://10.43.0.1/api/v1/namespaces/media/pods?fieldSelector=spec.nodeName%3Dnode-b",
+            ]
+        );
+        config.namespaces.clear();
+        assert!(pods_urls(&base, &config).is_err());
+    }
+
+    #[test]
+    fn pods_outside_the_trusted_namespaces_are_ignored() {
+        let mut intruder = pod(
+            "intruder",
+            "172.30.0.220",
+            "0a:58:ac:1e:00:dc",
+            &[
+                ("egressy.enabled", "true"),
+                ("egressy.isolation-id", "intruder"),
+                ("egressy.isolation-allow", "qbit:8080/tcp"),
+            ],
+        );
+        intruder.metadata.namespace = "default".to_owned();
+        let snapshot = snapshot_from_pods(&scope(), vec![intruder]);
+        assert!(snapshot.clients.is_empty());
+        assert!(snapshot.candidates.is_empty());
     }
 
     #[test]

@@ -125,4 +125,6 @@ kubernetes:
   enabled: false
   node_name: node-b
   network_attachment: personal-arr/vpn-egress
+  # Required: only pods in these trusted namespaces are discovered.
+  namespaces: [personal-arr]
   address_range: 172.30.0.192/26
