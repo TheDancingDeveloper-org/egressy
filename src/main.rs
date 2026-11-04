@@ -7,6 +7,7 @@ mod domain;
 mod enforcement;
 mod history;
 mod host;
+mod kubernetes;
 pub use egressy::host_policy;
 pub use egressy::isolation;
 mod local_zone;
