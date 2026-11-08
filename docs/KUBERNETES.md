@@ -103,6 +103,16 @@ by default, so the allowlist is what decides who may enrol. List only
 namespaces whose pod authors you trust (usually just the attachment's).
 Egressy refuses to start with discovery on and no namespaces.
 
+Multus `namespaceIsolation` means each namespace has its own
+NetworkAttachmentDefinition, so a pod's `network-status` entry is named
+`<its own namespace>/<nad>`. Configure every such attachment in
+`network_attachments`; a pod is matched only against the entries whose
+namespace is its own, so a pod can never be admitted through another
+namespace's NAD. Each attachment's namespace must also appear in
+`namespaces`, and Egressy refuses to start otherwise. The older single
+`network_attachment` key still works for one namespace; setting both keys is
+an error.
+
 The `network-status` annotation is written by Multus, but anyone who can patch
 pods in the namespace can also edit it. Restrict pod `patch`/`update` in the
 attachment's namespace to the controllers that need it.
@@ -113,8 +123,8 @@ attachment's namespace to the controllers that need it.
 kubernetes:
   enabled: true
   node_name: node-b
-  network_attachment: personal-arr/vpn-egress
-  namespaces: [personal-arr]
+  network_attachments: [personal-arr/vpn-egress, crw/vpn-egress]
+  namespaces: [personal-arr, crw]
   address_range: 172.30.0.192/26
   # Omit api_url in-cluster; KUBERNETES_SERVICE_HOST/PORT are used.
   api_url: https://192.168.1.10:6443

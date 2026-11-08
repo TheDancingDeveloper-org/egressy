@@ -49,12 +49,31 @@ pub struct KubernetesObserver {
 /// The parts of configuration that decide how a pod is read.
 #[derive(Clone, Debug)]
 pub struct DiscoveryScope {
-    pub network_attachment: String,
+    /// Every configured attachment, as `namespace/name`. A pod is matched
+    /// only against the entries whose namespace is its own.
+    pub network_attachments: Vec<String>,
     /// Pods from any other namespace are ignored, whatever they carry.
     pub namespaces: BTreeSet<String>,
     pub subnet: Ipv4Net,
     pub address_range: Ipv4Net,
     pub gateway_ip: Ipv4Addr,
+}
+
+impl DiscoveryScope {
+    /// The configured attachments that belong to `namespace`. Multus
+    /// namespace isolation means a pod can only ever use its own namespace's
+    /// attachment, so another namespace's entry must never match.
+    fn attachments_in(&self, namespace: &str) -> Vec<&str> {
+        self.network_attachments
+            .iter()
+            .filter(|attachment| {
+                attachment
+                    .split_once('/')
+                    .is_some_and(|(candidate, _)| candidate == namespace)
+            })
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 impl KubernetesObserver {
@@ -92,7 +111,7 @@ impl KubernetesObserver {
             pods_urls,
             token_path: config.token_path.clone(),
             scope: DiscoveryScope {
-                network_attachment: config.network_attachment.clone(),
+                network_attachments: config.attachments(),
                 namespaces: config.namespaces.iter().cloned().collect(),
                 subnet,
                 address_range: config
@@ -197,29 +216,41 @@ struct NetworkStatus {
 /// The pod's address on the egress attachment, as Multus reported it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Attachment {
+    /// The matching `namespace/name` entry in the network-status annotation.
+    pub name: String,
     pub ipv4_address: Ipv4Addr,
     pub mac: String,
     pub has_ipv6: bool,
     pub default_via_gateway: bool,
 }
 
-/// Find the configured attachment in a network-status annotation.
+/// Find the pod's egress attachment in a network-status annotation.
+///
+/// `attachments` must already be limited to the pod's own namespace; a pod is
+/// never admitted through another namespace's NAD.
 pub fn parse_attachment(
     raw: &str,
-    network_attachment: &str,
+    attachments: &[&str],
     gateway_ip: Ipv4Addr,
 ) -> Result<Attachment, String> {
+    let not_found = match attachments {
+        [] => return Err("no egress attachment is configured for this namespace".to_owned()),
+        [only] => format!("no {only} attachment in network-status"),
+        many => format!(
+            "none of the configured egress attachments ({}) is in network-status",
+            many.join(", ")
+        ),
+    };
     let entries: Vec<NetworkStatus> = serde_json::from_str(raw)
         .map_err(|_| "network-status annotation is not valid JSON".to_owned())?;
     let mut matching = entries
         .into_iter()
-        .filter(|entry| entry.name == network_attachment);
-    let entry = matching
-        .next()
-        .ok_or_else(|| format!("no {network_attachment} attachment in network-status"))?;
+        .filter(|entry| attachments.contains(&entry.name.as_str()));
+    let entry = matching.next().ok_or(not_found)?;
     if matching.next().is_some() {
-        return Err(format!("{network_attachment} is attached more than once"));
+        return Err(format!("{} is attached more than once", entry.name));
     }
+    let network_attachment = entry.name.clone();
     let mut ipv4 = entry
         .ips
         .iter()
@@ -235,6 +266,7 @@ pub fn parse_attachment(
     let mac = normalize_mac(&entry.mac)
         .ok_or_else(|| format!("{network_attachment} attachment has no valid MAC address"))?;
     Ok(Attachment {
+        name: network_attachment,
         ipv4_address,
         mac,
         has_ipv6: entry
@@ -262,10 +294,11 @@ pub fn snapshot_from_pods(scope: &DiscoveryScope, pods: Vec<Pod>) -> KubernetesS
         }
         let annotations = &metadata.annotations;
         let running = pod.status.phase == "Running" && metadata.deletion_timestamp.is_none();
-        let attachment = annotations
-            .get(NETWORK_STATUS_ANNOTATION)
-            .ok_or_else(|| "pod has no network-status annotation".to_owned())
-            .and_then(|raw| parse_attachment(raw, &scope.network_attachment, scope.gateway_ip));
+        let namespace_attachments = scope.attachments_in(&metadata.namespace);
+        let attachment = match annotations.get(NETWORK_STATUS_ANNOTATION) {
+            None => Err("pod has no network-status annotation".to_owned()),
+            Some(raw) => parse_attachment(raw, &namespace_attachments, scope.gateway_ip),
+        };
         let id = format!("{CLIENT_ID_PREFIX}{}", metadata.uid);
         let in_range = attachment
             .as_ref()
@@ -288,7 +321,14 @@ pub fn snapshot_from_pods(scope: &DiscoveryScope, pods: Vec<Pod>) -> KubernetesS
         }
         snapshot.clients.insert(
             id.clone(),
-            client_from_pod(scope, &pod, id, running, &attachment),
+            client_from_pod(
+                scope,
+                &pod,
+                id,
+                running,
+                &attachment,
+                &namespace_attachments,
+            ),
         );
     }
     snapshot.candidates.sort_by(|left, right| {
@@ -305,6 +345,7 @@ fn client_from_pod(
     id: String,
     running: bool,
     attachment: &Result<Attachment, String>,
+    namespace_attachments: &[&str],
 ) -> ClientState {
     let metadata = &pod.metadata;
     let annotations = &metadata.annotations;
@@ -324,23 +365,30 @@ fn client_from_pod(
             UsageIdentitySource::ContainerLifetime,
         ),
     };
-    let route_intent = route_intent(&scope.network_attachment, attachment.as_ref().ok());
+    let matched_name = attachment
+        .as_ref()
+        .ok()
+        .map(|attachment| attachment.name.clone());
+    let route_intent = route_intent(
+        matched_name
+            .as_deref()
+            .or_else(|| namespace_attachments.first().copied()),
+        attachment.as_ref().ok(),
+    );
 
     let (ipv4_address, attached, mut message) = match attachment {
-        Ok(attachment) if !scope.subnet.contains(&attachment.ipv4_address) => (
-            Ipv4Addr::UNSPECIFIED,
-            false,
-            format!(
+        Ok(attachment) if !scope.subnet.contains(&attachment.ipv4_address) => {
+            (Ipv4Addr::UNSPECIFIED, false, format!(
                 "{} address is outside the egress subnet",
-                scope.network_attachment
-            ),
-        ),
+                attachment.name
+            ))
+        }
         Ok(attachment) if !scope.address_range.contains(&attachment.ipv4_address) => (
             Ipv4Addr::UNSPECIFIED,
             false,
             format!(
                 "{} address is outside kubernetes.address_range",
-                scope.network_attachment
+                attachment.name
             ),
         ),
         Ok(attachment) => (
@@ -378,18 +426,27 @@ fn client_from_pod(
         compliance_message: message,
         running,
         ipv6_address: None,
-        networks: vec![scope.network_attachment.clone()],
+        networks: match &matched_name {
+            Some(name) => vec![name.clone()],
+            None => namespace_attachments
+                .iter()
+                .map(|attachment| (*attachment).to_owned())
+                .collect(),
+        },
         port_forward_label_valid,
         route_intent,
         traffic: ClientTrafficState::default(),
     }
 }
 
-fn route_intent(network_attachment: &str, attachment: Option<&Attachment>) -> RouteIntentState {
+fn route_intent(
+    network_attachment: Option<&str>,
+    attachment: Option<&Attachment>,
+) -> RouteIntentState {
     match attachment {
         Some(attachment) if attachment.default_via_gateway => RouteIntentState {
             status: RouteIntentStatus::Verified,
-            ipv4_default_network: Some(network_attachment.to_owned()),
+            ipv4_default_network: network_attachment.map(str::to_owned),
             reason_code: "route_intent.kubernetes_default_route".to_owned(),
             safe_message: "Multus reports the egress gateway as the pod's default route"
                 .to_owned(),
@@ -414,7 +471,7 @@ mod tests {
 
     fn scope() -> DiscoveryScope {
         DiscoveryScope {
-            network_attachment: "personal-arr/vpn-egress".to_owned(),
+            network_attachments: vec!["personal-arr/vpn-egress".to_owned()],
             namespaces: BTreeSet::from(["personal-arr".to_owned()]),
             subnet: "172.30.0.0/24".parse().unwrap(),
             address_range: "172.30.0.192/26".parse().unwrap(),
@@ -423,24 +480,44 @@ mod tests {
     }
 
     fn network_status(address: &str, mac: &str) -> String {
+        network_status_for("personal-arr/vpn-egress", address, mac)
+    }
+
+    fn network_status_for(attachment: &str, address: &str, mac: &str) -> String {
         format!(
-            r#"[{{"name":"cbr0","interface":"eth0","ips":["10.42.0.9"],"mac":"aa:aa:aa:aa:aa:aa","default":true}},{{"name":"personal-arr/vpn-egress","interface":"net1","ips":["{address}"],"mac":"{mac}","gateway":["172.30.0.2"]}}]"#
+            r#"[{{"name":"cbr0","interface":"eth0","ips":["10.42.0.9"],"mac":"aa:aa:aa:aa:aa:aa","default":true}},{{"name":"{attachment}","interface":"net1","ips":["{address}"],"mac":"{mac}","gateway":["172.30.0.2"]}}]"#
         )
     }
 
     fn pod(name: &str, address: &str, mac: &str, annotations: &[(&str, &str)]) -> Pod {
+        pod_in("personal-arr", name, address, mac, annotations)
+    }
+
+    fn pod_in(
+        namespace: &str,
+        name: &str,
+        address: &str,
+        mac: &str,
+        annotations: &[(&str, &str)],
+    ) -> Pod {
+        pod_in_with_status(namespace, name, &network_status(address, mac), annotations)
+    }
+
+    fn pod_in_with_status(
+        namespace: &str,
+        name: &str,
+        status: &str,
+        annotations: &[(&str, &str)],
+    ) -> Pod {
         let mut map = annotations
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect::<HashMap<_, _>>();
-        map.insert(
-            NETWORK_STATUS_ANNOTATION.to_owned(),
-            network_status(address, mac),
-        );
+        map.insert(NETWORK_STATUS_ANNOTATION.to_owned(), status.to_owned());
         Pod {
             metadata: PodMetadata {
                 name: name.to_owned(),
-                namespace: "personal-arr".to_owned(),
+                namespace: namespace.to_owned(),
                 uid: format!("uid-{name}"),
                 annotations: map,
                 deletion_timestamp: None,
@@ -455,10 +532,11 @@ mod tests {
     fn parses_the_configured_attachment_only() {
         let attachment = parse_attachment(
             &network_status("172.30.0.200", "0A:58:AC:1E:00:C8"),
-            "personal-arr/vpn-egress",
+            &["personal-arr/vpn-egress"],
             "172.30.0.2".parse().unwrap(),
         )
         .unwrap();
+        assert_eq!(attachment.name, "personal-arr/vpn-egress");
         assert_eq!(
             attachment.ipv4_address,
             "172.30.0.200".parse::<Ipv4Addr>().unwrap()
@@ -468,7 +546,7 @@ mod tests {
         assert!(!attachment.has_ipv6);
         assert!(parse_attachment(
             &network_status("172.30.0.200", "0a:58:ac:1e:00:c8"),
-            "other/net",
+            &["other/net"],
             "172.30.0.2".parse().unwrap()
         )
         .is_err());
@@ -484,7 +562,7 @@ mod tests {
             r#"[{"name":"personal-arr/vpn-egress","ips":["172.30.0.200"],"mac":"0a:58:ac:1e:00:c8"},{"name":"personal-arr/vpn-egress","ips":["172.30.0.201"],"mac":"0a:58:ac:1e:00:c9"}]"#,
         ] {
             assert!(
-                parse_attachment(raw, "personal-arr/vpn-egress", gateway).is_err(),
+                parse_attachment(raw, &["personal-arr/vpn-egress"], gateway).is_err(),
                 "{raw}"
             );
         }
@@ -660,6 +738,72 @@ mod tests {
         intruder.metadata.namespace = "default".to_owned();
         let snapshot = snapshot_from_pods(&scope(), vec![intruder]);
         assert!(snapshot.clients.is_empty());
+        assert!(snapshot.candidates.is_empty());
+    }
+
+    fn multi_namespace_scope() -> DiscoveryScope {
+        DiscoveryScope {
+            network_attachments: vec![
+                "personal-arr/vpn-egress".to_owned(),
+                "crw/vpn-egress".to_owned(),
+            ],
+            namespaces: BTreeSet::from(["personal-arr".to_owned(), "crw".to_owned()]),
+            subnet: "172.30.0.0/24".parse().unwrap(),
+            address_range: "172.30.0.192/26".parse().unwrap(),
+            gateway_ip: "172.30.0.2".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn each_namespace_is_admitted_through_its_own_attachment() {
+        let snapshot = snapshot_from_pods(
+            &multi_namespace_scope(),
+            vec![
+                pod_in(
+                    "personal-arr",
+                    "sonarr",
+                    "172.30.0.200",
+                    "0a:58:ac:1e:00:c8",
+                    &[("egressy.enabled", "true")],
+                ),
+                pod_in_with_status(
+                    "crw",
+                    "crw-api",
+                    &network_status_for("crw/vpn-egress", "172.30.0.201", "0a:58:ac:1e:00:c9"),
+                    &[("egressy.enabled", "true"), ("egressy.isolation-id", "crw")],
+                ),
+            ],
+        );
+        let sonarr = &snapshot.clients["k8s-uid-sonarr"];
+        assert!(sonarr.compliant, "{}", sonarr.compliance_message);
+        assert_eq!(sonarr.networks, vec!["personal-arr/vpn-egress".to_owned()]);
+        let crw = &snapshot.clients["k8s-uid-crw-api"];
+        assert!(crw.compliant, "{}", crw.compliance_message);
+        assert_eq!(crw.networks, vec!["crw/vpn-egress".to_owned()]);
+        assert_eq!(snapshot.candidates.len(), 2);
+    }
+
+    #[test]
+    fn an_attachment_from_another_namespace_never_admits_a_pod() {
+        let snapshot = snapshot_from_pods(
+            &multi_namespace_scope(),
+            vec![pod_in_with_status(
+                "personal-arr",
+                "smuggler",
+                &network_status_for("crw/vpn-egress", "172.30.0.202", "0a:58:ac:1e:00:ca"),
+                &[
+                    ("egressy.enabled", "true"),
+                    ("egressy.isolation-id", "smuggler"),
+                ],
+            )],
+        );
+        let client = &snapshot.clients["k8s-uid-smuggler"];
+        assert!(!client.compliant);
+        assert!(
+            client.compliance_message.contains("not attached"),
+            "{}",
+            client.compliance_message
+        );
         assert!(snapshot.candidates.is_empty());
     }
 
