@@ -587,9 +587,15 @@ pub struct KubernetesConfig {
     pub enabled: bool,
     /// The node whose pods are listed (`spec.nodeName` field selector).
     pub node_name: String,
-    /// The Multus attachment, as `namespace/name`, whose entry in the pod's
-    /// `k8s.v1.cni.cncf.io/network-status` annotation carries its address.
-    pub network_attachment: String,
+    /// Deprecated single attachment, as `namespace/name`. Kept so existing
+    /// configurations keep working; new configurations should set
+    /// `network_attachments` instead.
+    pub network_attachment: Option<String>,
+    /// The Multus attachments, as `namespace/name`, whose entries in the
+    /// pod's `k8s.v1.cni.cncf.io/network-status` annotation carry its
+    /// address. A pod is only ever matched against an attachment in its own
+    /// namespace. Mutually exclusive with `network_attachment`.
+    pub network_attachments: Option<Vec<String>>,
     /// The only namespaces whose pods are listed. Required: a pod's own
     /// annotations decide its enrolment, so only trusted namespaces may
     /// carry them. Usually just the attachment's namespace.
@@ -613,7 +619,8 @@ impl Default for KubernetesConfig {
         Self {
             enabled: false,
             node_name: String::new(),
-            network_attachment: "personal-arr/vpn-egress".to_owned(),
+            network_attachment: None,
+            network_attachments: None,
             namespaces: Vec::new(),
             address_range: None,
             api_url: None,
@@ -621,6 +628,21 @@ impl Default for KubernetesConfig {
             ca_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".to_owned(),
             timeout_seconds: 10,
             max_stale_seconds: 300,
+        }
+    }
+}
+
+/// The single attachment used when neither configuration key is set.
+pub const DEFAULT_NETWORK_ATTACHMENT: &str = "personal-arr/vpn-egress";
+
+impl KubernetesConfig {
+    /// The effective attachments: the list form when set, otherwise the
+    /// legacy single key, otherwise the built-in default.
+    pub fn attachments(&self) -> Vec<String> {
+        match (&self.network_attachments, &self.network_attachment) {
+            (Some(attachments), _) => attachments.clone(),
+            (None, Some(attachment)) => vec![attachment.clone()],
+            (None, None) => vec![DEFAULT_NETWORK_ATTACHMENT.to_owned()],
         }
     }
 }
@@ -927,9 +949,10 @@ impl Config {
         if kubernetes.node_name.trim().is_empty() {
             bail!("kubernetes.node_name must name the node whose pods are discovered");
         }
-        match kubernetes.network_attachment.split_once('/') {
-            Some((namespace, name)) if !namespace.is_empty() && !name.is_empty() => {}
-            _ => bail!("kubernetes.network_attachment must be namespace/name"),
+        if kubernetes.network_attachment.is_some() && kubernetes.network_attachments.is_some() {
+            bail!(
+                "kubernetes.network_attachment and kubernetes.network_attachments are mutually exclusive; set only network_attachments"
+            );
         }
         if kubernetes.namespaces.is_empty() {
             bail!(
@@ -939,6 +962,29 @@ impl Config {
         for namespace in &kubernetes.namespaces {
             if !valid_namespace(namespace) {
                 bail!("kubernetes.namespaces entry {namespace:?} is not a valid namespace name");
+            }
+        }
+        let attachments = kubernetes.attachments();
+        if attachments.is_empty() {
+            bail!(
+                "kubernetes.network_attachments must list at least one namespace/name attachment"
+            );
+        }
+        for attachment in &attachments {
+            let namespace = match attachment.split_once('/') {
+                Some((namespace, name)) if valid_namespace(namespace) && !name.is_empty() => {
+                    namespace
+                }
+                _ => bail!("kubernetes network attachment {attachment:?} must be namespace/name"),
+            };
+            if !kubernetes
+                .namespaces
+                .iter()
+                .any(|trusted| trusted == namespace)
+            {
+                bail!(
+                    "kubernetes network attachment {attachment:?} is in namespace {namespace:?}, which is not in kubernetes.namespaces"
+                );
             }
         }
         let range = kubernetes
@@ -1037,9 +1083,47 @@ mod tests {
         let config: Config = serde_yaml::from_str("{}").unwrap();
         assert!(!config.kubernetes.enabled);
         assert_eq!(
-            config.kubernetes.network_attachment,
-            "personal-arr/vpn-egress"
+            config.kubernetes.attachments(),
+            vec!["personal-arr/vpn-egress".to_owned()]
         );
+    }
+
+    #[test]
+    fn kubernetes_accepts_one_attachment_or_a_list_but_not_both() {
+        let base = "kubernetes:\n  enabled: true\n  node_name: node-b\n  namespaces: [personal-arr, crw]\n  address_range: 172.30.0.192/26\n";
+        // The old single key still parses and validates as before.
+        let old: Config = serde_yaml::from_str(&format!(
+            "{base}  network_attachment: personal-arr/vpn-egress\n"
+        ))
+        .unwrap();
+        old.validate().unwrap();
+        assert_eq!(
+            old.kubernetes.attachments(),
+            vec!["personal-arr/vpn-egress".to_owned()]
+        );
+        // The list form covers each trusted namespace's own attachment.
+        let list: Config = serde_yaml::from_str(&format!(
+            "{base}  network_attachments: [personal-arr/vpn-egress, crw/vpn-egress]\n"
+        ))
+        .unwrap();
+        list.validate().unwrap();
+        assert_eq!(
+            list.kubernetes.attachments(),
+            vec![
+                "personal-arr/vpn-egress".to_owned(),
+                "crw/vpn-egress".to_owned()
+            ]
+        );
+        for extra in [
+            "  network_attachment: personal-arr/vpn-egress\n  network_attachments: [crw/vpn-egress]\n",
+            "  network_attachments: []\n",
+            // An attachment in a namespace that is not trusted never lists.
+            "  network_attachments: [media/vpn-egress]\n",
+            "  network_attachments: [personal-arr]\n",
+        ] {
+            let config: Config = serde_yaml::from_str(&format!("{base}{extra}")).unwrap();
+            assert!(config.validate().is_err(), "{extra}");
+        }
     }
 
     #[test]
