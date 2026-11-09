@@ -126,9 +126,9 @@ kubernetes:
   node_name: node-b
   # One NAD per trusted namespace: Multus namespace isolation gives each
   # namespace its own attachment, and a pod is matched only against its own.
-  network_attachments: [personal-arr/vpn-egress]
-  # Deprecated single-attachment form; setting both keys is an error.
-  # network_attachment: personal-arr/vpn-egress
+  network_attachment: [personal-arr/vpn-egress]
+  # A single string is also accepted for compatibility. The plural key is
+  # retained only as a compatibility alias; do not set both keys.
   # Required: only pods in these trusted namespaces are discovered.
   namespaces: [personal-arr]
   address_range: 172.30.0.192/26

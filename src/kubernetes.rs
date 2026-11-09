@@ -553,6 +553,28 @@ mod tests {
     }
 
     #[test]
+    fn selects_any_listed_attachment_from_a_multi_attachment_pod() {
+        let first = network_status_for("other/net", "172.30.0.199", "0a:58:ac:1e:00:c7");
+        let second = network_status_for("crw/vpn-egress", "172.30.0.201", "0a:58:ac:1e:00:c9");
+        let raw = format!(
+            "[{},{}]",
+            &first[1..first.len() - 1],
+            &second[second.find("{\"name\":\"crw/").unwrap()..second.len() - 1]
+        );
+        let attachment = parse_attachment(
+            &raw,
+            &["personal-arr/vpn-egress", "crw/vpn-egress"],
+            "172.30.0.2".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attachment.name, "crw/vpn-egress");
+        assert_eq!(
+            attachment.ipv4_address,
+            "172.30.0.201".parse::<Ipv4Addr>().unwrap()
+        );
+    }
+
+    #[test]
     fn rejects_malformed_network_status() {
         let gateway = "172.30.0.2".parse().unwrap();
         for raw in [
