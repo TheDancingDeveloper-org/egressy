@@ -745,7 +745,11 @@ async fn reconcile_docker(
             .await
         {
             Ok(network) => {
-                let matches = network.exists && network.subnet_matches && network.gateway_attached;
+                // A gateway with a configured identity is not a Docker container, so
+                // Docker never lists it on the network.
+                let gateway_attached =
+                    network.gateway_attached || config.network.gateway_isolation.is_some();
+                let matches = network.exists && network.subnet_matches && gateway_attached;
                 publisher.observe(
                     "topology.docker_network",
                     if matches { CheckStatus::Healthy } else { CheckStatus::Failed },
@@ -1022,6 +1026,15 @@ async fn reconcile_docker(
         match observer.discover_isolation_candidates().await {
             Ok(mut candidates) => {
                 candidates.extend(pods.candidates.iter().cloned());
+                if let Some(gateway) = &config.network.gateway_isolation {
+                    if let Some(candidate) = crate::isolation::configured_gateway_candidate(
+                        &candidates,
+                        config.network.gateway_ip,
+                        gateway,
+                    ) {
+                        candidates.push(candidate);
+                    }
+                }
                 candidates.sort_by(|left, right| {
                     left.ipv4_address
                         .cmp(&right.ipv4_address)

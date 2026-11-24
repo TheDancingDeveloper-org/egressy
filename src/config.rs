@@ -193,6 +193,10 @@ pub struct NetworkConfig {
     pub host_bridge: String,
     pub route_table: u32,
     pub ipv6: Ipv6Config,
+    /// The gateway's own shared-bridge identity, for a gateway that is not a
+    /// Docker container (a Kubernetes pod attached by Multus). Docker labels
+    /// on an `egressy` container at `gateway_ip` take precedence.
+    pub gateway_isolation: Option<crate::isolation::GatewayIsolationConfig>,
 }
 
 impl NetworkConfig {
@@ -231,6 +235,7 @@ impl Default for NetworkConfig {
             host_bridge: default_bridge(),
             route_table: default_table(),
             ipv6: Ipv6Config::default(),
+            gateway_isolation: None,
         }
     }
 }
@@ -697,6 +702,11 @@ impl Config {
         }
         if !self.network.subnet.contains(&self.network.gateway_ip) {
             bail!("network.gateway_ip must be inside network.subnet");
+        }
+        if let Some(gateway) = &self.network.gateway_isolation {
+            if !crate::isolation::valid_identity(&gateway.id) {
+                bail!("network.gateway_isolation.id is not a valid isolation identity");
+            }
         }
         if self.network.gateway_ip == self.network.subnet.network()
             || self.network.gateway_ip == self.network.subnet.broadcast()

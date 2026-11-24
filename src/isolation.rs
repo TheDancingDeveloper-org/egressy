@@ -134,6 +134,44 @@ struct AllowSpec {
     protocol: IsolationProtocol,
 }
 
+/// The `egressy.isolation-*` values a Docker gateway carries as labels.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayIsolationConfig {
+    pub id: String,
+    #[serde(default)]
+    pub allow: Option<String>,
+    #[serde(default)]
+    pub accept: Option<String>,
+}
+
+/// The gateway's candidate from configuration, for a gateway that is not a
+/// Docker container. `None` when a discovered candidate already holds the
+/// gateway address: its Docker labels win.
+pub fn configured_gateway_candidate(
+    candidates: &[IsolationCandidate],
+    gateway_ip: Ipv4Addr,
+    config: &GatewayIsolationConfig,
+) -> Option<IsolationCandidate> {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.ipv4_address == gateway_ip)
+    {
+        return None;
+    }
+    Some(IsolationCandidate {
+        container_id: "config:gateway".to_owned(),
+        name: "egressy".to_owned(),
+        ipv4_address: gateway_ip,
+        isolation_id: Some(config.id.clone()),
+        allow: config.allow.clone(),
+        mac: None,
+        // Operator configuration, trusted like a Docker label.
+        source: CandidateSource::Docker,
+        accept: config.accept.clone(),
+    })
+}
+
 pub fn build_policy(
     network: &str,
     bridge: &str,
@@ -540,7 +578,7 @@ fn parse_allow_list(raw: &str) -> Result<Vec<AllowSpec>, String> {
         .collect()
 }
 
-fn valid_identity(value: &str) -> bool {
+pub fn valid_identity(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -1178,5 +1216,20 @@ mod tests {
             .participants
             .iter()
             .all(|participant| participant.mac.is_none()));
+    }
+
+    #[test]
+    fn configured_gateway_identity_fills_in_for_a_non_docker_gateway() {
+        let gateway = GatewayIsolationConfig {
+            id: "gateway".to_owned(),
+            allow: None,
+            accept: Some("prowlarr,qbittorrent".to_owned()),
+        };
+        let address: Ipv4Addr = "172.30.0.2".parse().unwrap();
+        let added = configured_gateway_candidate(&[], address, &gateway).unwrap();
+        assert_eq!(added.isolation_id.as_deref(), Some("gateway"));
+        assert_eq!(added.accept.as_deref(), Some("prowlarr,qbittorrent"));
+        assert_eq!(added.source, CandidateSource::Docker);
+        assert!(configured_gateway_candidate(&[added], address, &gateway).is_none());
     }
 }
