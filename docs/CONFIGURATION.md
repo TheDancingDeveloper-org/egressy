@@ -29,13 +29,19 @@ the security boundary even when the mount is marked read-only.
 | `ipv6.enabled` | `false` | Route enrolled IPv6 through the tunnel. When off, enrolled IPv6 is rejected. |
 | `ipv6.subnet` | `fd30:172:30::/64` | Enrolled IPv6 subnet, /120 or shorter. Must match the Docker network. |
 | `ipv6.gateway_ip` | `fd30:172:30::2` | Egressy's IPv6 address on the enrolled network. |
-| `gateway_isolation.id` | `gateway` | The gateway's own `egressy.isolation-id` when it is not a Docker container (a Kubernetes pod). Also stops Docker requiring the gateway on its network. |
-| `gateway_isolation.allow` | — | The gateway's `egressy.isolation-allow`. |
-| `gateway_isolation.accept` | `prowlarr,qbittorrent` | The gateway's `egressy.isolation-accept`. |
+| `gateway_isolation` | absent | Set only when the gateway is not a Docker container (a Kubernetes pod attached by Multus). When absent, egressy behaves as before. |
+| `gateway_isolation.id` | — (required) | The gateway's own `egressy.isolation-id`. Required when the block is present. |
+| `gateway_isolation.allow` | empty | The gateway's `egressy.isolation-allow`. |
+| `gateway_isolation.accept` | empty | The gateway's `egressy.isolation-accept`. |
+| `gateway_isolation.mac` | discovered | The MAC of the gateway's enrolled attachment, bound to `gateway_ip` so no other bridge port can claim it. When absent, egressy uses the MAC of its own interface holding `gateway_ip`. |
 
 These values must match the Docker network and installed host policy.
-Labels on a Docker container at `gateway_ip` take precedence over
-`gateway_isolation`.
+With `gateway_isolation` set, Docker must not list any container at
+`gateway_ip`: such a container is a conflict, so `topology.docker_network`
+fails and the isolation policy is incomplete. The gateway address must also be
+bound to a MAC, which needs `kubernetes.enabled` with an `address_range`;
+otherwise the isolation policy is incomplete and enforce mode degrades to
+audit.
 
 ### `wireguard`
 
