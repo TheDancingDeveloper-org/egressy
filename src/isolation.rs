@@ -134,7 +134,8 @@ struct AllowSpec {
     protocol: IsolationProtocol,
 }
 
-/// The `egressy.isolation-*` values a Docker gateway carries as labels.
+/// The `egressy.isolation-*` values a Docker gateway carries as labels, for a
+/// gateway that is not a Docker container.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayIsolationConfig {
@@ -143,33 +144,64 @@ pub struct GatewayIsolationConfig {
     pub allow: Option<String>,
     #[serde(default)]
     pub accept: Option<String>,
+    /// The MAC of the gateway's enrolled attachment. When absent, egressy uses
+    /// the MAC of its own interface that holds `gateway_ip`.
+    #[serde(default)]
+    pub mac: Option<String>,
 }
 
 /// The gateway's candidate from configuration, for a gateway that is not a
-/// Docker container. `None` when a discovered candidate already holds the
-/// gateway address: its Docker labels win.
+/// Docker container. It is always added: a Docker container that also holds
+/// the gateway address is a duplicate claim, so the policy is incomplete
+/// rather than letting that container's labels replace the gateway.
 pub fn configured_gateway_candidate(
-    candidates: &[IsolationCandidate],
     gateway_ip: Ipv4Addr,
     config: &GatewayIsolationConfig,
-) -> Option<IsolationCandidate> {
-    if candidates
-        .iter()
-        .any(|candidate| candidate.ipv4_address == gateway_ip)
-    {
-        return None;
-    }
-    Some(IsolationCandidate {
+    discovered_mac: Option<&str>,
+) -> IsolationCandidate {
+    IsolationCandidate {
         container_id: "config:gateway".to_owned(),
         name: "egressy".to_owned(),
         ipv4_address: gateway_ip,
         isolation_id: Some(config.id.clone()),
         allow: config.allow.clone(),
-        mac: None,
+        mac: config
+            .mac
+            .as_deref()
+            .or(discovered_mac)
+            .and_then(normalize_mac),
         // Operator configuration, trusted like a Docker label.
         source: CandidateSource::Docker,
         accept: config.accept.clone(),
-    })
+    }
+}
+
+/// With a configured gateway, the gateway address must be bound to a MAC;
+/// otherwise any unbound bridge port could claim it over ARP. Bindings render
+/// only for a bridge with a bound range, so call this once `bound_range` and
+/// `gateway_address` are set. An unbound gateway address makes the policy
+/// incomplete.
+pub fn require_gateway_binding(policy: &mut IsolationPolicy, gateway_ip: Ipv4Addr) {
+    policy.gateway_address = Some(gateway_ip);
+    let bound = policy.bound_range.is_some()
+        && policy
+            .participants
+            .iter()
+            .any(|participant| participant.ipv4_address == gateway_ip && participant.mac.is_some());
+    if bound {
+        return;
+    }
+    policy
+        .issues
+        .push(format!("gateway address {gateway_ip} has no MAC binding"));
+    policy.issues.sort();
+    policy.issues.dedup();
+    policy.eligible_for_enforcement = false;
+    if !policy.participants.is_empty() {
+        policy.reason_code = "isolation.policy_incomplete".to_owned();
+        policy.safe_message =
+            "The isolation policy is incomplete; enforce mode must degrade to audit".to_owned();
+    }
 }
 
 pub fn build_policy(
@@ -1218,18 +1250,145 @@ mod tests {
             .all(|participant| participant.mac.is_none()));
     }
 
-    #[test]
-    fn configured_gateway_identity_fills_in_for_a_non_docker_gateway() {
-        let gateway = GatewayIsolationConfig {
+    fn configured_gateway(mac: Option<&str>) -> GatewayIsolationConfig {
+        GatewayIsolationConfig {
             id: "gateway".to_owned(),
             allow: None,
-            accept: Some("prowlarr,qbittorrent".to_owned()),
-        };
-        let address: Ipv4Addr = "172.30.0.2".parse().unwrap();
-        let added = configured_gateway_candidate(&[], address, &gateway).unwrap();
-        assert_eq!(added.isolation_id.as_deref(), Some("gateway"));
-        assert_eq!(added.accept.as_deref(), Some("prowlarr,qbittorrent"));
-        assert_eq!(added.source, CandidateSource::Docker);
-        assert!(configured_gateway_candidate(&[added], address, &gateway).is_none());
+            accept: Some("qbit".to_owned()),
+            mac: mac.map(str::to_owned),
+        }
+    }
+
+    fn gateway_address() -> Ipv4Addr {
+        "172.30.0.2".parse().unwrap()
+    }
+
+    /// A Kubernetes-gateway bridge: the gateway from configuration, a Docker
+    /// probe that resolves `gateway:53/udp`, and a pod the gateway accepts.
+    fn configured_gateway_policy(
+        gateway: &GatewayIsolationConfig,
+        discovered_mac: Option<&str>,
+        extra: Vec<IsolationCandidate>,
+    ) -> IsolationPolicy {
+        let mut candidates = vec![
+            bound(
+                "probe",
+                "172.30.0.5",
+                "02:42:ac:1e:00:05",
+                Some("gateway:53/udp"),
+            ),
+            pod(
+                "qbit",
+                "172.30.0.200",
+                "0a:58:ac:1e:00:c8",
+                Some("gateway:53/udp"),
+            ),
+        ];
+        candidates.extend(extra);
+        candidates.push(configured_gateway_candidate(
+            gateway_address(),
+            gateway,
+            discovered_mac,
+        ));
+        let mut policy = policy(candidates);
+        policy.bound_range = Some("172.30.0.192/26".to_owned());
+        require_gateway_binding(&mut policy, gateway_address());
+        policy
+    }
+
+    #[test]
+    fn a_configured_gateway_builds_a_complete_policy() {
+        let policy =
+            configured_gateway_policy(&configured_gateway(None), Some("0A:58:AC:1E:00:02"), vec![]);
+        assert!(policy.eligible_for_enforcement, "{:?}", policy.issues);
+        assert_eq!(policy.reason_code, "isolation.policy_complete");
+        assert!(policy.rejected.is_empty(), "{:?}", policy.rejected);
+        let gateway = &policy.participants[0];
+        assert_eq!(gateway.ipv4_address, gateway_address());
+        assert_eq!(gateway.isolation_id.as_deref(), Some("gateway"));
+        for name in ["probe", "qbit"] {
+            let participant = policy
+                .participants
+                .iter()
+                .find(|participant| participant.name == name)
+                .unwrap();
+            assert_eq!(participant.allowances.len(), 1, "{name}");
+            assert_eq!(
+                participant.allowances[0].destination_address,
+                gateway_address()
+            );
+            assert_eq!(participant.allowances[0].port, 53);
+        }
+    }
+
+    #[test]
+    fn a_configured_gateway_address_is_bound_to_its_mac() {
+        // The configured MAC wins over the discovered one.
+        let policy = configured_gateway_policy(
+            &configured_gateway(Some("0a:58:ac:1e:00:02")),
+            Some("0a:58:ac:1e:00:99"),
+            vec![],
+        );
+        assert_eq!(
+            policy.participants[0].mac.as_deref(),
+            Some("0a:58:ac:1e:00:02")
+        );
+        let (_, rules) = render_bridge_policy(&policy, IsolationMode::Enforce, &BTreeMap::new());
+        assert!(rules.contains(
+            "arp saddr ip 172.30.0.2 ether saddr != 0a:58:ac:1e:00:02 counter name isolation_spoofed drop"
+        ));
+        assert!(rules.contains(
+            "ip saddr 172.30.0.2 ether saddr != 0a:58:ac:1e:00:02 counter name isolation_spoofed drop"
+        ));
+    }
+
+    #[test]
+    fn an_unbound_configured_gateway_makes_the_policy_incomplete() {
+        let policy = configured_gateway_policy(&configured_gateway(None), None, vec![]);
+        assert!(!policy.eligible_for_enforcement);
+        assert_eq!(policy.reason_code, "isolation.policy_incomplete");
+        assert!(policy
+            .issues
+            .contains(&"gateway address 172.30.0.2 has no MAC binding".to_owned()));
+    }
+
+    #[test]
+    fn a_configured_gateway_without_a_bound_range_is_unbound() {
+        let gateway = configured_gateway(Some("0a:58:ac:1e:00:02"));
+        let mut policy = policy(vec![configured_gateway_candidate(
+            gateway_address(),
+            &gateway,
+            None,
+        )]);
+        require_gateway_binding(&mut policy, gateway_address());
+        assert!(!policy.eligible_for_enforcement);
+        assert_eq!(policy.reason_code, "isolation.policy_incomplete");
+    }
+
+    #[test]
+    fn a_docker_container_at_a_configured_gateway_address_is_a_conflict() {
+        let intruder = accepting(
+            bound("intruder", "172.30.0.2", "02:42:ac:1e:00:02", None),
+            "qbit,probe",
+        );
+        let policy = configured_gateway_policy(
+            &configured_gateway(Some("0a:58:ac:1e:00:02")),
+            None,
+            vec![intruder],
+        );
+        assert!(!policy.eligible_for_enforcement);
+        assert!(policy
+            .issues
+            .contains(&"address 172.30.0.2 is claimed by more than one participant".to_owned()));
+        // Neither claimant is bound, and the intruder never takes the gateway's identity.
+        assert!(policy
+            .participants
+            .iter()
+            .filter(|participant| participant.ipv4_address == gateway_address())
+            .all(|participant| participant.mac.is_none()));
+        assert!(policy
+            .participants
+            .iter()
+            .any(|participant| participant.isolation_id.as_deref() == Some("gateway")));
     }
 }

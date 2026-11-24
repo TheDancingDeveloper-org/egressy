@@ -194,8 +194,8 @@ pub struct NetworkConfig {
     pub route_table: u32,
     pub ipv6: Ipv6Config,
     /// The gateway's own shared-bridge identity, for a gateway that is not a
-    /// Docker container (a Kubernetes pod attached by Multus). Docker labels
-    /// on an `egressy` container at `gateway_ip` take precedence.
+    /// Docker container (a Kubernetes pod attached by Multus). A Docker
+    /// container that also holds `gateway_ip` is then a conflict.
     pub gateway_isolation: Option<crate::isolation::GatewayIsolationConfig>,
 }
 
@@ -707,6 +707,13 @@ impl Config {
             if !crate::isolation::valid_identity(&gateway.id) {
                 bail!("network.gateway_isolation.id is not a valid isolation identity");
             }
+            if gateway
+                .mac
+                .as_deref()
+                .is_some_and(|mac| crate::isolation::normalize_mac(mac).is_none())
+            {
+                bail!("network.gateway_isolation.mac is not a unicast MAC address");
+            }
         }
         if self.network.gateway_ip == self.network.subnet.network()
             || self.network.gateway_ip == self.network.subnet.broadcast()
@@ -1091,6 +1098,42 @@ mod tests {
     fn defaults_are_valid() {
         let config: Config = serde_yaml::from_str("{}").unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn gateway_isolation_is_absent_by_default_and_checked_when_present() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(config.network.gateway_isolation.is_none());
+
+        let config: Config = serde_yaml::from_str(
+            "network:\n  gateway_isolation:\n    id: gateway\n    accept: qbit\n    mac: 0A:58:AC:1E:00:02\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let gateway = config.network.gateway_isolation.unwrap();
+        assert_eq!(gateway.id, "gateway");
+        assert_eq!(gateway.allow, None);
+        assert_eq!(gateway.accept.as_deref(), Some("qbit"));
+
+        // The id is required; allow, accept and mac are not.
+        assert!(serde_yaml::from_str::<Config>(
+            "network:\n  gateway_isolation:\n    accept: qbit\n"
+        )
+        .is_err());
+        assert!(serde_yaml::from_str::<Config>(
+            "network:\n  gateway_isolation:\n    id: gateway\n    bogus: 1\n"
+        )
+        .is_err());
+        for invalid in [
+            "    id: \"bad id\"\n",
+            "    id: gateway\n    mac: ff:ff:ff:ff:ff:ff\n",
+            "    id: gateway\n    mac: nonsense\n",
+        ] {
+            let config: Config =
+                serde_yaml::from_str(&format!("network:\n  gateway_isolation:\n{invalid}"))
+                    .unwrap();
+            assert!(config.validate().is_err(), "{invalid}");
+        }
     }
 
     #[test]

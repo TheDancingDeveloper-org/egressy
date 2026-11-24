@@ -745,11 +745,8 @@ async fn reconcile_docker(
             .await
         {
             Ok(network) => {
-                // A gateway with a configured identity is not a Docker container, so
-                // Docker never lists it on the network.
-                let gateway_attached =
-                    network.gateway_attached || config.network.gateway_isolation.is_some();
-                let matches = network.exists && network.subnet_matches && gateway_attached;
+                let matches =
+                    docker_network_matches(&network, config.network.gateway_isolation.is_some());
                 publisher.observe(
                     "topology.docker_network",
                     if matches { CheckStatus::Healthy } else { CheckStatus::Failed },
@@ -1027,13 +1024,16 @@ async fn reconcile_docker(
             Ok(mut candidates) => {
                 candidates.extend(pods.candidates.iter().cloned());
                 if let Some(gateway) = &config.network.gateway_isolation {
-                    if let Some(candidate) = crate::isolation::configured_gateway_candidate(
-                        &candidates,
+                    let discovered_mac = if gateway.mac.is_none() {
+                        local_interface_mac(config.network.gateway_ip).await
+                    } else {
+                        None
+                    };
+                    candidates.push(crate::isolation::configured_gateway_candidate(
                         config.network.gateway_ip,
                         gateway,
-                    ) {
-                        candidates.push(candidate);
-                    }
+                        discovered_mac.as_deref(),
+                    ));
                 }
                 candidates.sort_by(|left, right| {
                     left.ipv4_address
@@ -1057,6 +1057,12 @@ async fn reconcile_docker(
                         .address_range
                         .map(|range| range.to_string());
                     policy.gateway_address = Some(config.network.gateway_ip);
+                }
+                if config.network.gateway_isolation.is_some() {
+                    crate::isolation::require_gateway_binding(
+                        &mut policy,
+                        config.network.gateway_ip,
+                    );
                 }
                 if !policy.rejected.is_empty() {
                     warn!(
@@ -2534,6 +2540,45 @@ async fn wireguard_handshake(interface: &str) -> anyhow::Result<Option<u64>> {
         .max())
 }
 
+/// Whether the enrolled Docker network matches configuration. A gateway with a
+/// configured identity is not a Docker container, so Docker must not list
+/// anything at the gateway address: a container there is a conflict.
+fn docker_network_matches(
+    network: &crate::docker::NetworkObservation,
+    configured_gateway: bool,
+) -> bool {
+    network.exists && network.subnet_matches && network.gateway_attached != configured_gateway
+}
+
+/// The MAC of this host's (the gateway pod's) interface that holds `address`.
+async fn local_interface_mac(address: Ipv4Addr) -> Option<String> {
+    let output = tokio::process::Command::new("ip")
+        .args(["-j", "-4", "addr", "show"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    interface_mac_for(&output.stdout, address)
+}
+
+/// Pick the MAC of the interface holding `address` from `ip -j addr` output.
+fn interface_mac_for(json: &[u8], address: Ipv4Addr) -> Option<String> {
+    let interfaces: Vec<serde_json::Value> = serde_json::from_slice(json).ok()?;
+    interfaces
+        .iter()
+        .find(|interface| {
+            interface["addr_info"].as_array().is_some_and(|addresses| {
+                addresses
+                    .iter()
+                    .any(|info| info["local"].as_str() == Some(&address.to_string()))
+            })
+        })
+        .and_then(|interface| interface["address"].as_str())
+        .and_then(crate::isolation::normalize_mac)
+}
+
 pub(crate) async fn command(program: &str, args: &[&str]) -> anyhow::Result<()> {
     let output = Command::new(program)
         .args(args)
@@ -2561,6 +2606,49 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    fn observed_network(gateway_attached: bool) -> crate::docker::NetworkObservation {
+        crate::docker::NetworkObservation {
+            exists: true,
+            subnet_matches: true,
+            gateway_attached,
+            ipv6_enabled: false,
+            ipv6_subnet_matches: false,
+            ipv6_gateway_attached: false,
+            gateway_address_reserved: true,
+        }
+    }
+
+    #[test]
+    fn docker_must_hold_the_gateway_address_only_without_a_configured_gateway() {
+        assert!(docker_network_matches(&observed_network(true), false));
+        assert!(!docker_network_matches(&observed_network(false), false));
+        // A configured gateway is not a Docker container; a container at its
+        // address is a conflict.
+        assert!(docker_network_matches(&observed_network(false), true));
+        assert!(!docker_network_matches(&observed_network(true), true));
+        let mut missing = observed_network(false);
+        missing.exists = false;
+        assert!(!docker_network_matches(&missing, true));
+    }
+
+    #[test]
+    fn the_local_mac_comes_from_the_interface_holding_the_gateway_address() {
+        let json = br#"[
+            {"ifname":"lo","address":"00:00:00:00:00:00","addr_info":[{"local":"127.0.0.1"}]},
+            {"ifname":"eth0","address":"0a:58:0a:2a:00:07","addr_info":[{"local":"10.42.0.7"}]},
+            {"ifname":"net1","address":"0A:58:AC:1E:00:02","addr_info":[{"local":"172.30.0.2"}]}
+        ]"#;
+        assert_eq!(
+            interface_mac_for(json, "172.30.0.2".parse().unwrap()).as_deref(),
+            Some("0a:58:ac:1e:00:02")
+        );
+        assert_eq!(interface_mac_for(json, "172.30.0.9".parse().unwrap()), None);
+        assert_eq!(
+            interface_mac_for(b"not json", "172.30.0.2".parse().unwrap()),
+            None
+        );
+    }
 
     #[test]
     fn the_gateway_table_has_an_ipv4_unreachable_default_before_the_tunnel_route() {
