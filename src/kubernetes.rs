@@ -304,7 +304,12 @@ pub fn snapshot_from_pods(scope: &DiscoveryScope, pods: Vec<Pod>) -> KubernetesS
             .as_ref()
             .is_ok_and(|attachment| scope.address_range.contains(&attachment.ipv4_address));
 
-        if let (true, true, Ok(attachment)) = (running, in_range, &attachment) {
+        // A pod outside address_range (for example a probe pinned to a
+        // static address) still gets an isolation identity when it carries
+        // an explicit egressy.isolation-id annotation: the namespace and
+        // attachment checks above already established that it is trusted.
+        let has_identity = annotations.contains_key(ISOLATION_ID_LABEL);
+        if let (true, true, Ok(attachment)) = (running, in_range || has_identity, &attachment) {
             snapshot.candidates.push(IsolationCandidate {
                 container_id: id.clone(),
                 name: metadata.name.clone(),
@@ -668,6 +673,30 @@ mod tests {
             .compliance_message
             .contains("kubernetes.address_range"));
         assert!(snapshot.candidates.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_annotated_pod_gets_an_isolation_identity() {
+        let snapshot = snapshot_from_pods(
+            &scope(),
+            vec![
+                pod(
+                    "probe",
+                    "172.30.0.5",
+                    "0a:58:ac:1e:00:05",
+                    &[
+                        ("egressy.isolation-id", "egressy-probe"),
+                        ("egressy.isolation-allow", "egressy-probe:8081/tcp"),
+                    ],
+                ),
+                pod("plain", "172.30.0.6", "0a:58:ac:1e:00:06", &[]),
+            ],
+        );
+        assert_eq!(snapshot.candidates.len(), 1);
+        let candidate = &snapshot.candidates[0];
+        assert_eq!(candidate.isolation_id.as_deref(), Some("egressy-probe"));
+        assert_eq!(candidate.ipv4_address.to_string(), "172.30.0.5");
+        assert_eq!(candidate.allow.as_deref(), Some("egressy-probe:8081/tcp"));
     }
 
     #[test]
