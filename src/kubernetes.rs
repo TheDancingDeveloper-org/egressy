@@ -15,7 +15,7 @@ use anyhow::Context;
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 
-use crate::config::KubernetesConfig;
+use crate::config::{IsolationStaticClient, KubernetesConfig};
 use crate::docker::{ENABLE_LABEL, PORT_FORWARD_LABEL, TARGET_PORT_LABEL, USAGE_ID_LABEL};
 use crate::isolation::{
     normalize_mac, CandidateSource, IsolationCandidate, ISOLATION_ACCEPT_LABEL,
@@ -57,6 +57,9 @@ pub struct DiscoveryScope {
     pub subnet: Ipv4Net,
     pub address_range: Ipv4Net,
     pub gateway_ip: Ipv4Addr,
+    /// Validated `kubernetes.isolation_static_clients`: the only pods outside
+    /// `address_range` that may become isolation candidates.
+    pub isolation_static_clients: Vec<IsolationStaticClient>,
 }
 
 impl DiscoveryScope {
@@ -118,6 +121,7 @@ impl KubernetesObserver {
                     .address_range
                     .context("kubernetes.address_range is required")?,
                 gateway_ip,
+                isolation_static_clients: config.isolation_static_clients.clone(),
             },
         })
     }
@@ -304,12 +308,20 @@ pub fn snapshot_from_pods(scope: &DiscoveryScope, pods: Vec<Pod>) -> KubernetesS
             .as_ref()
             .is_ok_and(|attachment| scope.address_range.contains(&attachment.ipv4_address));
 
-        // A pod outside address_range (for example a probe pinned to a
-        // static address) still gets an isolation identity when it carries
-        // an explicit egressy.isolation-id annotation: the namespace and
-        // attachment checks above already established that it is trusted.
-        let has_identity = annotations.contains_key(ISOLATION_ID_LABEL);
-        if let (true, true, Ok(attachment)) = (running, in_range || has_identity, &attachment) {
+        // A pod outside address_range (for example the probe at its static
+        // address) is a candidate only when its namespace, its
+        // egressy.isolation-id and its address all match one configured
+        // isolation_static_clients entry. Without that, an annotated pod could
+        // claim the bridge, the gateway or another client's address.
+        let static_client = attachment.as_ref().is_ok_and(|attachment| {
+            let isolation_id = annotations.get(ISOLATION_ID_LABEL);
+            scope.isolation_static_clients.iter().any(|entry| {
+                entry.namespace == metadata.namespace
+                    && Some(&entry.isolation_id) == isolation_id
+                    && entry.address == attachment.ipv4_address
+            })
+        });
+        if let (true, true, Ok(attachment)) = (running, in_range || static_client, &attachment) {
             snapshot.candidates.push(IsolationCandidate {
                 container_id: id.clone(),
                 name: metadata.name.clone(),
@@ -481,6 +493,7 @@ mod tests {
             subnet: "172.30.0.0/24".parse().unwrap(),
             address_range: "172.30.0.192/26".parse().unwrap(),
             gateway_ip: "172.30.0.2".parse().unwrap(),
+            isolation_static_clients: Vec::new(),
         }
     }
 
@@ -675,20 +688,42 @@ mod tests {
         assert!(snapshot.candidates.is_empty());
     }
 
+    fn probe_scope() -> DiscoveryScope {
+        DiscoveryScope {
+            isolation_static_clients: vec![
+                IsolationStaticClient {
+                    namespace: "personal-arr".to_owned(),
+                    isolation_id: "egressy-probe".to_owned(),
+                    address: "172.30.0.5".parse().unwrap(),
+                },
+                IsolationStaticClient {
+                    namespace: "personal-arr".to_owned(),
+                    isolation_id: "other-static".to_owned(),
+                    address: "172.30.0.7".parse().unwrap(),
+                },
+            ],
+            ..scope()
+        }
+    }
+
+    fn probe_pod(name: &str, address: &str, isolation_id: &str) -> Pod {
+        pod(
+            name,
+            address,
+            "0a:58:ac:1e:00:05",
+            &[
+                ("egressy.isolation-id", isolation_id),
+                ("egressy.isolation-allow", "egressy-probe:8081/tcp"),
+            ],
+        )
+    }
+
     #[test]
-    fn out_of_range_annotated_pod_gets_an_isolation_identity() {
+    fn allowlisted_static_pod_gets_an_isolation_identity() {
         let snapshot = snapshot_from_pods(
-            &scope(),
+            &probe_scope(),
             vec![
-                pod(
-                    "probe",
-                    "172.30.0.5",
-                    "0a:58:ac:1e:00:05",
-                    &[
-                        ("egressy.isolation-id", "egressy-probe"),
-                        ("egressy.isolation-allow", "egressy-probe:8081/tcp"),
-                    ],
-                ),
+                probe_pod("probe", "172.30.0.5", "egressy-probe"),
                 pod("plain", "172.30.0.6", "0a:58:ac:1e:00:06", &[]),
             ],
         );
@@ -697,6 +732,57 @@ mod tests {
         assert_eq!(candidate.isolation_id.as_deref(), Some("egressy-probe"));
         assert_eq!(candidate.ipv4_address.to_string(), "172.30.0.5");
         assert_eq!(candidate.allow.as_deref(), Some("egressy-probe:8081/tcp"));
+        assert!(snapshot.clients.is_empty());
+    }
+
+    #[test]
+    fn annotated_pod_outside_the_range_without_a_matching_entry_is_refused() {
+        // Out of subnet, the bridge, the gateway, another entry's address,
+        // and an unlisted static address: none may claim an identity.
+        for address in [
+            "10.9.9.9",
+            "172.30.0.1",
+            "172.30.0.2",
+            "172.30.0.7",
+            "172.30.0.6",
+        ] {
+            let snapshot = snapshot_from_pods(
+                &probe_scope(),
+                vec![probe_pod("probe", address, "egressy-probe")],
+            );
+            assert!(snapshot.candidates.is_empty(), "{address} was accepted");
+        }
+        // Without any entry, the probe's own address is refused too.
+        let snapshot = snapshot_from_pods(
+            &scope(),
+            vec![probe_pod("probe", "172.30.0.5", "egressy-probe")],
+        );
+        assert!(snapshot.candidates.is_empty());
+    }
+
+    #[test]
+    fn static_entry_needs_the_namespace_and_isolation_id_to_match() {
+        let wrong_id = probe_pod("probe", "172.30.0.5", "impostor");
+        let wrong_namespace = pod_in_with_status(
+            "crw",
+            "probe",
+            &network_status_for("crw/vpn-egress", "172.30.0.5", "0a:58:ac:1e:00:05"),
+            &[("egressy.isolation-id", "egressy-probe")],
+        );
+        let mut unannotated = probe_pod("probe", "172.30.0.5", "egressy-probe");
+        unannotated.metadata.annotations.remove(ISOLATION_ID_LABEL);
+        let scope = DiscoveryScope {
+            network_attachments: vec![
+                "personal-arr/vpn-egress".to_owned(),
+                "crw/vpn-egress".to_owned(),
+            ],
+            namespaces: BTreeSet::from(["personal-arr".to_owned(), "crw".to_owned()]),
+            ..probe_scope()
+        };
+        for pod in [wrong_id, wrong_namespace, unannotated] {
+            let snapshot = snapshot_from_pods(&scope, vec![pod]);
+            assert!(snapshot.candidates.is_empty());
+        }
     }
 
     #[test]
@@ -802,6 +888,7 @@ mod tests {
             subnet: "172.30.0.0/24".parse().unwrap(),
             address_range: "172.30.0.192/26".parse().unwrap(),
             gateway_ip: "172.30.0.2".parse().unwrap(),
+            isolation_static_clients: Vec::new(),
         }
     }
 

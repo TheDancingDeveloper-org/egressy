@@ -138,6 +138,18 @@ kubernetes:
 gateway addresses. Keep Docker's own `ip_range` for the network outside it so
 Docker IPAM and the CNI never hand out the same address.
 
+A pod outside `address_range`, such as the probe pinned to a static address,
+gets an isolation identity only through an explicit
+`isolation_static_clients` entry whose namespace, isolation id and address all
+match the pod. An annotation alone is never enough, so a pod cannot claim the
+bridge, the gateway or another client's address:
+
+```yaml
+kubernetes:
+  isolation_static_clients:
+    - {namespace: egressy, isolation_id: egressy-probe, address: 172.30.0.5}
+```
+
 ## Credentials
 
 Egressy needs only `list` on `pods`, in each trusted namespace.

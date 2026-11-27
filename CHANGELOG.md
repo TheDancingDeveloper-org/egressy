@@ -4,6 +4,9 @@
 
 ### Added
 
+- `kubernetes.isolation_static_clients`: an allowlist of `{namespace,
+  isolation_id, address}` that gives a pod at a static address outside
+  `address_range` (the probe) an isolation identity. Validated at startup.
 - Optional read-only Kubernetes pod discovery (`kubernetes`, off by default).
   Pods attached to the bridge through Multus are enrolled by annotations that
   mirror the container labels, and the isolation agent binds every
