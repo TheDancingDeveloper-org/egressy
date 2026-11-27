@@ -202,6 +202,7 @@ default. See `docs/KUBERNETES.md`.
 | `network_attachments` | unset | Compatibility alias for the earlier list spelling; mutually exclusive with `network_attachment`. |
 | `namespaces` | empty | Required when enabled. The trusted namespaces whose pods are listed, each through its own namespaced URL. Pods anywhere else are ignored. |
 | `address_range` | unset | Required when enabled. The pod IPAM range; inside `network.subnet`, clear of the bridge and gateway addresses. Every source in it must be a discovered pod. |
+| `isolation_static_clients` | empty | Pods at a static address outside `address_range` that still get an isolation identity, as a list of `{namespace, isolation_id, address}`. A pod qualifies only when its namespace, its `egressy.isolation-id` annotation and its address all match one entry. Each address must be a host address in `network.subnet`, not the bridge or gateway, outside `address_range`, and listed once; each namespace must be in `namespaces`. Invalid entries stop startup. |
 | `api_url` | unset | `https` API server URL. Unset means in-cluster (`KUBERNETES_SERVICE_HOST`). |
 | `token_path` | service-account token path | Bearer token file, re-read on every listing. |
 | `ca_path` | service-account CA path | CA bundle for the API server. |

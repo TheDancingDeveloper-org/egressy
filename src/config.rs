@@ -614,6 +614,11 @@ pub struct KubernetesConfig {
     /// and exclude the bridge and gateway addresses. Every source address in
     /// it must belong to a discovered pod, or the host agent drops it.
     pub address_range: Option<Ipv4Net>,
+    /// Pods that keep a static address outside `address_range` (for example
+    /// the probe) but still need an isolation identity. A pod outside the
+    /// range is an isolation candidate only when its namespace, its
+    /// `egressy.isolation-id` annotation and its address all match one entry.
+    pub isolation_static_clients: Vec<IsolationStaticClient>,
     /// API server URL. Empty means in-cluster (`KUBERNETES_SERVICE_HOST`).
     pub api_url: Option<String>,
     pub token_path: String,
@@ -633,6 +638,7 @@ impl Default for KubernetesConfig {
             network_attachments: None,
             namespaces: Vec::new(),
             address_range: None,
+            isolation_static_clients: Vec::new(),
             api_url: None,
             token_path: "/var/run/secrets/kubernetes.io/serviceaccount/token".to_owned(),
             ca_path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".to_owned(),
@@ -640,6 +646,16 @@ impl Default for KubernetesConfig {
             max_stale_seconds: 300,
         }
     }
+}
+
+/// One pod allowed an isolation identity at a static address outside
+/// `kubernetes.address_range`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationStaticClient {
+    pub namespace: String,
+    pub isolation_id: String,
+    pub address: Ipv4Addr,
 }
 
 /// The single attachment used when neither configuration key is set.
@@ -1022,6 +1038,51 @@ impl Config {
         {
             bail!("kubernetes.address_range must exclude the bridge and gateway addresses");
         }
+        let mut static_addresses = std::collections::BTreeSet::new();
+        let mut static_ids = std::collections::BTreeSet::new();
+        for entry in &kubernetes.isolation_static_clients {
+            let address = entry.address;
+            if !kubernetes.namespaces.contains(&entry.namespace) {
+                bail!(
+                    "kubernetes.isolation_static_clients entry {address}: namespace {:?} is not in kubernetes.namespaces",
+                    entry.namespace
+                );
+            }
+            if !crate::isolation::valid_identity(&entry.isolation_id) {
+                bail!(
+                    "kubernetes.isolation_static_clients entry {address}: isolation_id {:?} is not a valid identity",
+                    entry.isolation_id
+                );
+            }
+            if !subnet.contains(&address)
+                || address == subnet.network()
+                || address == subnet.broadcast()
+            {
+                bail!(
+                    "kubernetes.isolation_static_clients entry {address} must be a host address inside network.subnet"
+                );
+            }
+            if address == self.network.gateway_ip || Some(address) == bridge_gateway {
+                bail!(
+                    "kubernetes.isolation_static_clients entry {address} must not be the bridge or gateway address"
+                );
+            }
+            if range.contains(&address) {
+                bail!(
+                    "kubernetes.isolation_static_clients entry {address} is inside kubernetes.address_range, which is discovered without an entry"
+                );
+            }
+            if !static_addresses.insert(address) {
+                bail!("kubernetes.isolation_static_clients lists address {address} more than once");
+            }
+            if !static_ids.insert((&entry.namespace, &entry.isolation_id)) {
+                bail!(
+                    "kubernetes.isolation_static_clients lists isolation_id {:?} in namespace {:?} more than once",
+                    entry.isolation_id,
+                    entry.namespace
+                );
+            }
+        }
         if let Some(url) = &kubernetes.api_url {
             let url = reqwest::Url::parse(url).context("invalid kubernetes.api_url")?;
             if url.scheme() != "https" {
@@ -1134,6 +1195,49 @@ mod tests {
                     .unwrap();
             assert!(config.validate().is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn kubernetes_isolation_static_clients_are_validated() {
+        let base = "kubernetes:\n  enabled: true\n  node_name: node-b\n  namespaces: [egressy]\n  network_attachment: egressy/vpn-egress-probe\n  address_range: 172.30.0.192/26\n  isolation_static_clients:\n";
+        let entry = |namespace: &str, id: &str, address: &str| {
+            format!("    - {{namespace: {namespace}, isolation_id: {id}, address: {address}}}\n")
+        };
+        let parse = |entries: &str| -> Config {
+            serde_yaml::from_str(&format!("{base}{entries}")).unwrap()
+        };
+        let absent: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(absent.kubernetes.isolation_static_clients.is_empty());
+        let probe = parse(&entry("egressy", "egressy-probe", "172.30.0.5"));
+        probe.validate().unwrap();
+        assert_eq!(
+            probe.kubernetes.isolation_static_clients,
+            vec![IsolationStaticClient {
+                namespace: "egressy".to_owned(),
+                isolation_id: "egressy-probe".to_owned(),
+                address: "172.30.0.5".parse().unwrap(),
+            }]
+        );
+        for invalid in [
+            entry("egressy", "egressy-probe", "172.30.0.2"),
+            entry("egressy", "egressy-probe", "172.30.0.1"),
+            entry("egressy", "egressy-probe", "172.31.0.5"),
+            entry("egressy", "egressy-probe", "172.30.0.0"),
+            entry("egressy", "egressy-probe", "172.30.0.255"),
+            entry("egressy", "egressy-probe", "172.30.0.200"),
+            entry("media", "egressy-probe", "172.30.0.5"),
+            entry("egressy", "\"bad id\"", "172.30.0.5"),
+            entry("egressy", "egressy-probe", "172.30.0.5")
+                + &entry("egressy", "other", "172.30.0.5"),
+            entry("egressy", "egressy-probe", "172.30.0.5")
+                + &entry("egressy", "egressy-probe", "172.30.0.6"),
+        ] {
+            assert!(parse(&invalid).validate().is_err(), "{invalid}");
+        }
+        assert!(serde_yaml::from_str::<Config>(&format!(
+            "{base}    - {{namespace: egressy, isolation_id: p, address: 172.30.0.5, mac: x}}\n"
+        ))
+        .is_err());
     }
 
     #[test]
